@@ -75,22 +75,146 @@ class AdminCommands(commands.Cog):
     @app_commands.command(name="addteam", description="[ADMIN] Add a new team to the league")
     @app_commands.describe(
         team_name="Name of the team",
-        role="Discord role for this team"
+        role="Discord role for this team",
+        emoji="Team emoji (optional)",
+        channel="Team channel for notifications (optional)"
     )
-    async def add_team(self, interaction: discord.Interaction, team_name: str, role: discord.Role):
+    async def add_team(
+        self,
+        interaction: discord.Interaction,
+        team_name: str,
+        role: discord.Role,
+        emoji: str = None,
+        channel: discord.TextChannel = None
+    ):
         async with aiosqlite.connect(DB_PATH) as db:
+            # Extract emoji ID if custom emoji provided
+            emoji_id = None
+            if emoji:
+                # Check if it's a custom emoji format <:name:id> or <a:name:id>
+                import re
+                emoji_match = re.match(r'<a?:(\w+):(\d+)>', emoji)
+                if emoji_match:
+                    emoji_id = emoji_match.group(2)
+                # If not custom emoji format, just store as-is (could be unicode emoji)
+                else:
+                    emoji_id = emoji
+
+            channel_id = str(channel.id) if channel else None
+
             try:
                 await db.execute(
-                    "INSERT INTO teams (team_name, role_id) VALUES (?, ?)",
-                    (team_name, str(role.id))
+                    "INSERT INTO teams (team_name, role_id, emoji_id, channel_id) VALUES (?, ?, ?, ?)",
+                    (team_name, str(role.id), emoji_id, channel_id)
                 )
                 await db.commit()
-                await interaction.response.send_message(
-                    f"✅ Team **{team_name}** created with role {role.mention}!"
-                )
+
+                # Build confirmation message
+                msg = f"✅ Team **{team_name}** created!\n"
+                msg += f"• Role: {role.mention}\n"
+                if emoji:
+                    msg += f"• Emoji: {emoji}\n"
+                if channel:
+                    msg += f"• Channel: {channel.mention}"
+
+                await interaction.response.send_message(msg)
             except aiosqlite.IntegrityError:
                 await interaction.response.send_message(
                     f"❌ Team name **{team_name}** already exists!",
+                    ephemeral=True
+                )
+
+    @app_commands.command(name="updateteam", description="[ADMIN] Update a team's settings")
+    @app_commands.describe(
+        team_name="Name of the team to update",
+        new_name="New team name (optional)",
+        role="New Discord role (optional)",
+        emoji="New team emoji (optional)",
+        channel="New team channel (optional)"
+    )
+    async def update_team(
+        self,
+        interaction: discord.Interaction,
+        team_name: str,
+        new_name: str = None,
+        role: discord.Role = None,
+        emoji: str = None,
+        channel: discord.TextChannel = None
+    ):
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Find the team
+            cursor = await db.execute(
+                "SELECT team_id, team_name FROM teams WHERE team_name LIKE ?",
+                (f"%{team_name}%",)
+            )
+            team = await cursor.fetchone()
+
+            if not team:
+                await interaction.response.send_message(
+                    f"❌ No team found matching '{team_name}'",
+                    ephemeral=True
+                )
+                return
+
+            team_id, current_name = team
+            updates = []
+            values = []
+            changes = []
+
+            # Update team name
+            if new_name:
+                updates.append("team_name = ?")
+                values.append(new_name)
+                changes.append(f"Name: {current_name} → {new_name}")
+
+            # Update role
+            if role:
+                updates.append("role_id = ?")
+                values.append(str(role.id))
+                changes.append(f"Role: {role.mention}")
+
+            # Update emoji
+            if emoji:
+                import re
+                emoji_match = re.match(r'<a?:(\w+):(\d+)>', emoji)
+                if emoji_match:
+                    emoji_id = emoji_match.group(2)
+                else:
+                    emoji_id = emoji
+
+                updates.append("emoji_id = ?")
+                values.append(emoji_id)
+                changes.append(f"Emoji: {emoji}")
+
+            # Update channel
+            if channel:
+                updates.append("channel_id = ?")
+                values.append(str(channel.id))
+                changes.append(f"Channel: {channel.mention}")
+
+            if not updates:
+                await interaction.response.send_message(
+                    "❌ No updates specified!",
+                    ephemeral=True
+                )
+                return
+
+            # Perform update
+            values.append(team_id)
+            query = f"UPDATE teams SET {', '.join(updates)} WHERE team_id = ?"
+
+            try:
+                await db.execute(query, values)
+                await db.commit()
+
+                # Build response
+                response = f"✅ Updated **{current_name}**\n\n"
+                response += "\n".join(changes)
+
+                await interaction.response.send_message(response)
+            except aiosqlite.IntegrityError:
+                await interaction.response.send_message(
+                    f"❌ Team name **{new_name}** already exists!",
                     ephemeral=True
                 )
 
@@ -479,13 +603,14 @@ class AdminCommands(commands.Cog):
             async with aiosqlite.connect(DB_PATH) as db:
                 # Export Teams
                 cursor = await db.execute(
-                    """SELECT team_name as Team_Name, role_id as Role_ID, emoji_id as Emoji_ID
+                    """SELECT team_name as Team_Name, role_id as Role_ID, emoji_id as Emoji_ID, channel_id as Channel_ID
                        FROM teams ORDER BY team_name"""
                 )
                 teams = await cursor.fetchall()
-                teams_df = pd.DataFrame(teams, columns=['Team_Name', 'Role_ID', 'Emoji_ID'])
+                teams_df = pd.DataFrame(teams, columns=['Team_Name', 'Role_ID', 'Emoji_ID', 'Channel_ID'])
                 teams_df['Role_ID'] = teams_df['Role_ID'].fillna('')
                 teams_df['Emoji_ID'] = teams_df['Emoji_ID'].fillna('')
+                teams_df['Channel_ID'] = teams_df['Channel_ID'].fillna('')
                 
                 # Export Players with Lineup Positions
                 cursor = await db.execute(
@@ -588,22 +713,23 @@ class AdminCommands(commands.Cog):
             async with aiosqlite.connect(DB_PATH) as db:
                 # Import Teams
                 try:
-                    teams_df = pd.read_excel(excel_file, sheet_name='Teams', dtype={'Role_ID': str, 'Emoji_ID': str})
-                    
+                    teams_df = pd.read_excel(excel_file, sheet_name='Teams', dtype={'Role_ID': str, 'Emoji_ID': str, 'Channel_ID': str})
+
                     for _, row in teams_df.iterrows():
                         try:
                             team_name = str(row['Team_Name']).strip()
                             role_id = str(row['Role_ID']).strip() if pd.notna(row['Role_ID']) and row['Role_ID'] else None
                             emoji_id = str(row['Emoji_ID']).strip() if pd.notna(row['Emoji_ID']) and row['Emoji_ID'] else None
-                            
+                            channel_id = str(row['Channel_ID']).strip() if 'Channel_ID' in row and pd.notna(row['Channel_ID']) and row['Channel_ID'] else None
+
                             cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
                             existing = await cursor.fetchone()
-                            
+
                             if existing:
-                                await db.execute("UPDATE teams SET role_id = ?, emoji_id = ? WHERE team_name = ?", (role_id, emoji_id, team_name))
+                                await db.execute("UPDATE teams SET role_id = ?, emoji_id = ?, channel_id = ? WHERE team_name = ?", (role_id, emoji_id, channel_id, team_name))
                                 teams_updated += 1
                             else:
-                                await db.execute("INSERT INTO teams (team_name, role_id, emoji_id) VALUES (?, ?, ?)", (team_name, role_id, emoji_id))
+                                await db.execute("INSERT INTO teams (team_name, role_id, emoji_id, channel_id) VALUES (?, ?, ?, ?)", (team_name, role_id, emoji_id, channel_id))
                                 teams_added += 1
                         except Exception as e:
                             errors.append(f"Team '{team_name}': {str(e)}")
