@@ -138,5 +138,6 @@ async def on_ready():
         print(f"Error syncing commands: {e}")
 
 # Run the bot
+# test comment delete this
 if __name__ == "__main__":
     bot.run(DISCORD_BOT_TOKEN)
