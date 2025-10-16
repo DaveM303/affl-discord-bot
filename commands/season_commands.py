@@ -70,16 +70,14 @@ class SeasonCommands(commands.Cog):
         )
         return False
 
-    @app_commands.command(name="migrateseasons", description="[ADMIN] Migrate seasons table (run once)")
-    async def migrate_seasons(self, interaction: discord.Interaction):
+    @app_commands.command(name="migratedb", description="[ADMIN] Migrate database tables (run once after updates)")
+    async def migrate_db(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
         async with aiosqlite.connect(DB_PATH) as db:
             try:
-                # Drop old table
+                # Migrate seasons table
                 await db.execute("DROP TABLE IF EXISTS seasons")
-
-                # Create new table
                 await db.execute('''
                     CREATE TABLE seasons (
                         season_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,11 +90,27 @@ class SeasonCommands(commands.Cog):
                     )
                 ''')
 
+                # Create injuries table
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS injuries (
+                        injury_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        player_id INTEGER NOT NULL,
+                        injury_type TEXT NOT NULL,
+                        injury_round INTEGER NOT NULL,
+                        recovery_rounds INTEGER NOT NULL,
+                        return_round INTEGER NOT NULL,
+                        status TEXT DEFAULT 'injured',
+                        FOREIGN KEY (player_id) REFERENCES players(player_id)
+                    )
+                ''')
+
                 await db.commit()
 
                 await interaction.followup.send(
-                    "✅ Seasons table migrated successfully!\n"
-                    "You can now use `/createseason` to create seasons.",
+                    "✅ Database migrated successfully!\n"
+                    "• Seasons table updated\n"
+                    "• Injuries table created\n\n"
+                    "You can now use all season and injury commands.",
                     ephemeral=True
                 )
             except Exception as e:
