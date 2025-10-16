@@ -70,6 +70,41 @@ class SeasonCommands(commands.Cog):
         )
         return False
 
+    @app_commands.command(name="migrateseasons", description="[ADMIN] Migrate seasons table (run once)")
+    async def migrate_seasons(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            try:
+                # Drop old table
+                await db.execute("DROP TABLE IF EXISTS seasons")
+
+                # Create new table
+                await db.execute('''
+                    CREATE TABLE seasons (
+                        season_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        season_number INTEGER NOT NULL UNIQUE,
+                        current_round INTEGER DEFAULT 0,
+                        regular_rounds INTEGER DEFAULT 24,
+                        total_rounds INTEGER DEFAULT 29,
+                        round_name TEXT DEFAULT 'Offseason',
+                        status TEXT DEFAULT 'offseason'
+                    )
+                ''')
+
+                await db.commit()
+
+                await interaction.followup.send(
+                    "✅ Seasons table migrated successfully!\n"
+                    "You can now use `/createseason` to create seasons.",
+                    ephemeral=True
+                )
+            except Exception as e:
+                await interaction.followup.send(
+                    f"❌ Migration failed: {str(e)}",
+                    ephemeral=True
+                )
+
     @app_commands.command(name="createseason", description="[ADMIN] Create a new season")
     @app_commands.describe(
         season_number="Season number (e.g., 1, 2, 3)",
