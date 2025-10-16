@@ -41,8 +41,11 @@ async def init_db():
         await db.execute('''
             CREATE TABLE IF NOT EXISTS seasons (
                 season_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                year INTEGER NOT NULL,
-                current_round INTEGER DEFAULT 1,
+                season_number INTEGER NOT NULL UNIQUE,
+                current_round INTEGER DEFAULT 0,
+                regular_rounds INTEGER DEFAULT 24,
+                total_rounds INTEGER DEFAULT 29,
+                round_name TEXT DEFAULT 'Offseason',
                 status TEXT DEFAULT 'offseason'
             )
         ''')
@@ -122,6 +125,7 @@ async def on_ready():
     await bot.load_extension('commands.player_commands')
     await bot.load_extension('commands.admin_commands')
     await bot.load_extension('commands.lineup_commands')
+    await bot.load_extension('commands.season_commands')
     
     try:
         if GUILD_ID:
