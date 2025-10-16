@@ -73,13 +73,6 @@ class PlayerCommands(commands.Cog):
                 return
 
             # Show list view for all results (single or multiple)
-            search_display = "', '".join(search_terms)
-            embed = discord.Embed(
-                title=f"Player Search: '{search_display}'",
-                description=f"Found {len(unique_players)} player(s)",
-                color=discord.Color.green()
-            )
-
             player_list = []
             for p_name, pos, rating, age, team, emoji_id in unique_players:
                 # Build team display
@@ -93,12 +86,10 @@ class PlayerCommands(commands.Cog):
                     f"{team_prefix}**{p_name}** - {pos} ({rating} OVR, {age}yo)"
                 )
 
-            embed.add_field(
-                name="Players",
-                value="\n".join(player_list),
-                inline=False
+            embed = discord.Embed(
+                description="\n".join(player_list),
+                color=discord.Color.green()
             )
-            embed.set_footer(text=f"Showing {len(unique_players)} result(s)")
 
             await interaction.response.send_message(embed=embed)
 
