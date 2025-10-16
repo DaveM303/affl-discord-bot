@@ -72,53 +72,35 @@ class PlayerCommands(commands.Cog):
                 )
                 return
 
-            # If only one player found, show detailed view
-            if len(unique_players) == 1:
-                p_name, pos, rating, age, team, emoji_id = unique_players[0]
+            # Show list view for all results (single or multiple)
+            search_display = "', '".join(search_terms)
+            embed = discord.Embed(
+                title=f"Player Search: '{search_display}'",
+                description=f"Found {len(unique_players)} player(s)",
+                color=discord.Color.green()
+            )
 
+            player_list = []
+            for p_name, pos, rating, age, team, emoji_id in unique_players:
                 # Build team display
-                team_display = "Free Agent"
                 if team:
                     emoji = self.get_team_emoji(emoji_id)
-                    team_display = f"{emoji} {team}" if emoji else team
+                    team_prefix = f"{emoji} " if emoji else ""
+                else:
+                    team_prefix = ""
 
-                embed = discord.Embed(title=f"{p_name}", color=discord.Color.green())
-                embed.add_field(name="Position", value=pos, inline=True)
-                embed.add_field(name="Overall", value=rating, inline=True)
-                embed.add_field(name="Age", value=age, inline=True)
-                embed.add_field(name="Team", value=team_display, inline=True)
-
-                await interaction.response.send_message(embed=embed)
-            else:
-                # Multiple players found, show list view
-                search_display = "', '".join(search_terms)
-                embed = discord.Embed(
-                    title=f"Player Search: '{search_display}'",
-                    description=f"Found {len(unique_players)} player(s)",
-                    color=discord.Color.green()
+                player_list.append(
+                    f"{team_prefix}**{p_name}** - {pos} ({rating} OVR, {age}yo)"
                 )
 
-                player_list = []
-                for p_name, pos, rating, age, team, emoji_id in unique_players:
-                    # Build team display
-                    if team:
-                        emoji = self.get_team_emoji(emoji_id)
-                        team_prefix = f"{emoji} " if emoji else ""
-                    else:
-                        team_prefix = ""
+            embed.add_field(
+                name="Players",
+                value="\n".join(player_list),
+                inline=False
+            )
+            embed.set_footer(text=f"Showing {len(unique_players)} result(s)")
 
-                    player_list.append(
-                        f"{team_prefix}**{p_name}** - {pos} ({rating} OVR, {age}yo)"
-                    )
-
-                embed.add_field(
-                    name="Players",
-                    value="\n".join(player_list),
-                    inline=False
-                )
-                embed.set_footer(text=f"Showing {len(unique_players)} result(s)")
-
-                await interaction.response.send_message(embed=embed)
+            await interaction.response.send_message(embed=embed)
 
     async def team_name_autocomplete(
         self,
