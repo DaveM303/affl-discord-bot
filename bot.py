@@ -112,7 +112,21 @@ async def init_db():
                 FOREIGN KEY (receiving_team_id) REFERENCES teams(team_id)
             )
         ''')
-        
+
+        # Create Injuries table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS injuries (
+                injury_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                player_id INTEGER NOT NULL,
+                injury_type TEXT NOT NULL,
+                injury_round INTEGER NOT NULL,
+                recovery_rounds INTEGER NOT NULL,
+                return_round INTEGER NOT NULL,
+                status TEXT DEFAULT 'injured',
+                FOREIGN KEY (player_id) REFERENCES players(player_id)
+            )
+        ''')
+
         await db.commit()
         print("Database initialized successfully!")
 
@@ -126,6 +140,7 @@ async def on_ready():
     await bot.load_extension('commands.admin_commands')
     await bot.load_extension('commands.lineup_commands')
     await bot.load_extension('commands.season_commands')
+    await bot.load_extension('commands.injury_commands')
     
     try:
         if GUILD_ID:
