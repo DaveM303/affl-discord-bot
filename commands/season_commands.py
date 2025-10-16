@@ -8,8 +8,8 @@ from config import DB_PATH, ADMIN_ROLE_ID
 FINALS_ROUNDS = [
     "Pre-Finals Bye",
     "Finals Week 1",
-    "Finals Week 2",
-    "Preliminary Final",
+    "Semi Finals",
+    "Preliminary Finals",
     "Grand Final"
 ]
 
@@ -70,41 +70,6 @@ class SeasonCommands(commands.Cog):
         )
         return False
 
-    @app_commands.command(name="migrateseasons", description="[ADMIN] Migrate seasons table (run once after update)")
-    async def migrate_seasons(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            try:
-                # Drop old table
-                await db.execute("DROP TABLE IF EXISTS seasons")
-
-                # Create new table
-                await db.execute('''
-                    CREATE TABLE seasons (
-                        season_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        season_number INTEGER NOT NULL UNIQUE,
-                        current_round INTEGER DEFAULT 0,
-                        regular_rounds INTEGER DEFAULT 24,
-                        total_rounds INTEGER DEFAULT 29,
-                        round_name TEXT DEFAULT 'Offseason',
-                        status TEXT DEFAULT 'offseason'
-                    )
-                ''')
-
-                await db.commit()
-
-                await interaction.followup.send(
-                    "✅ Seasons table migrated successfully!\n"
-                    "You can now use `/createseason` to create seasons.",
-                    ephemeral=True
-                )
-            except Exception as e:
-                await interaction.followup.send(
-                    f"❌ Migration failed: {str(e)}",
-                    ephemeral=True
-                )
-
     @app_commands.command(name="createseason", description="[ADMIN] Create a new season")
     @app_commands.describe(
         season_number="Season number (e.g., 1, 2, 3)",
@@ -143,10 +108,7 @@ class SeasonCommands(commands.Cog):
             await db.commit()
 
             await interaction.response.send_message(
-                f"✅ Created **Season {season_number}**\n"
-                f"• Regular Season: {regular_rounds} rounds\n"
-                f"• Finals: {len(FINALS_ROUNDS)} rounds\n"
-                f"• Total: {total_rounds} rounds\n\n"
+                f"✅ Created **Season {season_number}** with {regular_rounds} rounds\n"
                 f"Use `/startseason` to begin the season."
             )
 
@@ -225,8 +187,94 @@ class SeasonCommands(commands.Cog):
             await db.commit()
 
             await interaction.response.send_message(
-                f"✅ Advanced to **{next_round_name}** of Season {season_number}\n"
-                f"({next_round_num}/{total_rounds})"
+                f"✅ Advanced to **{next_round_name}** of Season {season_number}"
+            )
+
+    @app_commands.command(name="editseason", description="[ADMIN] Edit a season's settings")
+    @app_commands.describe(
+        season_number="Season number to edit",
+        regular_rounds="New number of regular season rounds"
+    )
+    async def edit_season(
+        self,
+        interaction: discord.Interaction,
+        season_number: int,
+        regular_rounds: int
+    ):
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Find the season
+            cursor = await db.execute(
+                "SELECT season_id, status FROM seasons WHERE season_number = ?",
+                (season_number,)
+            )
+            season = await cursor.fetchone()
+
+            if not season:
+                await interaction.response.send_message(
+                    f"❌ Season {season_number} not found!",
+                    ephemeral=True
+                )
+                return
+
+            season_id, status = season
+
+            # Calculate new total rounds
+            total_rounds = regular_rounds + len(FINALS_ROUNDS)
+
+            # Update the season
+            await db.execute(
+                """UPDATE seasons
+                   SET regular_rounds = ?, total_rounds = ?
+                   WHERE season_id = ?""",
+                (regular_rounds, total_rounds, season_id)
+            )
+            await db.commit()
+
+            await interaction.response.send_message(
+                f"✅ Updated **Season {season_number}** to {regular_rounds} rounds"
+            )
+
+    @app_commands.command(name="setround", description="[ADMIN] Skip to a specific round")
+    @app_commands.describe(round_number="Round number to skip to")
+    async def set_round(self, interaction: discord.Interaction, round_number: int):
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Get active season
+            cursor = await db.execute(
+                """SELECT season_id, season_number, regular_rounds, total_rounds
+                   FROM seasons WHERE status = 'active' LIMIT 1"""
+            )
+            season = await cursor.fetchone()
+
+            if not season:
+                await interaction.response.send_message(
+                    "❌ No active season! Start a season first with `/startseason`.",
+                    ephemeral=True
+                )
+                return
+
+            season_id, season_number, regular_rounds, total_rounds = season
+
+            # Validate round number
+            if round_number < 1 or round_number > total_rounds:
+                await interaction.response.send_message(
+                    f"❌ Round number must be between 1 and {total_rounds}!",
+                    ephemeral=True
+                )
+                return
+
+            # Set the round
+            round_name = get_round_name(round_number, regular_rounds)
+
+            await db.execute(
+                """UPDATE seasons
+                   SET current_round = ?, round_name = ?
+                   WHERE season_id = ?""",
+                (round_number, round_name, season_id)
+            )
+            await db.commit()
+
+            await interaction.response.send_message(
+                f"✅ Skipped to **{round_name}** of Season {season_number}"
             )
 
     @app_commands.command(name="endseason", description="[ADMIN] End the current season")
