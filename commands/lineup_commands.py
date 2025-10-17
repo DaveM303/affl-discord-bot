@@ -151,8 +151,9 @@ class LineupCommands(commands.Cog):
         
         # Create the lineup view
         view = LineupView(team_id, team_name, current_lineup, roster, self.bot)
+        await view.initialize()  # Initialize warnings and player IDs
         embed = view.create_embed()
-        
+
         await interaction.followup.send(
             embed=embed,
             view=view,
@@ -528,12 +529,14 @@ class LineupView(discord.ui.View):
         for pos_name, name, pos, rating in current_lineup:
             self.lineup[pos_name] = {'name': name, 'pos': pos, 'rating': rating, 'player_id': None}
 
-        # Get player IDs for current lineup
-        self.refresh_lineup_ids()
-
         # Add position buttons
         self.current_group = 0  # 0=backs, 1=mids, 2=forwards, 3=interchange
         self.add_position_buttons()
+
+    async def initialize(self):
+        """Initialize player IDs and warnings (call this after creating the view)"""
+        await self.refresh_lineup_ids()
+        await self.update_warnings()
     
     async def refresh_lineup_ids(self):
         """Get player IDs for current lineup players"""
