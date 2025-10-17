@@ -218,43 +218,23 @@ class AdminCommands(commands.Cog):
                     ephemeral=True
                 )
 
-    @app_commands.command(name="setlineupschannel", description="[ADMIN] Set the channel where submitted lineups are posted")
-    @app_commands.describe(
-        team_name="Team name",
-        channel="Channel for lineup submissions"
-    )
+    @app_commands.command(name="setlineupschannel", description="[ADMIN] Set the channel where all submitted lineups are posted")
+    @app_commands.describe(channel="Channel for all lineup submissions")
     async def set_lineups_channel(
         self,
         interaction: discord.Interaction,
-        team_name: str,
         channel: discord.TextChannel
     ):
         async with aiosqlite.connect(DB_PATH) as db:
-            # Find the team
-            cursor = await db.execute(
-                "SELECT team_id FROM teams WHERE team_name LIKE ?",
-                (f"%{team_name}%",)
-            )
-            team = await cursor.fetchone()
-
-            if not team:
-                await interaction.response.send_message(
-                    f"❌ No team found matching '{team_name}'",
-                    ephemeral=True
-                )
-                return
-
-            team_id = team[0]
-
-            # Update lineup channel
+            # Set the global lineups channel
             await db.execute(
-                "UPDATE teams SET lineup_channel_id = ? WHERE team_id = ?",
-                (str(channel.id), team_id)
+                "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
+                ("lineups_channel_id", str(channel.id))
             )
             await db.commit()
 
             await interaction.response.send_message(
-                f"✅ Lineup submissions for **{team_name}** will be posted in {channel.mention}"
+                f"✅ All lineup submissions will be posted in {channel.mention}"
             )
 
     @app_commands.command(name="removeteam", description="[ADMIN] Remove a team from the league")

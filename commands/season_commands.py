@@ -104,13 +104,22 @@ class SeasonCommands(commands.Cog):
                     )
                 ''')
 
-                # Add lineup_channel_id to teams table if it doesn't exist
+                # Create settings table for global bot settings
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS settings (
+                        setting_key TEXT PRIMARY KEY,
+                        setting_value TEXT
+                    )
+                ''')
+
+                # Remove lineup_channel_id from teams if it exists (moved to settings)
                 cursor = await db.execute("PRAGMA table_info(teams)")
                 columns = await cursor.fetchall()
                 column_names = [col[1] for col in columns]
 
-                if 'lineup_channel_id' not in column_names:
-                    await db.execute("ALTER TABLE teams ADD COLUMN lineup_channel_id TEXT")
+                if 'lineup_channel_id' in column_names:
+                    # Can't drop column in SQLite, so just notify user it's deprecated
+                    pass
 
                 await db.commit()
 
@@ -118,8 +127,9 @@ class SeasonCommands(commands.Cog):
                     "✅ Database migrated successfully!\n"
                     "• Seasons table updated\n"
                     "• Injuries table created\n"
-                    "• Teams table updated with lineup_channel_id\n\n"
-                    "You can now use all season, injury, and lineup submission commands.",
+                    "• Settings table created\n\n"
+                    "You can now use all season, injury, and lineup submission commands.\n"
+                    "Use `/setlineupschannel` to configure where lineups are posted.",
                     ephemeral=True
                 )
             except Exception as e:

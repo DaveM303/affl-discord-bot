@@ -33,8 +33,15 @@ async def init_db():
                 team_name TEXT NOT NULL UNIQUE,
                 role_id TEXT,
                 emoji_id TEXT,
-                channel_id TEXT,
-                lineup_channel_id TEXT
+                channel_id TEXT
+            )
+        ''')
+
+        # Create Settings table for global bot settings
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT
             )
         ''')
         

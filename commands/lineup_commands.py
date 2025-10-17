@@ -326,14 +326,21 @@ class LineupCommands(commands.Cog):
             )
             lineup = await cursor.fetchall()
 
-            # Get team emoji and lineup channel
+            # Get team emoji
             cursor = await db.execute(
-                "SELECT emoji_id, lineup_channel_id FROM teams WHERE team_id = ?",
+                "SELECT emoji_id FROM teams WHERE team_id = ?",
                 (team_id,)
             )
             result = await cursor.fetchone()
             emoji_id = result[0] if result else None
-            lineup_channel_id = result[1] if result else None
+
+            # Get global lineups channel
+            cursor = await db.execute(
+                "SELECT setting_value FROM settings WHERE setting_key = ?",
+                ("lineups_channel_id",)
+            )
+            result = await cursor.fetchone()
+            lineup_channel_id = result[0] if result else None
 
             # Get current round
             cursor = await db.execute(
@@ -399,7 +406,7 @@ class LineupCommands(commands.Cog):
         # If no lineup channel set, warn
         if not lineup_channel_id:
             await interaction.followup.send(
-                "⚠️ No lineup submission channel set for your team!\n"
+                "⚠️ No lineup submission channel has been set!\n"
                 "Ask an admin to use `/setlineupschannel` to set it up.",
                 ephemeral=True
             )
