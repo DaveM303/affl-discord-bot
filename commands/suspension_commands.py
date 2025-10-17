@@ -10,11 +10,7 @@ class SuspensionCommands(commands.Cog):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Check if user has admin permissions for admin commands"""
-        # Public commands
-        if interaction.command.name in ['suspensionlist']:
-            return True
-
-        # Admin check for other commands
+        # Admin check for all commands
         if interaction.guild.owner_id == interaction.user.id:
             return True
 
@@ -179,134 +175,6 @@ class SuspensionCommands(commands.Cog):
                     f"**{p_name}** has been suspended for **{suspension_reason}** and will miss **{games_missed} {game_text}**.\n"
                     f"Expected return: {return_text}"
                 )
-
-    @app_commands.command(name="suspensionlist", description="View current suspensions")
-    @app_commands.describe(team_name="Team name (leave empty for your team, use 'all' for all teams)")
-    async def suspension_list(self, interaction: discord.Interaction, team_name: str = None):
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Get current round and total rounds
-            cursor = await db.execute(
-                "SELECT current_round, total_rounds FROM seasons WHERE status = 'active' LIMIT 1"
-            )
-            season_info = await cursor.fetchone()
-            current_round = season_info[0] if season_info else 0
-            total_rounds = season_info[1] if season_info else 0
-
-            # Determine which team to show
-            filter_team_id = None
-            title_suffix = ""
-
-            if team_name and team_name.lower() == 'all':
-                # Show all teams - no suffix
-                filter_team_id = None
-                title_suffix = ""
-            elif team_name:
-                # Show specific team
-                cursor = await db.execute(
-                    "SELECT team_id, team_name FROM teams WHERE team_name LIKE ?",
-                    (f"%{team_name}%",)
-                )
-                team = await cursor.fetchone()
-                if not team:
-                    await interaction.response.send_message(
-                        f"❌ No team found matching '{team_name}'",
-                        ephemeral=True
-                    )
-                    return
-                filter_team_id = team[0]
-                title_suffix = f" - {team[1]}"
-            else:
-                # Default to user's team
-                cursor = await db.execute(
-                    "SELECT team_name, role_id FROM teams WHERE role_id IS NOT NULL"
-                )
-                teams = await cursor.fetchall()
-
-                user_team_id = None
-                user_team_name = None
-                for t_name, role_id in teams:
-                    role = interaction.guild.get_role(int(role_id))
-                    if role and role in interaction.user.roles:
-                        cursor = await db.execute(
-                            "SELECT team_id FROM teams WHERE team_name = ?",
-                            (t_name,)
-                        )
-                        result = await cursor.fetchone()
-                        if result:
-                            user_team_id = result[0]
-                            user_team_name = t_name
-                            break
-
-                if user_team_id:
-                    filter_team_id = user_team_id
-                    title_suffix = f" - {user_team_name}"
-                else:
-                    # User has no team, show all
-                    filter_team_id = None
-                    title_suffix = ""
-
-            # Get active suspensions (filtered by team if specified)
-            if filter_team_id:
-                cursor = await db.execute(
-                    """SELECT p.name, s.suspension_reason, s.return_round, t.team_name, t.emoji_id
-                       FROM suspensions s
-                       JOIN players p ON s.player_id = p.player_id
-                       LEFT JOIN teams t ON p.team_id = t.team_id
-                       WHERE s.status = 'suspended' AND p.team_id = ?
-                       ORDER BY s.return_round ASC, p.name ASC""",
-                    (filter_team_id,)
-                )
-            else:
-                cursor = await db.execute(
-                    """SELECT p.name, s.suspension_reason, s.return_round, t.team_name, t.emoji_id
-                       FROM suspensions s
-                       JOIN players p ON s.player_id = p.player_id
-                       LEFT JOIN teams t ON p.team_id = t.team_id
-                       WHERE s.status = 'suspended'
-                       ORDER BY s.return_round ASC, p.name ASC"""
-                )
-            suspensions = await cursor.fetchall()
-
-            if not suspensions:
-                await interaction.response.send_message("No active suspensions!")
-                return
-
-            # Build suspension list
-            suspension_list = []
-            for name, suspension_reason, return_round, team_name, emoji_id in suspensions:
-                # Calculate games remaining
-                games_left = return_round - current_round
-
-                # Get team emoji
-                team_display = ""
-                if team_name:
-                    try:
-                        if emoji_id:
-                            emoji = self.bot.get_emoji(int(emoji_id))
-                            if emoji:
-                                team_display = f"{emoji} "
-                    except:
-                        pass
-
-                if games_left <= 0:
-                    status = "✅ Ready to return"
-                else:
-                    game_text = "game" if games_left == 1 else "games"
-                    # Check if suspension extends beyond season
-                    season_indicator = " (SEASON)" if return_round > total_rounds else ""
-                    status = f"- {games_left} {game_text}{season_indicator}"
-
-                suspension_list.append(
-                    f"{team_display}**{name}** - {suspension_reason} {status}"
-                )
-
-            embed = discord.Embed(
-                title=f"Suspension List - Round {current_round}{title_suffix}",
-                description="\n".join(suspension_list),
-                color=discord.Color.orange()
-            )
-
-            await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="editsuspension", description="[ADMIN] Edit a player's suspension")
     @app_commands.describe(

@@ -183,7 +183,7 @@ class InjuryCommands(commands.Cog):
                     f"Expected return: {return_text}"
                 )
 
-    @app_commands.command(name="injurylist", description="View current injuries")
+    @app_commands.command(name="injurylist", description="View current injuries and suspensions")
     @app_commands.describe(team_name="Team name (leave empty for your team, use 'all' for all teams)")
     async def injury_list(self, interaction: discord.Interaction, team_name: str = None):
         async with aiosqlite.connect(DB_PATH) as db:
@@ -270,42 +270,100 @@ class InjuryCommands(commands.Cog):
                 )
             injuries = await cursor.fetchall()
 
-            if not injuries:
-                await interaction.response.send_message("No active injuries!")
+            # Get active suspensions (filtered by team if specified)
+            if filter_team_id:
+                cursor = await db.execute(
+                    """SELECT p.name, s.suspension_reason, s.return_round, t.team_name, t.emoji_id
+                       FROM suspensions s
+                       JOIN players p ON s.player_id = p.player_id
+                       LEFT JOIN teams t ON p.team_id = t.team_id
+                       WHERE s.status = 'suspended' AND p.team_id = ?
+                       ORDER BY s.return_round ASC, p.name ASC""",
+                    (filter_team_id,)
+                )
+            else:
+                cursor = await db.execute(
+                    """SELECT p.name, s.suspension_reason, s.return_round, t.team_name, t.emoji_id
+                       FROM suspensions s
+                       JOIN players p ON s.player_id = p.player_id
+                       LEFT JOIN teams t ON p.team_id = t.team_id
+                       WHERE s.status = 'suspended'
+                       ORDER BY s.return_round ASC, p.name ASC"""
+                )
+            suspensions = await cursor.fetchall()
+
+            if not injuries and not suspensions:
+                await interaction.response.send_message("No active injuries or suspensions!")
                 return
 
-            # Build injury list
-            injury_list = []
-            for name, injury_type, return_round, team_name, emoji_id in injuries:
-                # Calculate weeks remaining
-                weeks_left = return_round - current_round
+            # Build combined list
+            combined_list = []
 
-                # Get team emoji
-                team_display = ""
-                if team_name:
-                    try:
-                        if emoji_id:
-                            emoji = self.bot.get_emoji(int(emoji_id))
-                            if emoji:
-                                team_display = f"{emoji} "
-                    except:
-                        pass
+            # Add injuries
+            if injuries:
+                combined_list.append("**🚑 Injuries:**")
+                for name, injury_type, return_round, team_name, emoji_id in injuries:
+                    # Calculate weeks remaining
+                    weeks_left = return_round - current_round
 
-                if weeks_left <= 0:
-                    status = "✅ Ready to return"
-                else:
-                    week_text = "week" if weeks_left == 1 else "weeks"
-                    # Check if injury extends beyond season
-                    season_indicator = " (SEASON)" if return_round > total_rounds else ""
-                    status = f"- {weeks_left} {week_text}{season_indicator}"
+                    # Get team emoji
+                    team_display = ""
+                    if team_name:
+                        try:
+                            if emoji_id:
+                                emoji = self.bot.get_emoji(int(emoji_id))
+                                if emoji:
+                                    team_display = f"{emoji} "
+                        except:
+                            pass
 
-                injury_list.append(
-                    f"{team_display}**{name}** - {injury_type} {status}"
-                )
+                    if weeks_left <= 0:
+                        status = "✅ Ready to return"
+                    else:
+                        week_text = "week" if weeks_left == 1 else "weeks"
+                        # Check if injury extends beyond season
+                        season_indicator = " (SEASON)" if return_round > total_rounds else ""
+                        status = f"- {weeks_left} {week_text}{season_indicator}"
+
+                    combined_list.append(
+                        f"{team_display}**{name}** - {injury_type} {status}"
+                    )
+
+            # Add suspensions
+            if suspensions:
+                if injuries:
+                    combined_list.append("")  # Empty line separator
+                combined_list.append("**🚫 Suspensions:**")
+                for name, suspension_reason, return_round, team_name, emoji_id in suspensions:
+                    # Calculate games remaining
+                    games_left = return_round - current_round
+
+                    # Get team emoji
+                    team_display = ""
+                    if team_name:
+                        try:
+                            if emoji_id:
+                                emoji = self.bot.get_emoji(int(emoji_id))
+                                if emoji:
+                                    team_display = f"{emoji} "
+                        except:
+                            pass
+
+                    if games_left <= 0:
+                        status = "✅ Ready to return"
+                    else:
+                        game_text = "game" if games_left == 1 else "games"
+                        # Check if suspension extends beyond season
+                        season_indicator = " (SEASON)" if return_round > total_rounds else ""
+                        status = f"- {games_left} {game_text}{season_indicator}"
+
+                    combined_list.append(
+                        f"{team_display}**{name}** - {suspension_reason} {status}"
+                    )
 
             embed = discord.Embed(
-                title=f"Injury List - Round {current_round}{title_suffix}",
-                description="\n".join(injury_list),
+                title=f"Injury & Suspension List - Round {current_round}{title_suffix}",
+                description="\n".join(combined_list),
                 color=discord.Color.red()
             )
 
