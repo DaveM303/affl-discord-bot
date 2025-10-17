@@ -151,11 +151,24 @@ class InjuryCommands(commands.Cog):
             # Notify team channel
             if team_id:
                 team_display = team_name if team_name else "Free Agent"
-                round_text = "round" if recovery_rounds == 1 else "rounds"
+                week_text = "week" if recovery_rounds == 1 else "weeks"
+
+                # Use "an" for vowels, "a" for consonants
+                article = "an" if injury_type[0].lower() in 'aeiou' else "a"
+
+                # Check if injury extends beyond season
+                cursor = await db.execute(
+                    "SELECT total_rounds FROM seasons WHERE status = 'active' LIMIT 1"
+                )
+                season_info = await cursor.fetchone()
+                season_ending = ""
+                if season_info and return_round > season_info[0]:
+                    season_ending = " (SEASON)"
+
                 await self.notify_team_channel(
                     team_id,
                     f"🚑 **Injury Update**\n"
-                    f"**{p_name}** has suffered a **{injury_type} injury** and will miss **{recovery_rounds} {round_text}**.\n"
+                    f"**{p_name}** has suffered {article} **{injury_type} injury** and will miss **{recovery_rounds} {week_text}{season_ending}**.\n"
                     f"Expected return: Round {return_round}"
                 )
 
@@ -163,17 +176,22 @@ class InjuryCommands(commands.Cog):
     @app_commands.describe(team_name="Team name (leave empty for your team, use 'all' for all teams)")
     async def injury_list(self, interaction: discord.Interaction, team_name: str = None):
         async with aiosqlite.connect(DB_PATH) as db:
-            # Get current round
-            current_round = await self.get_current_round(db)
+            # Get current round and total rounds
+            cursor = await db.execute(
+                "SELECT current_round, total_rounds FROM seasons WHERE status = 'active' LIMIT 1"
+            )
+            season_info = await cursor.fetchone()
+            current_round = season_info[0] if season_info else 0
+            total_rounds = season_info[1] if season_info else 0
 
             # Determine which team to show
             filter_team_id = None
             title_suffix = ""
 
             if team_name and team_name.lower() == 'all':
-                # Show all teams
+                # Show all teams - no suffix
                 filter_team_id = None
-                title_suffix = " - All Teams"
+                title_suffix = ""
             elif team_name:
                 # Show specific team
                 cursor = await db.execute(
@@ -217,7 +235,7 @@ class InjuryCommands(commands.Cog):
                 else:
                     # User has no team, show all
                     filter_team_id = None
-                    title_suffix = " - All Teams"
+                    title_suffix = ""
 
             # Get active injuries (filtered by team if specified)
             if filter_team_id:
@@ -248,8 +266,8 @@ class InjuryCommands(commands.Cog):
             # Build injury list
             injury_list = []
             for name, injury_type, return_round, team_name, emoji_id in injuries:
-                # Calculate rounds remaining
-                rounds_left = return_round - current_round
+                # Calculate weeks remaining
+                weeks_left = return_round - current_round
 
                 # Get team emoji
                 team_display = ""
@@ -262,13 +280,16 @@ class InjuryCommands(commands.Cog):
                     except:
                         pass
 
-                if rounds_left <= 0:
+                if weeks_left <= 0:
                     status = "✅ Ready to return"
                 else:
-                    status = f"⏳ {rounds_left} round(s) remaining"
+                    week_text = "week" if weeks_left == 1 else "weeks"
+                    # Check if injury extends beyond season
+                    season_indicator = " (SEASON)" if return_round > total_rounds else ""
+                    status = f"- {weeks_left} {week_text}{season_indicator}"
 
                 injury_list.append(
-                    f"{team_display}**{name}** - {injury_type} ({status})"
+                    f"{team_display}**{name}** - {injury_type} {status}"
                 )
 
             embed = discord.Embed(
@@ -276,7 +297,6 @@ class InjuryCommands(commands.Cog):
                 description="\n".join(injury_list),
                 color=discord.Color.red()
             )
-            embed.set_footer(text=f"{len(injuries)} active injury(ies)")
 
             await interaction.response.send_message(embed=embed)
 
