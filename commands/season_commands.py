@@ -404,12 +404,15 @@ class SeasonCommands(commands.Cog):
                 f"✅ Skipped to **{round_name}** of Season {season_number}"
             )
 
-    @app_commands.command(name="endseason", description="[ADMIN] End the current season")
-    async def end_season(self, interaction: discord.Interaction):
+    @app_commands.command(name="endseason", description="[ADMIN] End the current season and create offseason")
+    @app_commands.describe(
+        next_season_rounds="Number of rounds for next season (default: same as current season)"
+    )
+    async def end_season(self, interaction: discord.Interaction, next_season_rounds: int = None):
         async with aiosqlite.connect(DB_PATH) as db:
             # Get active season
             cursor = await db.execute(
-                """SELECT season_id, season_number FROM seasons
+                """SELECT season_id, season_number, regular_rounds FROM seasons
                    WHERE status = 'active' LIMIT 1"""
             )
             season = await cursor.fetchone()
@@ -421,20 +424,50 @@ class SeasonCommands(commands.Cog):
                 )
                 return
 
-            season_id, season_number = season
+            season_id, season_number, current_regular_rounds = season
 
-            # End the season
+            # Use current season's rounds if not specified
+            if next_season_rounds is None:
+                next_season_rounds = current_regular_rounds
+
+            # End the current season
             await db.execute(
                 """UPDATE seasons
                    SET status = 'completed', round_name = 'Season Complete'
                    WHERE season_id = ?""",
                 (season_id,)
             )
+
+            # Check if next season already exists
+            next_season_num = season_number + 1
+            cursor = await db.execute(
+                "SELECT season_id FROM seasons WHERE season_number = ?",
+                (next_season_num,)
+            )
+            existing = await cursor.fetchone()
+
+            if existing:
+                await db.commit()
+                await interaction.response.send_message(
+                    f"✅ **Season {season_number}** has ended!\n"
+                    f"⚠️ Season {next_season_num} already exists. Use `/startseason` when ready.",
+                    ephemeral=True
+                )
+                return
+
+            # Create next season in offseason status
+            total_rounds = next_season_rounds + len(FINALS_ROUNDS)
+            await db.execute(
+                """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
+                   VALUES (?, 0, ?, ?, 'Offseason', 'offseason')""",
+                (next_season_num, next_season_rounds, total_rounds)
+            )
             await db.commit()
 
             await interaction.response.send_message(
                 f"✅ **Season {season_number}** has ended!\n"
-                f"Create a new season with `/createseason {season_number + 1}`"
+                f"✅ **Season {next_season_num}** created in offseason ({next_season_rounds} rounds)\n\n"
+                f"Use `/startseason` when ready to begin Season {next_season_num}."
             )
 
     @app_commands.command(name="currentseason", description="View the current season status")
