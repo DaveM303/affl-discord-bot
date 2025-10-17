@@ -313,9 +313,42 @@ class SeasonCommands(commands.Cog):
             )
             await db.commit()
 
-            await interaction.response.send_message(
-                f"✅ Advanced to **{next_round_name}** of Season {season_number}"
+            # Check for players who have recovered
+            cursor = await db.execute(
+                """SELECT i.injury_id, p.name, p.team_id, t.channel_id
+                   FROM injuries i
+                   JOIN players p ON i.player_id = p.player_id
+                   LEFT JOIN teams t ON p.team_id = t.team_id
+                   WHERE i.status = 'injured' AND i.return_round <= ?""",
+                (next_round_num,)
             )
+            recovered_players = await cursor.fetchall()
+
+            # Mark recovered players and send notifications
+            for injury_id, player_name, team_id, channel_id in recovered_players:
+                # Mark as recovered
+                await db.execute(
+                    "UPDATE injuries SET status = 'recovered' WHERE injury_id = ?",
+                    (injury_id,)
+                )
+
+                # Notify team channel
+                if team_id and channel_id:
+                    channel = self.bot.get_channel(int(channel_id))
+                    if channel:
+                        await channel.send(
+                            f"✅ **Recovery Update**\n"
+                            f"**{player_name}** has recovered from injury and is available for selection!"
+                        )
+
+            if recovered_players:
+                await db.commit()
+
+            response = f"✅ Advanced to **{next_round_name}** of Season {season_number}"
+            if recovered_players:
+                response += f"\n\n🏥 {len(recovered_players)} player(s) recovered from injury"
+
+            await interaction.response.send_message(response)
 
     @app_commands.command(name="editseason", description="[ADMIN] Edit a season's settings")
     @app_commands.describe(
