@@ -104,6 +104,20 @@ class SeasonCommands(commands.Cog):
                     )
                 ''')
 
+                # Create suspensions table
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS suspensions (
+                        suspension_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        player_id INTEGER NOT NULL,
+                        suspension_reason TEXT NOT NULL,
+                        suspension_round INTEGER NOT NULL,
+                        games_missed INTEGER NOT NULL,
+                        return_round INTEGER NOT NULL,
+                        status TEXT DEFAULT 'suspended',
+                        FOREIGN KEY (player_id) REFERENCES players(player_id)
+                    )
+                ''')
+
                 # Create settings table for global bot settings
                 await db.execute('''
                     CREATE TABLE IF NOT EXISTS settings (
@@ -127,8 +141,9 @@ class SeasonCommands(commands.Cog):
                     "✅ Database migrated successfully!\n"
                     "• Seasons table updated\n"
                     "• Injuries table created\n"
+                    "• Suspensions table created\n"
                     "• Settings table created\n\n"
-                    "You can now use all season, injury, and lineup submission commands.\n"
+                    "You can now use all season, injury, suspension, and lineup submission commands.\n"
                     "Use `/setlineupschannel` to configure where lineups are posted.",
                     ephemeral=True
                 )
@@ -213,6 +228,8 @@ class SeasonCommands(commands.Cog):
 
             carried_over = 0
             healed_during_offseason = 0
+            suspensions_carried_over = 0
+            suspensions_completed_offseason = 0
 
             if prev_season:
                 prev_season_id, prev_total_rounds = prev_season
@@ -251,6 +268,40 @@ class SeasonCommands(commands.Cog):
                         )
                         carried_over += 1
 
+                # Find suspensions that were still active at end of previous season
+                cursor = await db.execute(
+                    """SELECT suspension_id, player_id, suspension_reason, return_round
+                       FROM suspensions
+                       WHERE status = 'suspended' AND return_round > ?""",
+                    (prev_total_rounds,)
+                )
+                active_suspensions = await cursor.fetchall()
+
+                for suspension_id, player_id, suspension_reason, old_return_round in active_suspensions:
+                    # Calculate games remaining from end of last season
+                    games_remaining = old_return_round - prev_total_rounds
+
+                    # Subtract offseason weeks
+                    games_into_new_season = games_remaining - offseason_weeks
+
+                    if games_into_new_season <= 0:
+                        # Suspension completed during offseason
+                        await db.execute(
+                            "UPDATE suspensions SET status = 'completed' WHERE suspension_id = ?",
+                            (suspension_id,)
+                        )
+                        suspensions_completed_offseason += 1
+                    else:
+                        # Suspension carries over - update return round for new season
+                        new_return_round = games_into_new_season
+                        await db.execute(
+                            """UPDATE suspensions
+                               SET return_round = ?
+                               WHERE suspension_id = ?""",
+                            (new_return_round, suspension_id)
+                        )
+                        suspensions_carried_over += 1
+
                 await db.commit()
 
             # Start the season
@@ -271,6 +322,13 @@ class SeasonCommands(commands.Cog):
                     message += f"\n• {healed_during_offseason} player(s) healed during offseason"
                 if carried_over > 0:
                     message += f"\n• {carried_over} injury(ies) carried over to new season"
+
+            if suspensions_carried_over > 0 or suspensions_completed_offseason > 0:
+                message += f"\n\n**Suspension Updates:**"
+                if suspensions_completed_offseason > 0:
+                    message += f"\n• {suspensions_completed_offseason} suspension(s) completed during offseason"
+                if suspensions_carried_over > 0:
+                    message += f"\n• {suspensions_carried_over} suspension(s) carried over to new season"
 
             await interaction.followup.send(message, ephemeral=True)
 
@@ -313,7 +371,7 @@ class SeasonCommands(commands.Cog):
             )
             await db.commit()
 
-            # Check for players who have recovered
+            # Check for players who have recovered from injuries
             cursor = await db.execute(
                 """SELECT i.injury_id, p.name, p.team_id, t.channel_id
                    FROM injuries i
@@ -344,9 +402,42 @@ class SeasonCommands(commands.Cog):
             if recovered_players:
                 await db.commit()
 
+            # Check for players whose suspensions are complete
+            cursor = await db.execute(
+                """SELECT s.suspension_id, p.name, p.team_id, t.channel_id
+                   FROM suspensions s
+                   JOIN players p ON s.player_id = p.player_id
+                   LEFT JOIN teams t ON p.team_id = t.team_id
+                   WHERE s.status = 'suspended' AND s.return_round <= ?""",
+                (next_round_num,)
+            )
+            completed_suspensions = await cursor.fetchall()
+
+            # Mark suspensions as completed and send notifications
+            for suspension_id, player_name, team_id, channel_id in completed_suspensions:
+                # Mark as completed
+                await db.execute(
+                    "UPDATE suspensions SET status = 'completed' WHERE suspension_id = ?",
+                    (suspension_id,)
+                )
+
+                # Notify team channel
+                if team_id and channel_id:
+                    channel = self.bot.get_channel(int(channel_id))
+                    if channel:
+                        await channel.send(
+                            f"✅ **Suspension Update**\n"
+                            f"**{player_name}**'s suspension has been lifted and they are available for selection!"
+                        )
+
+            if completed_suspensions:
+                await db.commit()
+
             response = f"✅ Advanced to **{next_round_name}** of Season {season_number}"
             if recovered_players:
                 response += f"\n\n🏥 {len(recovered_players)} player(s) recovered from injury"
+            if completed_suspensions:
+                response += f"\n🚫 {len(completed_suspensions)} suspension(s) completed"
 
             await interaction.response.send_message(response)
 

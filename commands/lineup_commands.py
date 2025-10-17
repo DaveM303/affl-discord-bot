@@ -375,10 +375,12 @@ class LineupCommands(commands.Cog):
         if duplicates:
             errors.append(f"❌ Duplicate players: {', '.join(duplicates)}")
 
-        # Check for injured players
+        # Check for injured players and suspended players
         if player_ids:
             async with aiosqlite.connect(DB_PATH) as db:
                 placeholders = ','.join('?' * len(player_ids))
+
+                # Check injuries
                 cursor = await db.execute(
                     f"""SELECT p.name, i.return_round
                        FROM injuries i
@@ -396,6 +398,25 @@ class LineupCommands(commands.Cog):
 
                 if injured_players:
                     errors.append(f"❌ Injured players: {', '.join(injured_players)}")
+
+                # Check suspensions
+                cursor = await db.execute(
+                    f"""SELECT p.name, s.return_round
+                       FROM suspensions s
+                       JOIN players p ON s.player_id = p.player_id
+                       WHERE s.player_id IN ({placeholders}) AND s.status = 'suspended'""",
+                    player_ids
+                )
+                suspensions = await cursor.fetchall()
+
+                suspended_players = []
+                for name, return_round in suspensions:
+                    games_left = return_round - current_round
+                    if games_left > 0:
+                        suspended_players.append(f"{name} ({games_left}g)")
+
+                if suspended_players:
+                    errors.append(f"❌ Suspended players: {', '.join(suspended_players)}")
 
         # If there are errors, don't submit
         if errors:
@@ -688,6 +709,40 @@ class LineupView(discord.ui.View):
 
         return injured
 
+    async def get_suspended_players(self):
+        """Check for suspended players in lineup - returns list of (player_name, games_left) tuples"""
+        suspended = []
+        player_ids = [p.get('player_id') for p in self.lineup.values() if p.get('player_id')]
+
+        if not player_ids:
+            return suspended
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Get current round
+            cursor = await db.execute(
+                "SELECT current_round FROM seasons WHERE status = 'active' LIMIT 1"
+            )
+            season_info = await cursor.fetchone()
+            current_round = season_info[0] if season_info else 0
+
+            # Check for suspensions
+            placeholders = ','.join('?' * len(player_ids))
+            cursor = await db.execute(
+                f"""SELECT p.name, s.return_round
+                   FROM suspensions s
+                   JOIN players p ON s.player_id = p.player_id
+                   WHERE s.player_id IN ({placeholders}) AND s.status = 'suspended'""",
+                player_ids
+            )
+            suspensions = await cursor.fetchall()
+
+            for name, return_round in suspensions:
+                games_left = return_round - current_round
+                if games_left > 0:
+                    suspended.append((name, games_left))
+
+        return suspended
+
     async def update_warnings(self):
         """Update the warnings list based on current lineup"""
         self.warnings = []
@@ -702,6 +757,12 @@ class LineupView(discord.ui.View):
         if injured:
             injured_str = ', '.join([f"{name} ({weeks}w)" for name, weeks in injured])
             self.warnings.append(f"🚑 **Injured players:** {injured_str}")
+
+        # Check for suspended players
+        suspended = await self.get_suspended_players()
+        if suspended:
+            suspended_str = ', '.join([f"{name} ({games}g)" for name, games in suspended])
+            self.warnings.append(f"🚫 **Suspended players:** {suspended_str}")
 
     def create_embed(self):
         """Create the lineup display embed"""

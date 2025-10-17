@@ -135,6 +135,20 @@ async def init_db():
             )
         ''')
 
+        # Create Suspensions table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS suspensions (
+                suspension_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                player_id INTEGER NOT NULL,
+                suspension_reason TEXT NOT NULL,
+                suspension_round INTEGER NOT NULL,
+                games_missed INTEGER NOT NULL,
+                return_round INTEGER NOT NULL,
+                status TEXT DEFAULT 'suspended',
+                FOREIGN KEY (player_id) REFERENCES players(player_id)
+            )
+        ''')
+
         await db.commit()
         print("Database initialized successfully!")
 
@@ -149,6 +163,7 @@ async def on_ready():
     await bot.load_extension('commands.lineup_commands')
     await bot.load_extension('commands.season_commands')
     await bot.load_extension('commands.injury_commands')
+    await bot.load_extension('commands.suspension_commands')
     
     try:
         if GUILD_ID:
