@@ -61,6 +61,25 @@ class LineupCommands(commands.Cog):
 
         return False
 
+    async def team_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete for team names"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT team_name FROM teams ORDER BY team_name")
+            teams = await cursor.fetchall()
+
+        # Filter teams based on what the user has typed
+        choices = []
+        for (team_name,) in teams:
+            if current.lower() in team_name.lower():
+                choices.append(app_commands.Choice(name=team_name, value=team_name))
+
+        # Return up to 25 choices (Discord limit)
+        return choices[:25]
+
     @app_commands.command(name="setlineup", description="Set your team's 22-player lineup")
     @app_commands.describe(team_name="[ADMIN ONLY] Team name to manage lineup for")
     @app_commands.autocomplete(team_name=team_autocomplete)
@@ -139,25 +158,6 @@ class LineupCommands(commands.Cog):
             view=view,
             ephemeral=True
         )
-
-    async def team_autocomplete(
-        self,
-        interaction: discord.Interaction,
-        current: str,
-    ) -> list[app_commands.Choice[str]]:
-        """Autocomplete for team names"""
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT team_name FROM teams ORDER BY team_name")
-            teams = await cursor.fetchall()
-
-        # Filter teams based on what the user has typed
-        choices = []
-        for (team_name,) in teams:
-            if current.lower() in team_name.lower():
-                choices.append(app_commands.Choice(name=team_name, value=team_name))
-
-        # Return up to 25 choices (Discord limit)
-        return choices[:25]
 
     @app_commands.command(name="viewlineup", description="View your team's current lineup")
     @app_commands.autocomplete(team_name=team_autocomplete)
