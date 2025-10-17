@@ -181,24 +181,77 @@ class SeasonCommands(commands.Cog):
             )
 
     @app_commands.command(name="startseason", description="[ADMIN] Start the current offseason")
-    async def start_season(self, interaction: discord.Interaction):
+    @app_commands.describe(offseason_weeks="Number of weeks in offseason (default: 23)")
+    async def start_season(self, interaction: discord.Interaction, offseason_weeks: int = 23):
+        await interaction.response.defer(ephemeral=True)
+
         async with aiosqlite.connect(DB_PATH) as db:
             # Find the offseason
             cursor = await db.execute(
-                """SELECT season_id, season_number, regular_rounds FROM seasons
+                """SELECT season_id, season_number, regular_rounds, total_rounds FROM seasons
                    WHERE status = 'offseason'
                    ORDER BY season_number DESC LIMIT 1"""
             )
             season = await cursor.fetchone()
 
             if not season:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "❌ No offseason found! Create a season first with `/createseason`.",
                     ephemeral=True
                 )
                 return
 
-            season_id, season_number, regular_rounds = season
+            season_id, season_number, regular_rounds, total_rounds = season
+
+            # Get previous season's final round to calculate injury carryover
+            cursor = await db.execute(
+                """SELECT season_id, total_rounds FROM seasons
+                   WHERE status = 'completed'
+                   ORDER BY season_number DESC LIMIT 1"""
+            )
+            prev_season = await cursor.fetchone()
+
+            carried_over = 0
+            healed_during_offseason = 0
+
+            if prev_season:
+                prev_season_id, prev_total_rounds = prev_season
+
+                # Find injuries that were still active at end of previous season
+                cursor = await db.execute(
+                    """SELECT injury_id, player_id, injury_type, return_round
+                       FROM injuries
+                       WHERE status = 'injured' AND return_round > ?""",
+                    (prev_total_rounds,)
+                )
+                active_injuries = await cursor.fetchall()
+
+                for injury_id, player_id, injury_type, old_return_round in active_injuries:
+                    # Calculate weeks remaining from end of last season
+                    weeks_remaining = old_return_round - prev_total_rounds
+
+                    # Subtract offseason weeks
+                    weeks_into_new_season = weeks_remaining - offseason_weeks
+
+                    if weeks_into_new_season <= 0:
+                        # Injury healed during offseason
+                        await db.execute(
+                            "UPDATE injuries SET status = 'recovered' WHERE injury_id = ?",
+                            (injury_id,)
+                        )
+                        healed_during_offseason += 1
+                    else:
+                        # Injury carries over - update return round for new season
+                        new_return_round = weeks_into_new_season
+                        await db.execute(
+                            """UPDATE injuries
+                               SET return_round = ?
+                               WHERE injury_id = ?""",
+                            (new_return_round, injury_id)
+                        )
+                        carried_over += 1
+
+                await db.commit()
 
             # Start the season
             round_name = get_round_name(1, regular_rounds)
@@ -210,10 +263,16 @@ class SeasonCommands(commands.Cog):
             )
             await db.commit()
 
-            await interaction.response.send_message(
-                f"✅ **Season {season_number}** has started!\n"
-                f"Current: {round_name}"
-            )
+            message = f"✅ **Season {season_number}** has started!\nCurrent: {round_name}"
+
+            if carried_over > 0 or healed_during_offseason > 0:
+                message += f"\n\n**Injury Updates:**"
+                if healed_during_offseason > 0:
+                    message += f"\n• {healed_during_offseason} player(s) healed during offseason"
+                if carried_over > 0:
+                    message += f"\n• {carried_over} injury(ies) carried over to new season"
+
+            await interaction.followup.send(message, ephemeral=True)
 
     @app_commands.command(name="nextround", description="[ADMIN] Advance to the next round")
     async def next_round(self, interaction: discord.Interaction):
