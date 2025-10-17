@@ -104,13 +104,22 @@ class SeasonCommands(commands.Cog):
                     )
                 ''')
 
+                # Add lineup_channel_id to teams table if it doesn't exist
+                cursor = await db.execute("PRAGMA table_info(teams)")
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+
+                if 'lineup_channel_id' not in column_names:
+                    await db.execute("ALTER TABLE teams ADD COLUMN lineup_channel_id TEXT")
+
                 await db.commit()
 
                 await interaction.followup.send(
                     "✅ Database migrated successfully!\n"
                     "• Seasons table updated\n"
-                    "• Injuries table created\n\n"
-                    "You can now use all season and injury commands.",
+                    "• Injuries table created\n"
+                    "• Teams table updated with lineup_channel_id\n\n"
+                    "You can now use all season, injury, and lineup submission commands.",
                     ephemeral=True
                 )
             except Exception as e:
