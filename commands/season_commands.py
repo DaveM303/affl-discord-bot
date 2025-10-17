@@ -76,10 +76,9 @@ class SeasonCommands(commands.Cog):
 
         async with aiosqlite.connect(DB_PATH) as db:
             try:
-                # Migrate seasons table
-                await db.execute("DROP TABLE IF EXISTS seasons")
+                # Migrate seasons table - preserve existing data
                 await db.execute('''
-                    CREATE TABLE seasons (
+                    CREATE TABLE IF NOT EXISTS seasons (
                         season_id INTEGER PRIMARY KEY AUTOINCREMENT,
                         season_number INTEGER NOT NULL UNIQUE,
                         current_round INTEGER DEFAULT 0,
@@ -139,7 +138,7 @@ class SeasonCommands(commands.Cog):
 
                 await interaction.followup.send(
                     "✅ Database migrated successfully!\n"
-                    "• Seasons table updated\n"
+                    "• Seasons table created (existing data preserved)\n"
                     "• Injuries table created\n"
                     "• Suspensions table created\n"
                     "• Settings table created\n\n"
