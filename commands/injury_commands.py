@@ -159,21 +159,86 @@ class InjuryCommands(commands.Cog):
                     f"Expected return: Round {return_round}"
                 )
 
-    @app_commands.command(name="injurylist", description="View all current injuries")
-    async def injury_list(self, interaction: discord.Interaction):
+    @app_commands.command(name="injurylist", description="View current injuries")
+    @app_commands.describe(team_name="Team name (leave empty for your team, use 'all' for all teams)")
+    async def injury_list(self, interaction: discord.Interaction, team_name: str = None):
         async with aiosqlite.connect(DB_PATH) as db:
             # Get current round
             current_round = await self.get_current_round(db)
 
-            # Get all active injuries
-            cursor = await db.execute(
-                """SELECT p.name, i.injury_type, i.return_round, t.team_name, t.emoji_id
-                   FROM injuries i
-                   JOIN players p ON i.player_id = p.player_id
-                   LEFT JOIN teams t ON p.team_id = t.team_id
-                   WHERE i.status = 'injured'
-                   ORDER BY i.return_round ASC, p.name ASC"""
-            )
+            # Determine which team to show
+            filter_team_id = None
+            title_suffix = ""
+
+            if team_name and team_name.lower() == 'all':
+                # Show all teams
+                filter_team_id = None
+                title_suffix = " - All Teams"
+            elif team_name:
+                # Show specific team
+                cursor = await db.execute(
+                    "SELECT team_id, team_name FROM teams WHERE team_name LIKE ?",
+                    (f"%{team_name}%",)
+                )
+                team = await cursor.fetchone()
+                if not team:
+                    await interaction.response.send_message(
+                        f"❌ No team found matching '{team_name}'",
+                        ephemeral=True
+                    )
+                    return
+                filter_team_id = team[0]
+                title_suffix = f" - {team[1]}"
+            else:
+                # Default to user's team
+                cursor = await db.execute(
+                    "SELECT team_name, role_id FROM teams WHERE role_id IS NOT NULL"
+                )
+                teams = await cursor.fetchall()
+
+                user_team_id = None
+                user_team_name = None
+                for t_name, role_id in teams:
+                    role = interaction.guild.get_role(int(role_id))
+                    if role and role in interaction.user.roles:
+                        cursor = await db.execute(
+                            "SELECT team_id FROM teams WHERE team_name = ?",
+                            (t_name,)
+                        )
+                        result = await cursor.fetchone()
+                        if result:
+                            user_team_id = result[0]
+                            user_team_name = t_name
+                            break
+
+                if user_team_id:
+                    filter_team_id = user_team_id
+                    title_suffix = f" - {user_team_name}"
+                else:
+                    # User has no team, show all
+                    filter_team_id = None
+                    title_suffix = " - All Teams"
+
+            # Get active injuries (filtered by team if specified)
+            if filter_team_id:
+                cursor = await db.execute(
+                    """SELECT p.name, i.injury_type, i.return_round, t.team_name, t.emoji_id
+                       FROM injuries i
+                       JOIN players p ON i.player_id = p.player_id
+                       LEFT JOIN teams t ON p.team_id = t.team_id
+                       WHERE i.status = 'injured' AND p.team_id = ?
+                       ORDER BY i.return_round ASC, p.name ASC""",
+                    (filter_team_id,)
+                )
+            else:
+                cursor = await db.execute(
+                    """SELECT p.name, i.injury_type, i.return_round, t.team_name, t.emoji_id
+                       FROM injuries i
+                       JOIN players p ON i.player_id = p.player_id
+                       LEFT JOIN teams t ON p.team_id = t.team_id
+                       WHERE i.status = 'injured'
+                       ORDER BY i.return_round ASC, p.name ASC"""
+                )
             injuries = await cursor.fetchall()
 
             if not injuries:
@@ -207,7 +272,7 @@ class InjuryCommands(commands.Cog):
                 )
 
             embed = discord.Embed(
-                title=f"Injury List - Round {current_round}",
+                title=f"Injury List - Round {current_round}{title_suffix}",
                 description="\n".join(injury_list),
                 color=discord.Color.red()
             )
