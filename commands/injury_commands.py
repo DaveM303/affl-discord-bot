@@ -140,12 +140,26 @@ class InjuryCommands(commands.Cog):
             )
             await db.commit()
 
+            # Get total rounds to check if season-ending
+            cursor = await db.execute(
+                "SELECT total_rounds FROM seasons WHERE status = 'active' LIMIT 1"
+            )
+            season_info = await cursor.fetchone()
+            total_rounds = season_info[0] if season_info else 0
+
+            # Format expected return
+            if return_round > total_rounds:
+                expected_return = "SEASON"
+            else:
+                expected_return = f"Round {return_round}"
+
             # Send response
             await interaction.response.send_message(
                 f"🚑 **{p_name}** has been injured!\n"
                 f"• Injury: {injury_type}\n"
                 f"• Recovery: {recovery_rounds} round{'s' if recovery_rounds != 1 else ''}\n"
-                f"• Expected return: Round {return_round}"
+                f"• Expected return: {expected_return}",
+                ephemeral=True
             )
 
             # Notify team channel
@@ -156,20 +170,17 @@ class InjuryCommands(commands.Cog):
                 # Use "an" for vowels, "a" for consonants
                 article = "an" if injury_type[0].lower() in 'aeiou' else "a"
 
-                # Check if injury extends beyond season
-                cursor = await db.execute(
-                    "SELECT total_rounds FROM seasons WHERE status = 'active' LIMIT 1"
-                )
-                season_info = await cursor.fetchone()
-                season_ending = ""
-                if season_info and return_round > season_info[0]:
-                    season_ending = " (SEASON)"
+                # Format expected return for channel notification
+                if return_round > total_rounds:
+                    return_text = "SEASON"
+                else:
+                    return_text = f"Round {return_round}"
 
                 await self.notify_team_channel(
                     team_id,
                     f"🚑 **Injury Update**\n"
-                    f"**{p_name}** has suffered {article} **{injury_type} injury** and will miss **{recovery_rounds} {week_text}{season_ending}**.\n"
-                    f"Expected return: Round {return_round}"
+                    f"**{p_name}** has suffered {article} **{injury_type} injury** and will miss **{recovery_rounds} {week_text}**.\n"
+                    f"Expected return: {return_text}"
                 )
 
     @app_commands.command(name="injurylist", description="View current injuries")
@@ -383,7 +394,7 @@ class InjuryCommands(commands.Cog):
             response = f"✅ Updated injury for **{p_name}**\n\n"
             response += "\n".join(changes)
 
-            await interaction.response.send_message(response)
+            await interaction.response.send_message(response, ephemeral=True)
 
     @app_commands.command(name="removeinjury", description="[ADMIN] Remove a player's injury")
     @app_commands.describe(player_name="Player name")
@@ -431,7 +442,8 @@ class InjuryCommands(commands.Cog):
             await db.commit()
 
             await interaction.response.send_message(
-                f"✅ **{p_name}** has recovered from injury!"
+                f"✅ **{p_name}** has recovered from injury!",
+                ephemeral=True
             )
 
             # Notify team channel

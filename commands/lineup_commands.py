@@ -993,14 +993,14 @@ class SaveLineupButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         filled_slots = len(self.parent_view.lineup)
         
-        if filled_slots < 22:
+        if filled_slots < 23:
             await interaction.response.send_message(
-                f"⚠️ Your lineup has only {filled_slots}/22 players. Continue adding players or save as is?",
+                f"⚠️ Your lineup has only {filled_slots}/23 players. Continue adding players or save as is?",
                 ephemeral=True
             )
         else:
             await interaction.response.send_message(
-                f"✅ Lineup saved! {filled_slots}/22 players selected.",
+                f"✅ Lineup saved! {filled_slots}/23 players selected.",
                 ephemeral=True
             )
         
