@@ -657,13 +657,40 @@ class AdminCommands(commands.Cog):
                 )
                 lineups = await cursor.fetchall()
                 lineups_df = pd.DataFrame(lineups, columns=['Team_Name', 'Position', 'Player_Name', 'Player_Position', 'OVR'])
-            
+
+                # Export Seasons
+                cursor = await db.execute(
+                    """SELECT season_number as Season, current_round as Current_Round,
+                              regular_rounds as Regular_Rounds, total_rounds as Total_Rounds,
+                              round_name as Round_Name, status as Status
+                       FROM seasons ORDER BY season_number"""
+                )
+                seasons = await cursor.fetchall()
+                seasons_df = pd.DataFrame(seasons, columns=['Season', 'Current_Round', 'Regular_Rounds', 'Total_Rounds', 'Round_Name', 'Status'])
+
+                # Export Injuries
+                cursor = await db.execute(
+                    """SELECT p.name as Player_Name, t.team_name as Team,
+                              i.injury_type as Injury_Type, i.injury_round as Injury_Round,
+                              i.recovery_rounds as Recovery_Rounds, i.return_round as Return_Round,
+                              i.status as Status
+                       FROM injuries i
+                       JOIN players p ON i.player_id = p.player_id
+                       LEFT JOIN teams t ON p.team_id = t.team_id
+                       ORDER BY i.status, i.return_round"""
+                )
+                injuries = await cursor.fetchall()
+                injuries_df = pd.DataFrame(injuries, columns=['Player_Name', 'Team', 'Injury_Type', 'Injury_Round', 'Recovery_Rounds', 'Return_Round', 'Status'])
+                injuries_df['Team'] = injuries_df['Team'].fillna('Free Agent')
+
             # Create Excel file in memory
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 teams_df.to_excel(writer, sheet_name='Teams', index=False)
                 players_df.to_excel(writer, sheet_name='Players', index=False)
                 lineups_df.to_excel(writer, sheet_name='Lineups', index=False)
+                seasons_df.to_excel(writer, sheet_name='Seasons', index=False)
+                injuries_df.to_excel(writer, sheet_name='Injuries', index=False)
                 
                 # Add instructions sheet
                 instructions = pd.DataFrame({
@@ -701,7 +728,7 @@ class AdminCommands(commands.Cog):
             # Send file
             file = discord.File(output, filename='league_data.xlsx')
             await interaction.followup.send(
-                f"✅ Exported {len(teams_df)} teams, {len(players_df)} players, and {len(lineups_df)} lineup positions",
+                f"✅ Exported {len(teams_df)} teams, {len(players_df)} players, {len(lineups_df)} lineup positions, {len(seasons_df)} seasons, and {len(injuries_df)} injuries",
                 file=file,
                 ephemeral=True
             )
