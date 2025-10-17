@@ -144,17 +144,18 @@ class InjuryCommands(commands.Cog):
             await interaction.response.send_message(
                 f"🚑 **{p_name}** has been injured!\n"
                 f"• Injury: {injury_type}\n"
-                f"• Recovery: {recovery_rounds} rounds\n"
+                f"• Recovery: {recovery_rounds} round{'s' if recovery_rounds != 1 else ''}\n"
                 f"• Expected return: Round {return_round}"
             )
 
             # Notify team channel
             if team_id:
                 team_display = team_name if team_name else "Free Agent"
+                round_text = "round" if recovery_rounds == 1 else "rounds"
                 await self.notify_team_channel(
                     team_id,
                     f"🚑 **Injury Update**\n"
-                    f"**{p_name}** has suffered a **{injury_type}** and will miss {recovery_rounds} round(s).\n"
+                    f"**{p_name}** has suffered a **{injury_type} injury** and will miss **{recovery_rounds} {round_text}**.\n"
                     f"Expected return: Round {return_round}"
                 )
 
