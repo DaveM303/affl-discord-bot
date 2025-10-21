@@ -207,15 +207,15 @@ class InjuryCommands(commands.Cog):
                 filter_team_id = None
                 title_suffix = ""
             elif team_name:
-                # Show specific team
+                # Show specific team (exact match due to autocomplete)
                 cursor = await db.execute(
-                    "SELECT team_id, team_name FROM teams WHERE team_name LIKE ?",
-                    (f"%{team_name}%",)
+                    "SELECT team_id, team_name FROM teams WHERE team_name = ?",
+                    (team_name,)
                 )
                 team = await cursor.fetchone()
                 if not team:
                     await interaction.response.send_message(
-                        f"❌ No team found matching '{team_name}'",
+                        f"❌ Team '{team_name}' not found. Please select from the autocomplete suggestions.",
                         ephemeral=True
                     )
                     return

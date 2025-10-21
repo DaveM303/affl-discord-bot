@@ -167,16 +167,16 @@ class PlayerCommands(commands.Cog):
                 t_name = user_team
                 emoji_id = user_emoji_id
             else:
-                # Get team info by name
+                # Get team info by name (exact match due to autocomplete)
                 cursor = await db.execute(
-                    """SELECT team_id, team_name, emoji_id FROM teams WHERE team_name LIKE ?""",
-                    (f"%{team_name}%",)
+                    """SELECT team_id, team_name, emoji_id FROM teams WHERE team_name = ?""",
+                    (team_name,)
                 )
                 team = await cursor.fetchone()
 
                 if not team:
                     await interaction.response.send_message(
-                        f"No team found matching '{team_name}'",
+                        f"❌ Team '{team_name}' not found. Please select from the autocomplete suggestions.",
                         ephemeral=True
                     )
                     return
@@ -308,8 +308,8 @@ class PlayerCommands(commands.Cog):
                 if team_name.lower() in ['free agent', 'free agents', 'fa']:
                     query += " AND p.team_id IS NULL"
                 else:
-                    query += " AND t.team_name LIKE ?"
-                    params.append(f"%{team_name}%")
+                    query += " AND t.team_name = ?"
+                    params.append(team_name)
             
             query += " ORDER BY p.overall_rating DESC LIMIT ?"
             params.append(limit)
