@@ -3,6 +3,7 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH, ADMIN_ROLE_ID
+from commands.season_commands import get_round_name
 
 class SuspensionCommands(commands.Cog):
     def __init__(self, bot):
@@ -136,18 +137,19 @@ class SuspensionCommands(commands.Cog):
             )
             await db.commit()
 
-            # Get total rounds to check if season-ending
+            # Get total rounds and regular_rounds to check if season-ending
             cursor = await db.execute(
-                "SELECT total_rounds FROM seasons WHERE status = 'active' LIMIT 1"
+                "SELECT total_rounds, regular_rounds FROM seasons WHERE status = 'active' LIMIT 1"
             )
             season_info = await cursor.fetchone()
             total_rounds = season_info[0] if season_info else 0
+            regular_rounds = season_info[1] if season_info else 24
 
             # Format expected return
             if return_round > total_rounds:
                 expected_return = "SEASON"
             else:
-                expected_return = f"Round {return_round}"
+                expected_return = get_round_name(return_round, regular_rounds)
 
             # Send response
             await interaction.response.send_message(
@@ -167,7 +169,7 @@ class SuspensionCommands(commands.Cog):
                 if return_round > total_rounds:
                     return_text = "SEASON"
                 else:
-                    return_text = f"Round {return_round}"
+                    return_text = get_round_name(return_round, regular_rounds)
 
                 await self.notify_team_channel(
                     team_id,

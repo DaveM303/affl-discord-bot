@@ -3,6 +3,7 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH
+from commands.season_commands import get_round_name
 
 # AFL lineup structure with 22 positions + 1 sub
 AFL_POSITIONS = [
@@ -343,12 +344,13 @@ class LineupCommands(commands.Cog):
             result = await cursor.fetchone()
             lineup_channel_id = result[0] if result else None
 
-            # Get current round
+            # Get current round and regular_rounds
             cursor = await db.execute(
-                "SELECT current_round FROM seasons WHERE status = 'active' LIMIT 1"
+                "SELECT current_round, regular_rounds FROM seasons WHERE status = 'active' LIMIT 1"
             )
             season_info = await cursor.fetchone()
             current_round = season_info[0] if season_info else 0
+            regular_rounds = season_info[1] if season_info else 24
 
         # Validate lineup
         errors = []
@@ -463,8 +465,11 @@ class LineupCommands(commands.Cog):
             ("Fol", ["R", "RR", "RO"])
         ]
 
+        # Get the round name
+        round_display = get_round_name(current_round, regular_rounds) if current_round > 0 else "Offseason"
+
         embed = discord.Embed(
-            title=f"{emoji}{team_name} - Round {current_round} Lineup",
+            title=f"{emoji}{team_name} - {round_display} Lineup",
             color=discord.Color.green()
         )
 

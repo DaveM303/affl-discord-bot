@@ -3,6 +3,7 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH, ADMIN_ROLE_ID
+from commands.season_commands import get_round_name
 
 class InjuryCommands(commands.Cog):
     def __init__(self, bot):
@@ -140,18 +141,19 @@ class InjuryCommands(commands.Cog):
             )
             await db.commit()
 
-            # Get total rounds to check if season-ending
+            # Get total rounds and regular_rounds to check if season-ending
             cursor = await db.execute(
-                "SELECT total_rounds FROM seasons WHERE status = 'active' LIMIT 1"
+                "SELECT total_rounds, regular_rounds FROM seasons WHERE status = 'active' LIMIT 1"
             )
             season_info = await cursor.fetchone()
             total_rounds = season_info[0] if season_info else 0
+            regular_rounds = season_info[1] if season_info else 24
 
             # Format expected return
             if return_round > total_rounds:
                 expected_return = "SEASON"
             else:
-                expected_return = f"Round {return_round}"
+                expected_return = get_round_name(return_round, regular_rounds)
 
             # Send response
             await interaction.response.send_message(
@@ -174,7 +176,7 @@ class InjuryCommands(commands.Cog):
                 if return_round > total_rounds:
                     return_text = "SEASON"
                 else:
-                    return_text = f"Round {return_round}"
+                    return_text = get_round_name(return_round, regular_rounds)
 
                 await self.notify_team_channel(
                     team_id,
@@ -187,13 +189,14 @@ class InjuryCommands(commands.Cog):
     @app_commands.describe(team_name="Team name (leave empty for your team, use 'all' for all teams)")
     async def injury_list(self, interaction: discord.Interaction, team_name: str = None):
         async with aiosqlite.connect(DB_PATH) as db:
-            # Get current round and total rounds
+            # Get current round, total rounds, and regular_rounds
             cursor = await db.execute(
-                "SELECT current_round, total_rounds FROM seasons WHERE status = 'active' LIMIT 1"
+                "SELECT current_round, total_rounds, regular_rounds FROM seasons WHERE status = 'active' LIMIT 1"
             )
             season_info = await cursor.fetchone()
             current_round = season_info[0] if season_info else 0
             total_rounds = season_info[1] if season_info else 0
+            regular_rounds = season_info[2] if season_info else 24
 
             # Determine which team to show
             filter_team_id = None
@@ -361,8 +364,11 @@ class InjuryCommands(commands.Cog):
                         f"{team_display}**{name}** - {suspension_reason} {status}"
                     )
 
+            # Get the round name
+            round_display = get_round_name(current_round, regular_rounds) if current_round > 0 else "Offseason"
+
             embed = discord.Embed(
-                title=f"Injury & Suspension List - Round {current_round}{title_suffix}",
+                title=f"Injury & Suspension List - {round_display}{title_suffix}",
                 description="\n".join(combined_list),
                 color=discord.Color.red()
             )

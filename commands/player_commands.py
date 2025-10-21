@@ -195,18 +195,17 @@ class PlayerCommands(commands.Cog):
                 (team_id,)
             )
             players = await cursor.fetchall()
-            
+
             embed = discord.Embed(title=f"{team_title}", color=discord.Color.blue())
-            embed.add_field(name="Roster Size", value=f"{len(players)} players", inline=True)
-            
+
             if players:
                 # Group by position (dynamically)
                 from collections import defaultdict
                 positions = defaultdict(list)
-                
+
                 for name, pos, rating, age in players:
                     positions[pos].append(f"**{name}** - {rating} OVR, {age}yo")
-                
+
                 # Import position display order
                 from positions import POSITION_DISPLAY_ORDER
 
@@ -220,12 +219,16 @@ class PlayerCommands(commands.Cog):
                         value="\n".join(player_list),
                         inline=False
                     )
+
+                # Add roster size to footer
+                embed.set_footer(text=f"{len(players)} players")
             else:
                 embed.add_field(name="Roster", value="No players on this team", inline=False)
-            
+                embed.set_footer(text="0 players")
+
             await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="searchplayers", description="Search for players with filters")
+    @app_commands.command(name="filterplayers", description="Search for players with filters")
     @app_commands.describe(
         min_rating="Minimum overall rating",
         max_rating="Maximum overall rating",

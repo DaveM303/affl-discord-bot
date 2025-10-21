@@ -637,13 +637,6 @@ class SeasonCommands(commands.Cog):
             embed.add_field(name="Status", value=status_text, inline=True)
             embed.add_field(name="Current", value=round_name, inline=True)
 
-            if status == 'active':
-                embed.add_field(
-                    name="Progress",
-                    value=f"{current_round}/{total_rounds} rounds",
-                    inline=True
-                )
-
             await interaction.response.send_message(embed=embed)
 
 
