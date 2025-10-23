@@ -159,6 +159,21 @@ async def init_db():
             )
         ''')
 
+        # Create Submitted Lineups table (for tracking lineup submissions per round)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS submitted_lineups (
+                submission_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                team_id INTEGER NOT NULL,
+                season_id INTEGER NOT NULL,
+                round_number INTEGER NOT NULL,
+                player_ids TEXT NOT NULL,
+                submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (team_id) REFERENCES teams(team_id),
+                FOREIGN KEY (season_id) REFERENCES seasons(season_id),
+                UNIQUE(team_id, season_id, round_number)
+            )
+        ''')
+
         await db.commit()
         print("Database initialized successfully!")
 

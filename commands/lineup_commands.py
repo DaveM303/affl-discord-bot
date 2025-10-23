@@ -552,6 +552,53 @@ class TeamLineupMenu(discord.ui.View):
                 await interaction.followup.send("❌ Lineup channel not found!", ephemeral=True)
                 return
 
+            # Get season_id for tracking submissions
+            cursor = await db.execute(
+                "SELECT season_id FROM seasons WHERE status = 'active' LIMIT 1"
+            )
+            season_result = await cursor.fetchone()
+            season_id = season_result[0] if season_result else None
+
+            # Get previous submitted lineup for this team in this season
+            previous_player_ids = set()
+            if season_id:
+                cursor = await db.execute(
+                    """SELECT player_ids FROM submitted_lineups
+                       WHERE team_id = ? AND season_id = ?
+                       ORDER BY round_number DESC LIMIT 1""",
+                    (self.team_id, season_id)
+                )
+                prev_result = await cursor.fetchone()
+                if prev_result:
+                    previous_player_ids = set(json.loads(prev_result[0]))
+
+        # Calculate Ins and Outs
+        current_player_ids = set(player_ids)
+        ins = current_player_ids - previous_player_ids
+        outs = previous_player_ids - current_player_ids
+
+        # Get player names for ins and outs
+        ins_names = []
+        outs_names = []
+
+        if ins or outs:
+            async with aiosqlite.connect(DB_PATH) as db:
+                if ins:
+                    placeholders = ','.join('?' * len(ins))
+                    cursor = await db.execute(
+                        f"SELECT name FROM players WHERE player_id IN ({placeholders})",
+                        list(ins)
+                    )
+                    ins_names = [row[0] for row in await cursor.fetchall()]
+
+                if outs:
+                    placeholders = ','.join('?' * len(outs))
+                    cursor = await db.execute(
+                        f"SELECT name FROM players WHERE player_id IN ({placeholders})",
+                        list(outs)
+                    )
+                    outs_names = [row[0] for row in await cursor.fetchall()]
+
         # Build lineup embed
         round_display = get_round_name(current_round, regular_rounds) if current_round > 0 else "Offseason"
 
@@ -604,6 +651,26 @@ class TeamLineupMenu(discord.ui.View):
             field_text += f"**Sub:**  *Empty*"
 
         embed.description = field_text
+
+        # Add Ins & Outs field if there are changes
+        if ins_names or outs_names:
+            changes_text = ""
+            if ins_names:
+                changes_text += f"**IN:** {', '.join(ins_names)}\n"
+            if outs_names:
+                changes_text += f"**OUT:** {', '.join(outs_names)}"
+            embed.add_field(name="Changes", value=changes_text, inline=False)
+
+        # Save this submission to the database
+        if season_id:
+            async with aiosqlite.connect(DB_PATH) as db:
+                player_ids_json = json.dumps(player_ids)
+                await db.execute(
+                    """INSERT OR REPLACE INTO submitted_lineups (team_id, season_id, round_number, player_ids)
+                       VALUES (?, ?, ?, ?)""",
+                    (self.team_id, season_id, current_round, player_ids_json)
+                )
+                await db.commit()
 
         # Post to lineup channel
         await lineup_channel.send(embed=embed)
