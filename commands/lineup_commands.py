@@ -296,9 +296,111 @@ class TeamLineupMenu(discord.ui.View):
         self.bot = bot
         self.emoji_id = emoji_id
         self.has_starting_lineup = has_starting_lineup
+        self.warnings = []
 
         # Add buttons
         self.add_buttons()
+
+    async def get_injured_players(self):
+        """Check for injured players in lineup - returns list of (player_name, weeks_left) tuples"""
+        injured = []
+        player_ids = [p.get('player_id') for p in self.lineup.values() if p.get('player_id')]
+
+        if not player_ids:
+            return injured
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Get current round
+            cursor = await db.execute(
+                "SELECT current_round FROM seasons WHERE status = 'active' LIMIT 1"
+            )
+            season_info = await cursor.fetchone()
+            current_round = season_info[0] if season_info else 0
+
+            # Check for injuries
+            placeholders = ','.join('?' * len(player_ids))
+            cursor = await db.execute(
+                f"""SELECT p.name, i.return_round
+                   FROM injuries i
+                   JOIN players p ON i.player_id = p.player_id
+                   WHERE i.player_id IN ({placeholders}) AND i.status = 'injured'""",
+                player_ids
+            )
+            injuries = await cursor.fetchall()
+
+            for name, return_round in injuries:
+                weeks_left = return_round - current_round
+                if weeks_left > 0:
+                    injured.append((name, weeks_left))
+
+        return injured
+
+    async def get_suspended_players(self):
+        """Check for suspended players in lineup - returns list of (player_name, games_left) tuples"""
+        suspended = []
+        player_ids = [p.get('player_id') for p in self.lineup.values() if p.get('player_id')]
+
+        if not player_ids:
+            return suspended
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Get current round
+            cursor = await db.execute(
+                "SELECT current_round FROM seasons WHERE status = 'active' LIMIT 1"
+            )
+            season_info = await cursor.fetchone()
+            current_round = season_info[0] if season_info else 0
+
+            # Check for suspensions
+            placeholders = ','.join('?' * len(player_ids))
+            cursor = await db.execute(
+                f"""SELECT p.name, s.return_round
+                   FROM suspensions s
+                   JOIN players p ON s.player_id = p.player_id
+                   WHERE s.player_id IN ({placeholders}) AND s.status = 'suspended'""",
+                player_ids
+            )
+            suspensions = await cursor.fetchall()
+
+            for name, return_round in suspensions:
+                games_left = return_round - current_round
+                if games_left > 0:
+                    suspended.append((name, games_left))
+
+        return suspended
+
+    def get_duplicate_players(self):
+        """Check for duplicate players in lineup - returns list of player names that appear more than once"""
+        player_ids = [p.get('player_id') for p in self.lineup.values() if p.get('player_id')]
+        duplicates = []
+        seen = set()
+        for pos_name, player_info in self.lineup.items():
+            player_id = player_info.get('player_id')
+            if player_id and player_ids.count(player_id) > 1 and player_id not in seen:
+                duplicates.append(player_info['name'])
+                seen.add(player_id)
+        return duplicates
+
+    async def update_warnings(self):
+        """Update the warnings list based on current lineup"""
+        self.warnings = []
+
+        # Check for duplicates
+        duplicates = self.get_duplicate_players()
+        if duplicates:
+            self.warnings.append(f"⚠️ **Duplicate players:** {', '.join(duplicates)}")
+
+        # Check for injured players
+        injured = await self.get_injured_players()
+        if injured:
+            injured_str = ', '.join([f"{name} ({weeks}w)" for name, weeks in injured])
+            self.warnings.append(f"🚑 **Injured players:** {injured_str}")
+
+        # Check for suspended players
+        suspended = await self.get_suspended_players()
+        if suspended:
+            suspended_str = ', '.join([f"{name} ({games}g)" for name, games in suspended])
+            self.warnings.append(f"🚫 **Suspended players:** {suspended_str}")
 
     def add_buttons(self):
         """Add all menu buttons"""
@@ -510,7 +612,19 @@ class TeamLineupMenu(discord.ui.View):
         await interaction.followup.send(f"✅ Lineup submitted to {lineup_channel.mention}!", ephemeral=True)
 
     async def save_starting_lineup_callback(self, interaction: discord.Interaction):
-        """Save current lineup as starting lineup"""
+        """Save current lineup as starting lineup - show confirmation first"""
+        # Create confirmation view
+        confirmation_view = ConfirmSaveStartingLineupView(self)
+
+        if self.has_starting_lineup:
+            message = "⚠️ **Are you sure?**\n\nThis will overwrite your previously saved starting lineup with your current lineup."
+        else:
+            message = "💾 **Save as Starting Lineup?**\n\nYour current lineup will be saved and can be restored later."
+
+        await interaction.response.send_message(message, view=confirmation_view, ephemeral=True)
+
+    async def do_save_starting_lineup(self, interaction: discord.Interaction):
+        """Actually save the starting lineup after confirmation"""
         await interaction.response.defer(ephemeral=True)
 
         async with aiosqlite.connect(DB_PATH) as db:
@@ -603,7 +717,15 @@ class TeamLineupMenu(discord.ui.View):
         await interaction.edit_original_response(embed=embed, view=self)
 
     async def clear_lineup_callback(self, interaction: discord.Interaction):
-        """Clear the entire lineup"""
+        """Clear the entire lineup - show confirmation first"""
+        # Create confirmation view
+        confirmation_view = ConfirmClearLineupView(self)
+        message = "⚠️ **Clear Lineup?**\n\nThis will remove all players from your lineup. This action cannot be undone."
+
+        await interaction.response.send_message(message, view=confirmation_view, ephemeral=True)
+
+    async def do_clear_lineup(self, interaction: discord.Interaction):
+        """Actually clear the lineup after confirmation"""
         await interaction.response.defer(ephemeral=True)
 
         async with aiosqlite.connect(DB_PATH) as db:
@@ -718,7 +840,15 @@ class TeamLineupMenu(discord.ui.View):
 
     async def create_menu_embed(self):
         """Create the menu display embed"""
-        emoji = self.bot.get_emoji(int(self.emoji_id)) if self.emoji_id else ""
+        # Update warnings before creating embed
+        await self.update_warnings()
+
+        emoji = ""
+        if self.emoji_id:
+            emoji_obj = self.bot.get_emoji(int(self.emoji_id))
+            if emoji_obj:
+                emoji = f"{emoji_obj} "
+
         embed = discord.Embed(
             title=f"{emoji}{self.team_name} - Lineup Management",
             color=discord.Color.blue()
@@ -765,9 +895,62 @@ class TeamLineupMenu(discord.ui.View):
             field_text += f"**Sub:**  *Empty*"
 
         embed.description = field_text
+
+        # Add warnings if any exist
+        if self.warnings:
+            embed.add_field(name="\u200b", value="\n".join(self.warnings), inline=False)
+
         embed.set_footer(text=f"{len(self.lineup)}/23 positions filled")
 
         return embed
+
+
+class ConfirmSaveStartingLineupView(discord.ui.View):
+    """Confirmation view for saving starting lineup"""
+    def __init__(self, parent_menu):
+        super().__init__(timeout=60)
+        self.parent_menu = parent_menu
+
+    @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.success)
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Disable all buttons
+        for item in self.children:
+            item.disabled = True
+        await interaction.message.edit(view=self)
+
+        # Call the parent's do_save method
+        await self.parent_menu.do_save_starting_lineup(interaction)
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Disable all buttons
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="❌ Cancelled.", view=self)
+
+
+class ConfirmClearLineupView(discord.ui.View):
+    """Confirmation view for clearing lineup"""
+    def __init__(self, parent_menu):
+        super().__init__(timeout=60)
+        self.parent_menu = parent_menu
+
+    @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.danger)
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Disable all buttons
+        for item in self.children:
+            item.disabled = True
+        await interaction.message.edit(view=self)
+
+        # Call the parent's do_clear method
+        await self.parent_menu.do_clear_lineup(interaction)
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Disable all buttons
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="❌ Cancelled.", view=self)
 
 
 class LineupView(discord.ui.View):
