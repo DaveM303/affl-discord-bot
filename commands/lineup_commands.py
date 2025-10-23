@@ -660,13 +660,8 @@ class LineupView(discord.ui.View):
         return sorted(self.roster, key=sort_key)
     
     def get_sorted_roster_count(self):
-        """Get count of available players"""
-        used_ids = {p.get('player_id') for p in self.lineup.values() if p.get('player_id')}
-        count = 0
-        for player_id, name, pos, rating in self.roster:
-            if player_id not in used_ids or player_id == self.lineup.get(self.selected_position, {}).get('player_id'):
-                count += 1
-        return count
+        """Get count of all players (no filtering - all players can be moved)"""
+        return len(self.roster)
 
     def get_duplicate_players(self):
         """Check for duplicate players in lineup - returns list of player names that appear more than once"""
