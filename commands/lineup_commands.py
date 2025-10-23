@@ -1037,8 +1037,14 @@ class PlayerSelect(discord.ui.Select):
                 (player_id,)
             )
             name, pos, rating = await cursor.fetchone()
-        
-        # Update parent view
+
+        # Remove player from old position in lineup dict (if they were in a different position)
+        for pos_name, player_info in list(self.parent_view.lineup.items()):
+            if player_info.get('player_id') == player_id and pos_name != self.position_name:
+                # Clear the old position
+                self.parent_view.lineup[pos_name] = {'name': '', 'pos': '', 'rating': '', 'player_id': None}
+
+        # Update parent view with new position
         self.parent_view.lineup[self.position_name] = {
             'name': name,
             'pos': pos,
