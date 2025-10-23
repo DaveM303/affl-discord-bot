@@ -957,33 +957,42 @@ class PlayerSelect(discord.ui.Select):
         
         # Get sorted roster
         sorted_roster = parent_view.get_sorted_roster()
-        
-        # Get players already in lineup
+
+        # Get players already in lineup (for display purposes)
         used_ids = {p.get('player_id') for p in parent_view.lineup.values() if p.get('player_id')}
-        
-        # Build options from available players with pagination
+
+        # Build options from all players with pagination
         options = []
         start_idx = parent_view.player_page * 25
         end_idx = start_idx + 25
         count = 0
         added = 0
-        
+
         for player_id, name, pos, rating in sorted_roster:
-            # Skip players already in lineup (unless it's the current position's player)
-            if player_id in used_ids and player_id != parent_view.lineup.get(position_name, {}).get('player_id'):
-                continue
-            
+            # Show all players - they can be moved between positions
             # Check if this player is in the current page
             if count >= start_idx and added < 25:
+                # Mark if player is currently in lineup
+                label = f"{name} ({rating} OVR)"
+                if player_id in used_ids:
+                    # Find which position they're in
+                    current_pos = None
+                    for pos_name, player_info in parent_view.lineup.items():
+                        if player_info.get('player_id') == player_id:
+                            current_pos = pos_name
+                            break
+                    if current_pos and current_pos != position_name:
+                        label += f" [Currently in {current_pos}]"
+
                 options.append(
                     discord.SelectOption(
-                        label=f"{name} ({rating} OVR)",
+                        label=label,
                         description=f"{pos}",
                         value=str(player_id)
                     )
                 )
                 added += 1
-            
+
             count += 1
             if added >= 25:
                 break
