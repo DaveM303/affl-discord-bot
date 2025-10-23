@@ -648,15 +648,12 @@ class LineupView(discord.ui.View):
         # Sort roster: priority positions first, then by rating
         def sort_key(player):
             player_id, name, pos, rating = player
-            # Skip if already in lineup (unless current position)
-            if player_id in used_ids and player_id != self.lineup.get(self.selected_position, {}).get('player_id'):
-                return (2, -rating)  # Lower priority
             # Check if position is in priority list
             if pos in priority_positions:
                 return (0, -rating)  # Highest priority
             else:
                 return (1, -rating)  # Normal priority
-        
+
         return sorted(self.roster, key=sort_key)
     
     def get_sorted_roster_count(self):
