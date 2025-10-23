@@ -125,6 +125,16 @@ class SeasonCommands(commands.Cog):
                     )
                 ''')
 
+                # Create Starting Lineups table (for saved lineup presets)
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS starting_lineups (
+                        team_id INTEGER PRIMARY KEY,
+                        lineup_data TEXT NOT NULL,
+                        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (team_id) REFERENCES teams(team_id)
+                    )
+                ''')
+
                 # Remove lineup_channel_id from teams if it exists (moved to settings)
                 cursor = await db.execute("PRAGMA table_info(teams)")
                 columns = await cursor.fetchall()
@@ -141,6 +151,7 @@ class SeasonCommands(commands.Cog):
                     "• Seasons table created (existing data preserved)\n"
                     "• Injuries table created\n"
                     "• Suspensions table created\n"
+                    "• Starting Lineups table created\n"
                     "• Settings table created\n\n"
                     "You can now use all season, injury, suspension, and lineup submission commands.\n"
                     "Use `/setlineupschannel` to configure where lineups are posted.",

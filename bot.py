@@ -149,6 +149,16 @@ async def init_db():
             )
         ''')
 
+        # Create Starting Lineups table (for saved lineup presets)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS starting_lineups (
+                team_id INTEGER PRIMARY KEY,
+                lineup_data TEXT NOT NULL,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (team_id) REFERENCES teams(team_id)
+            )
+        ''')
+
         await db.commit()
         print("Database initialized successfully!")
 
