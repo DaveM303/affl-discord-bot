@@ -7,7 +7,7 @@ from config import DB_PATH
 class PlayerCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-    
+
     def get_team_emoji(self, emoji_id: str) -> str:
         """Get server emoji by ID, return empty string if not found."""
         if not emoji_id:
@@ -19,6 +19,36 @@ class PlayerCommands(commands.Cog):
         except:
             return ""
 
+    async def player_name_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete for player names with format: Name (Team, POS, age, OVR)"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating, t.team_name
+                   FROM players p
+                   LEFT JOIN teams t ON p.team_id = t.team_id
+                   ORDER BY p.name"""
+            )
+            players = await cursor.fetchall()
+
+        # Filter players based on what the user has typed
+        choices = []
+        for player_id, name, position, age, rating, team_name in players:
+            # Check if current input matches player name
+            if current.lower() in name.lower():
+                # Format: Name (Team, POS, age yo, OVR)
+                team_prefix = team_name if team_name else "Free Agent"
+                display_name = f"{name} ({team_prefix}, {position}, {age}yo, {rating} OVR)"
+
+                # Value is player_id so we can query by ID later
+                choices.append(app_commands.Choice(name=display_name, value=str(player_id)))
+
+        # Return up to 25 choices (Discord limit)
+        return choices[:25]
+
     @app_commands.command(name="player", description="Look up player information")
     @app_commands.describe(
         name1="First player name to search",
@@ -26,6 +56,13 @@ class PlayerCommands(commands.Cog):
         name3="Third player name (optional)",
         name4="Fourth player name (optional)",
         name5="Fifth player name (optional)"
+    )
+    @app_commands.autocomplete(
+        name1=player_name_autocomplete,
+        name2=player_name_autocomplete,
+        name3=player_name_autocomplete,
+        name4=player_name_autocomplete,
+        name5=player_name_autocomplete
     )
     async def player_lookup(
         self,
@@ -36,24 +73,34 @@ class PlayerCommands(commands.Cog):
         name4: str = None,
         name5: str = None
     ):
-        # Collect all non-empty search terms
-        search_terms = [name for name in [name1, name2, name3, name4, name5] if name]
+        # Collect all non-empty player IDs (from autocomplete)
+        player_ids = [pid for pid in [name1, name2, name3, name4, name5] if pid]
+
+        # Convert to integers
+        try:
+            player_ids = [int(pid) for pid in player_ids]
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Invalid player selection. Please use the autocomplete suggestions.",
+                ephemeral=True
+            )
+            return
 
         async with aiosqlite.connect(DB_PATH) as db:
             all_players = []
 
-            # Search for each term
-            for search_term in search_terms:
+            # Get each player by ID
+            for player_id in player_ids:
                 cursor = await db.execute(
                     """SELECT p.name, p.position, p.overall_rating, p.age, t.team_name, t.emoji_id
                        FROM players p
                        LEFT JOIN teams t ON p.team_id = t.team_id
-                       WHERE p.name LIKE ?
-                       ORDER BY p.overall_rating DESC""",
-                    (f"%{search_term}%",)
+                       WHERE p.player_id = ?""",
+                    (player_id,)
                 )
-                results = await cursor.fetchall()
-                all_players.extend(results)
+                result = await cursor.fetchone()
+                if result:
+                    all_players.append(result)
 
             # Remove duplicates while preserving order (in case searches overlap)
             seen = set()

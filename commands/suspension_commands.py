@@ -9,6 +9,36 @@ class SuspensionCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+    async def player_name_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete for player names with format: Team Name (POS, age, OVR)"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating, t.team_name
+                   FROM players p
+                   LEFT JOIN teams t ON p.team_id = t.team_id
+                   ORDER BY p.name"""
+            )
+            players = await cursor.fetchall()
+
+        # Filter players based on what the user has typed
+        choices = []
+        for player_id, name, position, age, rating, team_name in players:
+            # Check if current input matches player name
+            if current.lower() in name.lower():
+                # Format: Team Name (POS, age yo, OVR)
+                team_prefix = team_name if team_name else "Free Agent"
+                display_name = f"{name} ({team_prefix}, {position}, {age}yo, {rating} OVR)"
+
+                # Value is player_id so we can query by ID later
+                choices.append(app_commands.Choice(name=display_name, value=str(player_id)))
+
+        # Return up to 25 choices (Discord limit)
+        return choices[:25]
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Check if user has admin permissions for admin commands"""
         # Admin check for all commands
@@ -74,6 +104,7 @@ class SuspensionCommands(commands.Cog):
         suspension_reason="Reason for suspension",
         games_missed="Number of games to miss"
     )
+    @app_commands.autocomplete(player_name=player_name_autocomplete)
     async def add_suspension(
         self,
         interaction: discord.Interaction,
@@ -82,19 +113,28 @@ class SuspensionCommands(commands.Cog):
         games_missed: int
     ):
         async with aiosqlite.connect(DB_PATH) as db:
-            # Find the player
+            # Get player by ID (player_name is actually player_id from autocomplete)
+            try:
+                player_id = int(player_name)
+            except ValueError:
+                await interaction.response.send_message(
+                    f"❌ Invalid player selection. Please use the autocomplete suggestions.",
+                    ephemeral=True
+                )
+                return
+
             cursor = await db.execute(
                 """SELECT p.player_id, p.name, p.team_id, t.team_name
                    FROM players p
                    LEFT JOIN teams t ON p.team_id = t.team_id
-                   WHERE p.name LIKE ?""",
-                (f"%{player_name}%",)
+                   WHERE p.player_id = ?""",
+                (player_id,)
             )
             player = await cursor.fetchone()
 
             if not player:
                 await interaction.response.send_message(
-                    f"❌ No player found matching '{player_name}'",
+                    f"❌ Player not found. Please select from the autocomplete suggestions.",
                     ephemeral=True
                 )
                 return
@@ -184,6 +224,7 @@ class SuspensionCommands(commands.Cog):
         new_suspension_reason="New suspension reason (optional)",
         new_games_missed="New games missed (optional)"
     )
+    @app_commands.autocomplete(player_name=player_name_autocomplete)
     async def edit_suspension(
         self,
         interaction: discord.Interaction,
@@ -192,18 +233,27 @@ class SuspensionCommands(commands.Cog):
         new_games_missed: int = None
     ):
         async with aiosqlite.connect(DB_PATH) as db:
-            # Find the player
+            # Get player by ID (player_name is actually player_id from autocomplete)
+            try:
+                player_id = int(player_name)
+            except ValueError:
+                await interaction.response.send_message(
+                    f"❌ Invalid player selection. Please use the autocomplete suggestions.",
+                    ephemeral=True
+                )
+                return
+
             cursor = await db.execute(
                 """SELECT p.player_id, p.name
                    FROM players p
-                   WHERE p.name LIKE ?""",
-                (f"%{player_name}%",)
+                   WHERE p.player_id = ?""",
+                (player_id,)
             )
             player = await cursor.fetchone()
 
             if not player:
                 await interaction.response.send_message(
-                    f"❌ No player found matching '{player_name}'",
+                    f"❌ Player not found. Please select from the autocomplete suggestions.",
                     ephemeral=True
                 )
                 return
@@ -265,21 +315,31 @@ class SuspensionCommands(commands.Cog):
 
     @app_commands.command(name="removesuspension", description="[ADMIN] Remove a player's suspension")
     @app_commands.describe(player_name="Player name")
+    @app_commands.autocomplete(player_name=player_name_autocomplete)
     async def remove_suspension(self, interaction: discord.Interaction, player_name: str):
         async with aiosqlite.connect(DB_PATH) as db:
-            # Find the player
+            # Get player by ID (player_name is actually player_id from autocomplete)
+            try:
+                player_id = int(player_name)
+            except ValueError:
+                await interaction.response.send_message(
+                    f"❌ Invalid player selection. Please use the autocomplete suggestions.",
+                    ephemeral=True
+                )
+                return
+
             cursor = await db.execute(
                 """SELECT p.player_id, p.name, p.team_id, t.team_name
                    FROM players p
                    LEFT JOIN teams t ON p.team_id = t.team_id
-                   WHERE p.name LIKE ?""",
-                (f"%{player_name}%",)
+                   WHERE p.player_id = ?""",
+                (player_id,)
             )
             player = await cursor.fetchone()
 
             if not player:
                 await interaction.response.send_message(
-                    f"❌ No player found matching '{player_name}'",
+                    f"❌ Player not found. Please select from the autocomplete suggestions.",
                     ephemeral=True
                 )
                 return
