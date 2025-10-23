@@ -284,6 +284,106 @@ class LineupCommands(commands.Cog):
 
         await interaction.response.send_message(embed=embed)
 
+    @app_commands.command(name="delist", description="Delist a player from your team (offseason only)")
+    @app_commands.describe(
+        player_name="Player to delist",
+        team_name="[ADMIN ONLY] Team name to delist player from"
+    )
+    @app_commands.autocomplete(team_name=team_autocomplete)
+    async def delist_player(self, interaction: discord.Interaction, player_name: str, team_name: str = None):
+        # If team_name specified, check if user is admin
+        if team_name:
+            if not await self.is_admin(interaction):
+                await interaction.response.send_message(
+                    "❌ Only admins can delist players from other teams!",
+                    ephemeral=True
+                )
+                return
+
+            # Look up specified team (exact match due to autocomplete)
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT team_id, team_name FROM teams WHERE team_name = ?",
+                    (team_name,)
+                )
+                result = await cursor.fetchone()
+                if not result:
+                    await interaction.response.send_message(
+                        f"❌ Team '{team_name}' not found. Please select from the autocomplete suggestions.",
+                        ephemeral=True
+                    )
+                    return
+                team_id, team_name = result
+        else:
+            # Get user's team
+            team_id, team_name = await self.get_user_team(interaction.user.id, interaction.guild)
+
+            if not team_id:
+                await interaction.response.send_message(
+                    "❌ You don't manage a team!",
+                    ephemeral=True
+                )
+                return
+
+        # Check if it's offseason
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT status FROM seasons WHERE status = 'active' LIMIT 1"
+            )
+            season = await cursor.fetchone()
+
+            if not season or season[0] != 'offseason':
+                await interaction.response.send_message(
+                    "❌ Players can only be delisted during the offseason!",
+                    ephemeral=True
+                )
+                return
+
+            # Find player by name on this team
+            cursor = await db.execute(
+                """SELECT player_id, name FROM players
+                   WHERE team_id = ? AND LOWER(name) LIKE LOWER(?)
+                   ORDER BY name LIMIT 5""",
+                (team_id, f"%{player_name}%")
+            )
+            matches = await cursor.fetchall()
+
+            if not matches:
+                await interaction.response.send_message(
+                    f"❌ No player found matching '{player_name}' on your team.",
+                    ephemeral=True
+                )
+                return
+
+            if len(matches) > 1:
+                # Multiple matches - list them
+                names = [f"• {name}" for _, name in matches]
+                await interaction.response.send_message(
+                    f"❌ Multiple players match '{player_name}':\n" + "\n".join(names) + "\n\nPlease be more specific.",
+                    ephemeral=True
+                )
+                return
+
+            player_id, full_name = matches[0]
+
+            # Delist the player
+            await db.execute(
+                "UPDATE players SET team_id = NULL WHERE player_id = ?",
+                (player_id,)
+            )
+
+            # Remove from lineups
+            await db.execute(
+                "DELETE FROM lineups WHERE player_id = ?",
+                (player_id,)
+            )
+
+            await db.commit()
+
+        await interaction.response.send_message(
+            f"✅ **{full_name}** has been delisted from **{team_name}**."
+        )
+
 
 class TeamLineupMenu(discord.ui.View):
     """Main menu for team lineup management"""
@@ -595,11 +695,43 @@ class TeamLineupMenu(discord.ui.View):
 
                 if outs:
                     placeholders = ','.join('?' * len(outs))
+                    # Get player info for outs
                     cursor = await db.execute(
-                        f"SELECT name, overall_rating FROM players WHERE player_id IN ({placeholders})",
+                        f"SELECT player_id, name, overall_rating FROM players WHERE player_id IN ({placeholders})",
                         list(outs)
                     )
-                    outs_names = [f"{name} ({ovr})" for name, ovr in await cursor.fetchall()]
+                    out_players = await cursor.fetchall()
+
+                    # Check injury/suspension status for each player
+                    for player_id, name, ovr in out_players:
+                        status = None
+
+                        # Check if injured
+                        cursor = await db.execute(
+                            """SELECT 1 FROM injuries
+                               WHERE player_id = ? AND status = 'injured' AND return_round > ?""",
+                            (player_id, current_round)
+                        )
+                        if await cursor.fetchone():
+                            status = "injured"
+
+                        # Check if suspended (only if not injured)
+                        if not status:
+                            cursor = await db.execute(
+                                """SELECT 1 FROM suspensions
+                                   WHERE player_id = ? AND status = 'suspended' AND return_round > ?""",
+                                (player_id, current_round)
+                            )
+                            if await cursor.fetchone():
+                                status = "suspended"
+
+                        # Build name with status
+                        if status == "injured":
+                            outs_names.append(f"{name} ({ovr}) (injured)")
+                        elif status == "suspended":
+                            outs_names.append(f"{name} ({ovr}) (suspended)")
+                        else:
+                            outs_names.append(f"{name} ({ovr}) (omitted)")
 
         # Build lineup embed
         round_display = get_round_name(current_round, regular_rounds) if current_round > 0 else "Offseason"

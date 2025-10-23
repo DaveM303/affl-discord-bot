@@ -365,8 +365,21 @@ class AdminCommands(commands.Cog):
             return
         
         async with aiosqlite.connect(DB_PATH) as db:
+            # Check for duplicate names
+            cursor = await db.execute(
+                "SELECT player_id, name FROM players WHERE LOWER(name) = LOWER(?)",
+                (name,)
+            )
+            duplicate = await cursor.fetchone()
+            if duplicate:
+                await interaction.response.send_message(
+                    f"⚠️ Warning: A player named **{duplicate[1]}** already exists in the system (ID: {duplicate[0]}). Consider using a unique name.",
+                    ephemeral=True
+                )
+                return
+
             team_id = None
-            
+
             # If team specified, find it
             if team_name:
                 cursor = await db.execute(
@@ -497,6 +510,19 @@ class AdminCommands(commands.Cog):
             changes = []
 
             if new_name is not None:
+                # Check for duplicate names
+                cursor = await db.execute(
+                    "SELECT player_id, name FROM players WHERE LOWER(name) = LOWER(?) AND player_id != ?",
+                    (new_name, player_id)
+                )
+                duplicate = await cursor.fetchone()
+                if duplicate:
+                    await interaction.response.send_message(
+                        f"⚠️ Warning: A player named **{duplicate[1]}** already exists in the system (ID: {duplicate[0]}). Consider using a unique name.",
+                        ephemeral=True
+                    )
+                    return
+
                 updates.append("name = ?")
                 values.append(new_name)
                 changes.append(f"Name: {player_name} → {new_name}")
@@ -751,6 +777,7 @@ class AdminCommands(commands.Cog):
             players_added = 0
             players_updated = 0
             errors = []
+            duplicate_warnings = []
             
             async with aiosqlite.connect(DB_PATH) as db:
                 # Import Teams
@@ -827,7 +854,13 @@ class AdminCommands(commands.Cog):
                             # Check if player exists
                             cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (name,))
                             existing = await cursor.fetchone()
-                            
+
+                            # Check for case-insensitive duplicates (different from exact match)
+                            cursor = await db.execute("SELECT player_id, name FROM players WHERE LOWER(name) = LOWER(?) AND name != ?", (name, name))
+                            duplicate = await cursor.fetchone()
+                            if duplicate:
+                                duplicate_warnings.append(f"'{name}' is similar to existing player '{duplicate[1]}' (ID: {duplicate[0]})")
+
                             if existing:
                                 player_id = existing[0]
                                 await db.execute(
@@ -883,13 +916,19 @@ class AdminCommands(commands.Cog):
             response = "✅ **Import Complete!**\n\n"
             response += f"**Teams:** {teams_added} added, {teams_updated} updated\n"
             response += f"**Players:** {players_added} added, {players_updated} updated\n"
-            
+
+            if duplicate_warnings:
+                response += f"\n⚠️ **{len(duplicate_warnings)} Duplicate Name Warning(s):**\n"
+                response += "\n".join(duplicate_warnings[:10])  # Show first 10 warnings
+                if len(duplicate_warnings) > 10:
+                    response += f"\n... and {len(duplicate_warnings) - 10} more"
+
             if errors:
-                response += f"\n⚠️ **{len(errors)} Errors:**\n"
+                response += f"\n❌ **{len(errors)} Errors:**\n"
                 response += "\n".join(errors[:10])  # Show first 10 errors
                 if len(errors) > 10:
                     response += f"\n... and {len(errors) - 10} more"
-            
+
             await interaction.followup.send(response, ephemeral=True)
             
         except Exception as e:

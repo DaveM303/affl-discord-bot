@@ -160,9 +160,19 @@ class PlayerCommands(commands.Cog):
         return choices[:25]
 
     @app_commands.command(name="roster", description="View a team's roster")
-    @app_commands.describe(team_name="Name of the team (leave empty for your team)")
+    @app_commands.describe(
+        team_name="Name of the team (leave empty for your team)",
+        sort_by="Sort by (default: OVR desc)"
+    )
     @app_commands.autocomplete(team_name=team_name_autocomplete)
-    async def roster(self, interaction: discord.Interaction, team_name: str = None):
+    @app_commands.choices(sort_by=[
+        app_commands.Choice(name="OVR (High to Low)", value="ovr_desc"),
+        app_commands.Choice(name="OVR (Low to High)", value="ovr_asc"),
+        app_commands.Choice(name="Age (Oldest to Youngest)", value="age_desc"),
+        app_commands.Choice(name="Age (Youngest to Oldest)", value="age_asc"),
+        app_commands.Choice(name="Position", value="position"),
+    ])
+    async def roster(self, interaction: discord.Interaction, team_name: str = None, sort_by: str = "ovr_desc"):
         async with aiosqlite.connect(DB_PATH) as db:
             # If no team specified, get user's team
             if not team_name:
@@ -217,11 +227,31 @@ class PlayerCommands(commands.Cog):
             emoji = self.get_team_emoji(emoji_id)
             team_title = f"{emoji} {t_name}" if emoji else t_name
             
+            # Build ORDER BY clause
+            if sort_by == "ovr_desc":
+                order_clause = "overall_rating DESC, age ASC"
+            elif sort_by == "ovr_asc":
+                order_clause = "overall_rating ASC, age ASC"
+            elif sort_by == "age_desc":
+                order_clause = "age DESC, overall_rating DESC"
+            elif sort_by == "age_asc":
+                order_clause = "age ASC, overall_rating DESC"
+            elif sort_by == "position":
+                # Use CASE to order by POSITION_DISPLAY_ORDER
+                from positions import POSITION_DISPLAY_ORDER
+                case_parts = []
+                for idx, pos in enumerate(POSITION_DISPLAY_ORDER):
+                    case_parts.append(f"WHEN position = '{pos}' THEN {idx}")
+                case_statement = "CASE " + " ".join(case_parts) + " ELSE 999 END"
+                order_clause = f"{case_statement}, overall_rating DESC"
+            else:
+                order_clause = "overall_rating DESC, age ASC"
+
             # Get roster
             cursor = await db.execute(
-                """SELECT name, position, overall_rating, age
+                f"""SELECT name, position, overall_rating, age
                    FROM players WHERE team_id = ?
-                   ORDER BY position, overall_rating DESC""",
+                   ORDER BY {order_clause}""",
                 (team_id,)
             )
             players = await cursor.fetchall()
@@ -268,6 +298,7 @@ class PlayerCommands(commands.Cog):
         position2="Second position filter (optional)",
         position3="Third position filter (optional)",
         team_name="Team name (or 'delisted')",
+        sort_by="Sort by (default: OVR desc)",
         limit="Max results to show (default 100)"
     )
     @app_commands.autocomplete(
@@ -276,6 +307,13 @@ class PlayerCommands(commands.Cog):
         position2=position_autocomplete,
         position3=position_autocomplete
     )
+    @app_commands.choices(sort_by=[
+        app_commands.Choice(name="OVR (High to Low)", value="ovr_desc"),
+        app_commands.Choice(name="OVR (Low to High)", value="ovr_asc"),
+        app_commands.Choice(name="Age (Oldest to Youngest)", value="age_desc"),
+        app_commands.Choice(name="Age (Youngest to Oldest)", value="age_asc"),
+        app_commands.Choice(name="Position", value="position"),
+    ])
     async def search_players(
         self,
         interaction: discord.Interaction,
@@ -287,6 +325,7 @@ class PlayerCommands(commands.Cog):
         position2: str = None,
         position3: str = None,
         team_name: str = None,
+        sort_by: str = "ovr_desc",
         limit: int = 100
     ):
         async with aiosqlite.connect(DB_PATH) as db:
@@ -340,8 +379,28 @@ class PlayerCommands(commands.Cog):
                 else:
                     query += " AND t.team_name = ?"
                     params.append(team_name)
-            
-            query += " ORDER BY p.overall_rating DESC LIMIT ?"
+
+            # Build ORDER BY clause
+            if sort_by == "ovr_desc":
+                order_clause = "p.overall_rating DESC, p.age ASC"
+            elif sort_by == "ovr_asc":
+                order_clause = "p.overall_rating ASC, p.age ASC"
+            elif sort_by == "age_desc":
+                order_clause = "p.age DESC, p.overall_rating DESC"
+            elif sort_by == "age_asc":
+                order_clause = "p.age ASC, p.overall_rating DESC"
+            elif sort_by == "position":
+                # Use CASE to order by POSITION_DISPLAY_ORDER
+                from positions import POSITION_DISPLAY_ORDER
+                case_parts = []
+                for idx, pos in enumerate(POSITION_DISPLAY_ORDER):
+                    case_parts.append(f"WHEN p.position = '{pos}' THEN {idx}")
+                case_statement = "CASE " + " ".join(case_parts) + " ELSE 999 END"
+                order_clause = f"{case_statement}, p.overall_rating DESC"
+            else:
+                order_clause = "p.overall_rating DESC, p.age ASC"
+
+            query += f" ORDER BY {order_clause} LIMIT ?"
             params.append(limit)
             
             cursor = await db.execute(query, params)
