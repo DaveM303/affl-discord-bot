@@ -259,31 +259,30 @@ class PlayerCommands(commands.Cog):
             embed = discord.Embed(title=f"{team_title}", color=discord.Color.blue())
 
             if players:
-                # Group by position (dynamically)
-                from collections import defaultdict
-                positions = defaultdict(list)
-
+                # Build simple player list
+                player_lines = []
                 for name, pos, rating, age in players:
-                    positions[pos].append(f"**{name}** - {rating} OVR, {age}yo")
+                    player_lines.append(f"**{name}** - {pos}, {rating} OVR, {age}yo")
 
-                # Import position display order
-                from positions import POSITION_DISPLAY_ORDER
-
-                # Display positions in specified order
-                for pos in POSITION_DISPLAY_ORDER:
-                    if pos not in positions:
-                        continue
-                    player_list = positions[pos]
-                    embed.add_field(
-                        name=f"{pos} ({len(player_list)})",
-                        value="\n".join(player_list),
-                        inline=False
-                    )
+                # Split into chunks if needed (Discord embed description limit is 4096 chars)
+                description = "\n".join(player_lines)
+                if len(description) > 4000:
+                    # If too long, split into fields
+                    chunk_size = 20
+                    for i in range(0, len(player_lines), chunk_size):
+                        chunk = player_lines[i:i + chunk_size]
+                        embed.add_field(
+                            name=f"Players {i+1}-{i+len(chunk)}" if i > 0 else "Players",
+                            value="\n".join(chunk),
+                            inline=False
+                        )
+                else:
+                    embed.description = description
 
                 # Add roster size to footer
                 embed.set_footer(text=f"{len(players)} players")
             else:
-                embed.add_field(name="Roster", value="No players on this team", inline=False)
+                embed.description = "No players on this team"
                 embed.set_footer(text="0 players")
 
             await interaction.response.send_message(embed=embed)

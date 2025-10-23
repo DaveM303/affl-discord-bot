@@ -371,12 +371,6 @@ class AdminCommands(commands.Cog):
                 (name,)
             )
             duplicate = await cursor.fetchone()
-            if duplicate:
-                await interaction.response.send_message(
-                    f"⚠️ Warning: A player named **{duplicate[1]}** already exists in the system (ID: {duplicate[0]}). Consider using a unique name.",
-                    ephemeral=True
-                )
-                return
 
             team_id = None
 
@@ -387,16 +381,16 @@ class AdminCommands(commands.Cog):
                     (f"%{team_name}%",)
                 )
                 team = await cursor.fetchone()
-                
+
                 if not team:
                     await interaction.response.send_message(
                         f"❌ No team found matching '{team_name}'",
                         ephemeral=True
                     )
                     return
-                
+
                 team_id = team[0]
-            
+
             # Add player
             await db.execute(
                 """INSERT INTO players (name, position, overall_rating, age, team_id)
@@ -404,11 +398,15 @@ class AdminCommands(commands.Cog):
                 (name, normalized_pos, rating, age, team_id)
             )
             await db.commit()
-            
+
             team_text = f"to **{team_name}**" if team_name else "as delisted"
-            await interaction.response.send_message(
-                f"✅ Added **{name}** ({normalized_pos}, {rating} OVR, {age}yo) {team_text}!"
-            )
+            success_msg = f"✅ Added **{name}** ({normalized_pos}, {rating} OVR, {age}yo) {team_text}!"
+
+            # Add warning if duplicate name exists
+            if duplicate:
+                success_msg += f"\n\n⚠️ Note: Another player named **{duplicate[1]}** already exists (ID: {duplicate[0]})."
+
+            await interaction.response.send_message(success_msg)
 
     @app_commands.command(name="removeplayer", description="[ADMIN] Remove a player")
     @app_commands.describe(name="Player name")
@@ -509,19 +507,16 @@ class AdminCommands(commands.Cog):
             values = []
             changes = []
 
+            # Check for duplicate names if changing name
+            duplicate_warning = None
             if new_name is not None:
-                # Check for duplicate names
                 cursor = await db.execute(
                     "SELECT player_id, name FROM players WHERE LOWER(name) = LOWER(?) AND player_id != ?",
                     (new_name, player_id)
                 )
                 duplicate = await cursor.fetchone()
                 if duplicate:
-                    await interaction.response.send_message(
-                        f"⚠️ Warning: A player named **{duplicate[1]}** already exists in the system (ID: {duplicate[0]}). Consider using a unique name.",
-                        ephemeral=True
-                    )
-                    return
+                    duplicate_warning = f"\n\n⚠️ Note: Another player named **{duplicate[1]}** already exists (ID: {duplicate[0]})."
 
                 updates.append("name = ?")
                 values.append(new_name)
@@ -633,6 +628,10 @@ class AdminCommands(commands.Cog):
             # Build response with changes
             response = f"✅ Updated **{player_name}**\n\n"
             response += "\n".join(changes)
+
+            # Add duplicate warning if applicable
+            if duplicate_warning:
+                response += duplicate_warning
 
             await interaction.response.send_message(response)
 
