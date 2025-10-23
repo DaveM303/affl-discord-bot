@@ -40,7 +40,7 @@ class PlayerCommands(commands.Cog):
             # Check if current input matches player name
             if current.lower() in name.lower():
                 # Format: Name (Team, POS, age yo, OVR)
-                team_prefix = team_name if team_name else "Free Agent"
+                team_prefix = team_name if team_name else "Delisted"
                 display_name = f"{name} ({team_prefix}, {position}, {age}yo, {rating} OVR)"
 
                 # Value is player_id so we can query by ID later
@@ -267,7 +267,7 @@ class PlayerCommands(commands.Cog):
         position1="First position filter (optional)",
         position2="Second position filter (optional)",
         position3="Third position filter (optional)",
-        team_name="Team name (or 'free agents')",
+        team_name="Team name (or 'delisted')",
         limit="Max results to show (default 100)"
     )
     @app_commands.autocomplete(
@@ -335,7 +335,7 @@ class PlayerCommands(commands.Cog):
                 params.extend(normalized_positions)
             
             if team_name is not None:
-                if team_name.lower() in ['free agent', 'free agents', 'fa']:
+                if team_name.lower() in ['delisted', 'delist', 'del']:
                     query += " AND p.team_id IS NULL"
                 else:
                     query += " AND t.team_name = ?"
@@ -371,36 +371,6 @@ class PlayerCommands(commands.Cog):
             embed = view.create_embed()
             
             await interaction.response.send_message(embed=embed, view=view)
-
-    @app_commands.command(name="teamlist", description="View all teams in the league")
-    async def team_list(self, interaction: discord.Interaction):
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                """SELECT team_name, role_id, emoji_id FROM teams ORDER BY team_name"""
-            )
-            teams = await cursor.fetchall()
-            
-            if not teams:
-                await interaction.response.send_message("No teams in the league yet!")
-                return
-            
-            embed = discord.Embed(title="League Teams", color=discord.Color.gold())
-            
-            team_list = ""
-            for name, role_id, emoji_id in teams:
-                emoji = self.get_team_emoji(emoji_id)
-                team_display = f"{emoji} {name}" if emoji else f"**{name}**"
-                
-                # Try to get role mention
-                role_mention = ""
-                if role_id:
-                    role = interaction.guild.get_role(int(role_id))
-                    if role:
-                        role_mention = f" - {role.mention}"
-                team_list += f"{team_display}{role_mention}\n"
-            
-            embed.description = team_list
-            await interaction.response.send_message(embed=embed)
 
 
 class SearchPlayersView(discord.ui.View):

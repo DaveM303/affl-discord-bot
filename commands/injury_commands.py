@@ -30,7 +30,7 @@ class InjuryCommands(commands.Cog):
             # Check if current input matches player name
             if current.lower() in name.lower():
                 # Format: Team Name (POS, age yo, OVR)
-                team_prefix = team_name if team_name else "Free Agent"
+                team_prefix = team_name if team_name else "Delisted"
                 display_name = f"{name} ({team_prefix}, {position}, {age}yo, {rating} OVR)"
 
                 # Value is player_id so we can query by ID later
@@ -206,7 +206,7 @@ class InjuryCommands(commands.Cog):
 
             # Notify team channel
             if team_id:
-                team_display = team_name if team_name else "Free Agent"
+                team_display = team_name if team_name else "Delisted"
                 week_text = "week" if recovery_rounds == 1 else "weeks"
 
                 # Use "an" for vowels, "a" for consonants
@@ -572,7 +572,7 @@ class InjuryCommands(commands.Cog):
 
             # Notify team channel
             if team_id:
-                team_display = team_name if team_name else "Free Agent"
+                team_display = team_name if team_name else "Delisted"
                 await self.notify_team_channel(
                     team_id,
                     f"✅ **Recovery Update**\n"

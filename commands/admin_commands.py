@@ -32,7 +32,7 @@ class AdminCommands(commands.Cog):
             # Check if current input matches player name
             if current.lower() in name.lower():
                 # Format: Name (Team, POS, age yo, OVR)
-                team_prefix = team_name if team_name else "Free Agent"
+                team_prefix = team_name if team_name else "Delisted"
                 display_name = f"{name} ({team_prefix}, {position}, {age}yo, {rating} OVR)"
 
                 # Value is player_id so we can query by ID later
@@ -248,24 +248,55 @@ class AdminCommands(commands.Cog):
                     ephemeral=True
                 )
 
-    @app_commands.command(name="setlineupschannel", description="[ADMIN] Set the channel where all submitted lineups are posted")
-    @app_commands.describe(channel="Channel for all lineup submissions")
-    async def set_lineups_channel(
+    @app_commands.command(name="config", description="[ADMIN] Configure bot settings")
+    @app_commands.describe(
+        lineups_channel="Channel where all lineup submissions are posted"
+    )
+    async def config(
         self,
         interaction: discord.Interaction,
-        channel: discord.TextChannel
+        lineups_channel: discord.TextChannel = None
     ):
+        # If no parameters provided, show current settings
+        if lineups_channel is None:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT setting_key, setting_value FROM settings WHERE setting_key = 'lineups_channel_id'"
+                )
+                result = await cursor.fetchone()
+
+            embed = discord.Embed(title="⚙️ Bot Configuration", color=discord.Color.blue())
+
+            if result and result[1]:
+                channel = interaction.guild.get_channel(int(result[1]))
+                channel_display = channel.mention if channel else f"<#{result[1]}> (channel not found)"
+            else:
+                channel_display = "*Not set*"
+
+            embed.add_field(name="Lineups Channel", value=channel_display, inline=False)
+            embed.set_footer(text="Use /config with parameters to update settings")
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # Update settings
+        updates = []
         async with aiosqlite.connect(DB_PATH) as db:
-            # Set the global lineups channel
-            await db.execute(
-                "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
-                ("lineups_channel_id", str(channel.id))
-            )
+            if lineups_channel:
+                await db.execute(
+                    "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
+                    ("lineups_channel_id", str(lineups_channel.id))
+                )
+                updates.append(f"Lineups Channel → {lineups_channel.mention}")
+
             await db.commit()
 
+        if updates:
             await interaction.response.send_message(
-                f"✅ All lineup submissions will be posted in {channel.mention}"
+                "✅ **Configuration Updated:**\n" + "\n".join(updates)
             )
+        else:
+            await interaction.response.send_message("❌ No settings were updated!", ephemeral=True)
 
     @app_commands.command(name="removeteam", description="[ADMIN] Remove a team from the league")
     @app_commands.describe(team_name="Name of the team to remove")
@@ -306,7 +337,7 @@ class AdminCommands(commands.Cog):
         position="Player position",
         rating="Overall rating (1-100)",
         age="Player age",
-        team_name="Team name (leave empty for free agent)"
+        team_name="Team name (leave empty for delisted)"
     )
     @app_commands.autocomplete(position=position_autocomplete)
     async def add_player(
@@ -361,7 +392,7 @@ class AdminCommands(commands.Cog):
             )
             await db.commit()
             
-            team_text = f"to **{team_name}**" if team_name else "as a free agent"
+            team_text = f"to **{team_name}**" if team_name else "as delisted"
             await interaction.response.send_message(
                 f"✅ Added **{name}** ({normalized_pos}, {rating} OVR, {age}yo) {team_text}!"
             )
@@ -406,16 +437,18 @@ class AdminCommands(commands.Cog):
     @app_commands.command(name="updateplayer", description="[ADMIN] Update a player's stats")
     @app_commands.describe(
         name="Player name",
+        new_name="New player name (optional)",
         ovr="New overall rating (optional)",
         age="New age (optional)",
         position="New position (optional)",
-        team="New team (optional, use 'free agent' to release)"
+        team="New team (optional, use 'delisted' to release)"
     )
     @app_commands.autocomplete(position=position_autocomplete, name=player_name_autocomplete)
     async def update_player(
         self,
         interaction: discord.Interaction,
         name: str,
+        new_name: str = None,
         ovr: int = None,
         age: int = None,
         position: str = None,
@@ -463,6 +496,11 @@ class AdminCommands(commands.Cog):
             values = []
             changes = []
 
+            if new_name is not None:
+                updates.append("name = ?")
+                values.append(new_name)
+                changes.append(f"Name: {player_name} → {new_name}")
+
             if ovr is not None:
                 if not 1 <= ovr <= 100:
                     await interaction.response.send_message(
@@ -493,7 +531,7 @@ class AdminCommands(commands.Cog):
 
             if team is not None:
                 # Handle team update
-                if team.lower() in ['free agent', 'free agents', 'fa']:
+                if team.lower() in ['delisted', 'delist', 'del']:
                     # Release to free agency
                     new_team_id = None
                     new_team_display = "FA"
@@ -572,120 +610,6 @@ class AdminCommands(commands.Cog):
 
             await interaction.response.send_message(response)
 
-    @app_commands.command(name="signplayer", description="[ADMIN] Sign a free agent to a team")
-    @app_commands.describe(
-        player_name="Player name",
-        team_name="Team name"
-    )
-    @app_commands.autocomplete(player_name=player_name_autocomplete)
-    async def sign_player(self, interaction: discord.Interaction, player_name: str, team_name: str):
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Get player by ID (player_name is actually player_id from autocomplete)
-            try:
-                player_id = int(player_name)
-            except ValueError:
-                await interaction.response.send_message(
-                    f"❌ Invalid player selection. Please use the autocomplete suggestions.",
-                    ephemeral=True
-                )
-                return
-
-            cursor = await db.execute(
-                "SELECT player_id, name, team_id FROM players WHERE player_id = ?",
-                (player_id,)
-            )
-            player = await cursor.fetchone()
-
-            if not player:
-                await interaction.response.send_message(
-                    f"❌ Player not found. Please select from the autocomplete suggestions.",
-                    ephemeral=True
-                )
-                return
-
-            player_id, p_name, current_team = player
-            
-            if current_team is not None:
-                await interaction.response.send_message(
-                    f"❌ **{p_name}** is already on a team! Use `/releaseplayer` first.",
-                    ephemeral=True
-                )
-                return
-            
-            # Find team
-            cursor = await db.execute(
-                "SELECT team_id, team_name FROM teams WHERE team_name LIKE ?",
-                (f"%{team_name}%",)
-            )
-            team = await cursor.fetchone()
-            
-            if not team:
-                await interaction.response.send_message(
-                    f"❌ No team found matching '{team_name}'",
-                    ephemeral=True
-                )
-                return
-            
-            team_id, t_name = team
-            
-            # Sign player
-            await db.execute(
-                "UPDATE players SET team_id = ? WHERE player_id = ?",
-                (team_id, player_id)
-            )
-            await db.commit()
-            
-            await interaction.response.send_message(
-                f"✅ **{p_name}** signed to **{t_name}**!"
-            )
-
-    @app_commands.command(name="releaseplayer", description="[ADMIN] Release a player to free agency")
-    @app_commands.describe(player_name="Player name")
-    @app_commands.autocomplete(player_name=player_name_autocomplete)
-    async def release_player(self, interaction: discord.Interaction, player_name: str):
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Get player by ID (player_name is actually player_id from autocomplete)
-            try:
-                player_id = int(player_name)
-            except ValueError:
-                await interaction.response.send_message(
-                    f"❌ Invalid player selection. Please use the autocomplete suggestions.",
-                    ephemeral=True
-                )
-                return
-
-            cursor = await db.execute(
-                "SELECT player_id, name, team_id FROM players WHERE player_id = ?",
-                (player_id,)
-            )
-            player = await cursor.fetchone()
-
-            if not player:
-                await interaction.response.send_message(
-                    f"❌ Player not found. Please select from the autocomplete suggestions.",
-                    ephemeral=True
-                )
-                return
-
-            player_id, p_name, team_id = player
-            
-            if team_id is None:
-                await interaction.response.send_message(
-                    f"❌ **{p_name}** is already a free agent!",
-                    ephemeral=True
-                )
-                return
-            
-            await db.execute(
-                "UPDATE players SET team_id = NULL WHERE player_id = ?",
-                (player_id,)
-            )
-            await db.commit()
-            
-            await interaction.response.send_message(
-                f"✅ **{p_name}** released to free agency!"
-            )
-
     @app_commands.command(name="exportdata", description="[ADMIN] Export all teams and players to Excel")
     async def export_data(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -753,7 +677,7 @@ class AdminCommands(commands.Cog):
                 )
                 injuries = await cursor.fetchall()
                 injuries_df = pd.DataFrame(injuries, columns=['Player_Name', 'Team', 'Injury_Type', 'Injury_Round', 'Recovery_Rounds', 'Return_Round', 'Status'])
-                injuries_df['Team'] = injuries_df['Team'].fillna('Free Agent')
+                injuries_df['Team'] = injuries_df['Team'].fillna('Delisted')
 
             # Create Excel file in memory
             output = io.BytesIO()
@@ -783,7 +707,7 @@ class AdminCommands(commands.Cog):
                         '',
                         '5. Players sheet columns:',
                         '   - Name: Player name',
-                        '   - Team: Team name (leave blank for free agents)',
+                        '   - Team: Team name (leave blank for delisted players)',
                         '   - Age: Player age',
                         '   - Pos: Position (MID, KEY FWD, RUCK, etc.)',
                         '   - OVR: Overall rating (1-100)',

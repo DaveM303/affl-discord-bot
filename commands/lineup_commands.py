@@ -1407,26 +1407,32 @@ class ClearPositionButton(discord.ui.Button):
 
 class NextGroupButton(discord.ui.Button):
     def __init__(self, parent_view):
-        super().__init__(label="Next →", style=discord.ButtonStyle.primary)
+        group_names = ["Backline", "Midfield", "Forwards", "Interchange"]
+        next_group = parent_view.current_group + 1
+        label = f"{group_names[next_group]} →"
+        super().__init__(label=label, style=discord.ButtonStyle.primary)
         self.parent_view = parent_view
-    
+
     async def callback(self, interaction: discord.Interaction):
         self.parent_view.current_group += 1
         self.parent_view.add_position_buttons()
-        
+
         embed = self.parent_view.create_embed()
         await interaction.response.edit_message(embed=embed, view=self.parent_view)
 
 
 class PrevGroupButton(discord.ui.Button):
     def __init__(self, parent_view):
-        super().__init__(label="← Back", style=discord.ButtonStyle.primary)
+        group_names = ["Backline", "Midfield", "Forwards", "Interchange"]
+        prev_group = parent_view.current_group - 1
+        label = f"← {group_names[prev_group]}"
+        super().__init__(label=label, style=discord.ButtonStyle.primary)
         self.parent_view = parent_view
-    
+
     async def callback(self, interaction: discord.Interaction):
         self.parent_view.current_group -= 1
         self.parent_view.add_position_buttons()
-        
+
         embed = self.parent_view.create_embed()
         await interaction.response.edit_message(embed=embed, view=self.parent_view)
 
