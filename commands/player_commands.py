@@ -57,13 +57,6 @@ class PlayerCommands(commands.Cog):
         name4="Fourth player name (optional)",
         name5="Fifth player name (optional)"
     )
-    @app_commands.autocomplete(
-        name1=player_name_autocomplete,
-        name2=player_name_autocomplete,
-        name3=player_name_autocomplete,
-        name4=player_name_autocomplete,
-        name5=player_name_autocomplete
-    )
     async def player_lookup(
         self,
         interaction: discord.Interaction,
@@ -73,34 +66,24 @@ class PlayerCommands(commands.Cog):
         name4: str = None,
         name5: str = None
     ):
-        # Collect all non-empty player IDs (from autocomplete)
-        player_ids = [pid for pid in [name1, name2, name3, name4, name5] if pid]
-
-        # Convert to integers
-        try:
-            player_ids = [int(pid) for pid in player_ids]
-        except ValueError:
-            await interaction.response.send_message(
-                "❌ Invalid player selection. Please use the autocomplete suggestions.",
-                ephemeral=True
-            )
-            return
+        # Collect all non-empty search terms
+        search_terms = [name for name in [name1, name2, name3, name4, name5] if name]
 
         async with aiosqlite.connect(DB_PATH) as db:
             all_players = []
 
-            # Get each player by ID
-            for player_id in player_ids:
+            # Search for each term
+            for search_term in search_terms:
                 cursor = await db.execute(
                     """SELECT p.name, p.position, p.overall_rating, p.age, t.team_name, t.emoji_id
                        FROM players p
                        LEFT JOIN teams t ON p.team_id = t.team_id
-                       WHERE p.player_id = ?""",
-                    (player_id,)
+                       WHERE p.name LIKE ?
+                       ORDER BY p.overall_rating DESC""",
+                    (f"%{search_term}%",)
                 )
-                result = await cursor.fetchone()
-                if result:
-                    all_players.append(result)
+                results = await cursor.fetchall()
+                all_players.extend(results)
 
             # Remove duplicates while preserving order (in case searches overlap)
             seen = set()
