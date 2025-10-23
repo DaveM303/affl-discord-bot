@@ -560,7 +560,8 @@ class TeamLineupMenu(discord.ui.View):
             season_id = season_result[0] if season_result else None
 
             # Get previous submitted lineup for this team in this season
-            previous_player_ids = set()
+            previous_player_ids = None
+            has_previous_submission = False
             if season_id:
                 cursor = await db.execute(
                     """SELECT player_ids FROM submitted_lineups
@@ -571,17 +572,18 @@ class TeamLineupMenu(discord.ui.View):
                 prev_result = await cursor.fetchone()
                 if prev_result:
                     previous_player_ids = set(json.loads(prev_result[0]))
+                    has_previous_submission = True
 
-        # Calculate Ins and Outs
-        current_player_ids = set(player_ids)
-        ins = current_player_ids - previous_player_ids
-        outs = previous_player_ids - current_player_ids
-
-        # Get player names for ins and outs
+        # Calculate Ins and Outs (only if there was a previous submission)
         ins_names = []
         outs_names = []
 
-        if ins or outs:
+        if has_previous_submission:
+            current_player_ids = set(player_ids)
+            ins = current_player_ids - previous_player_ids
+            outs = previous_player_ids - current_player_ids
+
+            # Get player names for ins and outs
             async with aiosqlite.connect(DB_PATH) as db:
                 if ins:
                     placeholders = ','.join('?' * len(ins))
