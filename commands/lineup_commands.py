@@ -169,86 +169,6 @@ class LineupCommands(commands.Cog):
 
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    @app_commands.command(name="setlineup", description="Set your team's 22-player lineup")
-    @app_commands.describe(team_name="[ADMIN ONLY] Team name to manage lineup for")
-    @app_commands.autocomplete(team_name=team_autocomplete)
-    async def set_lineup(self, interaction: discord.Interaction, team_name: str = None):
-        # If team_name specified, check if user is admin
-        if team_name:
-            if not await self.is_admin(interaction):
-                await interaction.response.send_message(
-                    "❌ Only admins can manage other team's lineups!",
-                    ephemeral=True
-                )
-                return
-
-            # Look up specified team (exact match due to autocomplete)
-            async with aiosqlite.connect(DB_PATH) as db:
-                cursor = await db.execute(
-                    "SELECT team_id, team_name FROM teams WHERE team_name = ?",
-                    (team_name,)
-                )
-                result = await cursor.fetchone()
-                if not result:
-                    await interaction.response.send_message(
-                        f"❌ Team '{team_name}' not found. Please select from the autocomplete suggestions.",
-                        ephemeral=True
-                    )
-                    return
-                team_id, team_name = result
-        else:
-            # Get user's team
-            team_id, team_name = await self.get_user_team(interaction.user.id, interaction.guild)
-
-            if not team_id:
-                await interaction.response.send_message(
-                    "❌ You don't manage a team! Contact an admin to get assigned.",
-                    ephemeral=True
-                )
-                return
-        
-        await interaction.response.defer(ephemeral=True)
-        
-        # Get current lineup and available players
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Get current lineup
-            cursor = await db.execute(
-                """SELECT l.position_name, p.name, p.position, p.overall_rating
-                   FROM lineups l
-                   JOIN players p ON l.player_id = p.player_id
-                   WHERE l.team_id = ?
-                   ORDER BY l.slot_number""",
-                (team_id,)
-            )
-            current_lineup = await cursor.fetchall()
-            
-            # Get all players on the team
-            cursor = await db.execute(
-                """SELECT player_id, name, position, overall_rating
-                   FROM players WHERE team_id = ?
-                   ORDER BY overall_rating DESC""",
-                (team_id,)
-            )
-            roster = await cursor.fetchall()
-        
-        if len(roster) < 23:
-            await interaction.followup.send(
-                f"❌ You need at least 23 players on your roster to set a lineup (22 + 1 sub). You currently have {len(roster)} players.",
-                ephemeral=True
-            )
-            return
-        
-        # Create the lineup view
-        view = LineupView(team_id, team_name, current_lineup, roster, self.bot)
-        await view.initialize()  # Initialize warnings and player IDs
-        embed = view.create_embed()
-
-        await interaction.followup.send(
-            embed=embed,
-            view=view,
-            ephemeral=True
-        )
-
     @app_commands.command(name="viewlineup", description="View your team's current lineup")
     @app_commands.autocomplete(team_name=team_autocomplete)
     async def view_lineup(self, interaction: discord.Interaction, team_name: str = None):
@@ -361,269 +281,8 @@ class LineupCommands(commands.Cog):
         
         embed.description = field_text
         embed.set_footer(text=f"{len(lineup)}/23 players selected")
-        
+
         await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(name="submitlineup", description="Submit your lineup for the current round")
-    @app_commands.describe(team_name="[ADMIN ONLY] Team name to submit lineup for")
-    @app_commands.autocomplete(team_name=team_autocomplete)
-    async def submit_lineup(self, interaction: discord.Interaction, team_name: str = None):
-        # If team_name specified, check if user is admin
-        if team_name:
-            if not await self.is_admin(interaction):
-                await interaction.response.send_message(
-                    "❌ Only admins can submit lineups for other teams!",
-                    ephemeral=True
-                )
-                return
-
-            # Look up specified team (exact match due to autocomplete)
-            async with aiosqlite.connect(DB_PATH) as db:
-                cursor = await db.execute(
-                    "SELECT team_id, team_name FROM teams WHERE team_name = ?",
-                    (team_name,)
-                )
-                result = await cursor.fetchone()
-                if not result:
-                    await interaction.response.send_message(
-                        f"❌ Team '{team_name}' not found. Please select from the autocomplete suggestions.",
-                        ephemeral=True
-                    )
-                    return
-                team_id, team_name = result
-        else:
-            # Get user's team
-            team_id, team_name = await self.get_user_team(interaction.user.id, interaction.guild)
-
-            if not team_id:
-                await interaction.response.send_message(
-                    "❌ You don't manage a team!",
-                    ephemeral=True
-                )
-                return
-
-        await interaction.response.defer(ephemeral=True)
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Get current lineup
-            cursor = await db.execute(
-                """SELECT l.position_name, p.player_id, p.name, p.position, p.overall_rating
-                   FROM lineups l
-                   JOIN players p ON l.player_id = p.player_id
-                   WHERE l.team_id = ?
-                   ORDER BY l.slot_number""",
-                (team_id,)
-            )
-            lineup = await cursor.fetchall()
-
-            # Get team emoji
-            cursor = await db.execute(
-                "SELECT emoji_id FROM teams WHERE team_id = ?",
-                (team_id,)
-            )
-            result = await cursor.fetchone()
-            emoji_id = result[0] if result else None
-
-            # Get global lineups channel
-            cursor = await db.execute(
-                "SELECT setting_value FROM settings WHERE setting_key = ?",
-                ("lineups_channel_id",)
-            )
-            result = await cursor.fetchone()
-            lineup_channel_id = result[0] if result else None
-
-            # Get current round and regular_rounds
-            cursor = await db.execute(
-                "SELECT current_round, regular_rounds FROM seasons WHERE status = 'active' LIMIT 1"
-            )
-            season_info = await cursor.fetchone()
-            current_round = season_info[0] if season_info else 0
-            regular_rounds = season_info[1] if season_info else 24
-
-        # Validate lineup
-        errors = []
-
-        # Check if lineup has 23 players
-        if len(lineup) < 23:
-            empty_count = 23 - len(lineup)
-            errors.append(f"❌ Lineup incomplete: {empty_count} empty position(s)")
-
-        # Build position map for duplicate checking
-        lineup_dict = {}
-        for pos_name, player_id, name, pos, rating in lineup:
-            lineup_dict[pos_name] = {'player_id': player_id, 'name': name, 'pos': pos, 'rating': rating}
-
-        # Check for duplicates
-        player_ids = [p_id for _, p_id, _, _, _ in lineup]
-        seen = set()
-        duplicates = []
-        for pos_name, player_id, name, pos, rating in lineup:
-            if player_ids.count(player_id) > 1 and player_id not in seen:
-                duplicates.append(name)
-                seen.add(player_id)
-
-        if duplicates:
-            errors.append(f"❌ Duplicate players: {', '.join(duplicates)}")
-
-        # Check for injured players and suspended players
-        if player_ids:
-            async with aiosqlite.connect(DB_PATH) as db:
-                placeholders = ','.join('?' * len(player_ids))
-
-                # Check injuries
-                cursor = await db.execute(
-                    f"""SELECT p.name, i.return_round
-                       FROM injuries i
-                       JOIN players p ON i.player_id = p.player_id
-                       WHERE i.player_id IN ({placeholders}) AND i.status = 'injured'""",
-                    player_ids
-                )
-                injuries = await cursor.fetchall()
-
-                injured_players = []
-                for name, return_round in injuries:
-                    weeks_left = return_round - current_round
-                    if weeks_left > 0:
-                        injured_players.append(f"{name} ({weeks_left}w)")
-
-                if injured_players:
-                    errors.append(f"❌ Injured players: {', '.join(injured_players)}")
-
-                # Check suspensions
-                cursor = await db.execute(
-                    f"""SELECT p.name, s.return_round
-                       FROM suspensions s
-                       JOIN players p ON s.player_id = p.player_id
-                       WHERE s.player_id IN ({placeholders}) AND s.status = 'suspended'""",
-                    player_ids
-                )
-                suspensions = await cursor.fetchall()
-
-                suspended_players = []
-                for name, return_round in suspensions:
-                    games_left = return_round - current_round
-                    if games_left > 0:
-                        suspended_players.append(f"{name} ({games_left}g)")
-
-                if suspended_players:
-                    errors.append(f"❌ Suspended players: {', '.join(suspended_players)}")
-
-        # If there are errors, don't submit
-        if errors:
-            error_msg = "**Cannot submit lineup:**\n\n" + "\n".join(errors)
-            error_msg += "\n\n*Fix these issues using `/setlineup` and try again.*"
-            await interaction.followup.send(error_msg, ephemeral=True)
-            return
-
-        # If no lineup channel set, warn
-        if not lineup_channel_id:
-            await interaction.followup.send(
-                "⚠️ No lineup submission channel has been set!\n"
-                "Ask an admin to use `/setlineupschannel` to set it up.",
-                ephemeral=True
-            )
-            return
-
-        # Get the lineup channel
-        lineup_channel = self.bot.get_channel(int(lineup_channel_id))
-        if not lineup_channel:
-            await interaction.followup.send(
-                "❌ Lineup channel not found! Ask an admin to update it with `/setlineupschannel`.",
-                ephemeral=True
-            )
-            return
-
-        # Get team emoji
-        emoji = ""
-        if emoji_id:
-            try:
-                emoji_obj = self.bot.get_emoji(int(emoji_id))
-                if emoji_obj:
-                    emoji = f"{emoji_obj} "
-            except:
-                pass
-
-        # Create lineup embed for submission
-        rows = [
-            ("FB", ["LBP", "FB", "RBP"]),
-            ("HB", ["LHB", "CHB", "RHB"]),
-            ("C", ["LW", "C", "RW"]),
-            ("HF", ["LHF", "CHF", "RHF"]),
-            ("FF", ["LFP", "FF", "RFP"]),
-            ("Fol", ["R", "RR", "RO"])
-        ]
-
-        # Get the round name
-        round_display = get_round_name(current_round, regular_rounds) if current_round > 0 else "Offseason"
-
-        embed = discord.Embed(
-            title=f"{emoji}{team_name} - {round_display} Lineup",
-            color=discord.Color.green()
-        )
-
-        # Build field display
-        field_text = ""
-        for line_name, positions in rows:
-            row_text = []
-            for pos_name in positions:
-                if pos_name in lineup_dict:
-                    p = lineup_dict[pos_name]
-                    row_text.append(f"{p['name']} ({p['rating']})")
-                else:
-                    row_text.append("*Empty*")
-            field_text += f"**{line_name}:**  {', '.join(row_text)}\n"
-
-        # Add spacing before interchange
-        field_text += "\n"
-
-        # Interchange - all on one line
-        int_players = []
-        for pos_name in ["INT1", "INT2", "INT3", "INT4"]:
-            if pos_name in lineup_dict:
-                p = lineup_dict[pos_name]
-                int_players.append(f"{p['name']} ({p['rating']})")
-            else:
-                int_players.append("*Empty*")
-
-        field_text += f"**Int:**  {', '.join(int_players)}\n"
-
-        # Sub
-        if "SUB" in lineup_dict:
-            p = lineup_dict["SUB"]
-            field_text += f"**Sub:**  {p['name']} ({p['rating']})"
-        else:
-            field_text += f"**Sub:**  *Empty*"
-
-        embed.description = field_text
-
-        # Post to lineup channel
-        await lineup_channel.send(embed=embed)
-
-        # Confirm to user
-        await interaction.followup.send(
-            f"✅ Lineup submitted to {lineup_channel.mention}!",
-            ephemeral=True
-        )
-
-    @app_commands.command(name="clearlineup", description="Clear your team's lineup")
-    async def clear_lineup(self, interaction: discord.Interaction):
-        team_id, team_name = await self.get_user_team(interaction.user.id, interaction.guild)
-
-        if not team_id:
-            await interaction.response.send_message(
-                "❌ You don't manage a team!",
-                ephemeral=True
-            )
-            return
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("DELETE FROM lineups WHERE team_id = ?", (team_id,))
-            await db.commit()
-
-        await interaction.response.send_message(
-            f"✅ Cleared lineup for **{team_name}**",
-            ephemeral=True
-        )
 
 
 class TeamLineupMenu(discord.ui.View):
@@ -666,7 +325,16 @@ class TeamLineupMenu(discord.ui.View):
         revert_btn.callback = self.revert_starting_lineup_callback
         self.add_item(revert_btn)
 
-        # Row 3: Clear action
+        # Row 3: View and Clear actions
+        view_starting_btn = discord.ui.Button(
+            label="👁️ View Starting Lineup",
+            style=discord.ButtonStyle.secondary,
+            custom_id="view_starting",
+            disabled=not self.has_starting_lineup
+        )
+        view_starting_btn.callback = self.view_starting_lineup_callback
+        self.add_item(view_starting_btn)
+
         clear_btn = discord.ui.Button(label="🗑️ Clear Lineup", style=discord.ButtonStyle.danger, custom_id="clear_lineup")
         clear_btn.callback = self.clear_lineup_callback
         self.add_item(clear_btn)
@@ -950,6 +618,104 @@ class TeamLineupMenu(discord.ui.View):
         embed = await self.create_menu_embed()
         await interaction.edit_original_response(embed=embed, view=self)
 
+    async def view_starting_lineup_callback(self, interaction: discord.Interaction):
+        """Display the saved starting lineup"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Get saved starting lineup
+            cursor = await db.execute(
+                "SELECT lineup_data FROM starting_lineups WHERE team_id = ?",
+                (self.team_id,)
+            )
+            result = await cursor.fetchone()
+
+            if not result:
+                await interaction.response.send_message("❌ No starting lineup saved!", ephemeral=True)
+                return
+
+            lineup_data = json.loads(result[0])
+
+            # Get player details for the saved lineup
+            player_ids = list(lineup_data.values())
+            if not player_ids:
+                await interaction.response.send_message("❌ Starting lineup is empty!", ephemeral=True)
+                return
+
+            placeholders = ','.join('?' * len(player_ids))
+            cursor = await db.execute(
+                f"""SELECT player_id, name, position, overall_rating
+                   FROM players
+                   WHERE player_id IN ({placeholders})""",
+                [int(pid) for pid in player_ids]
+            )
+            players = await cursor.fetchall()
+
+        # Build player lookup
+        player_lookup = {pid: (name, pos, rating) for pid, name, pos, rating in players}
+
+        # Create embed for starting lineup
+        emoji = self.bot.get_emoji(int(self.emoji_id)) if self.emoji_id else ""
+        embed = discord.Embed(
+            title=f"{emoji}{self.team_name} - Starting Lineup",
+            color=discord.Color.gold()
+        )
+
+        # Display lineup
+        rows = [
+            ("FB", ["LBP", "FB", "RBP"]),
+            ("HB", ["LHB", "CHB", "RHB"]),
+            ("C", ["LW", "C", "RW"]),
+            ("HF", ["LHF", "CHF", "RHF"]),
+            ("FF", ["LFP", "FF", "RFP"]),
+            ("Fol", ["R", "RR", "RO"])
+        ]
+
+        field_text = ""
+        for line_name, positions in rows:
+            row_text = []
+            for pos_name in positions:
+                if pos_name in lineup_data:
+                    player_id = int(lineup_data[pos_name])
+                    if player_id in player_lookup:
+                        name, pos, rating = player_lookup[player_id]
+                        row_text.append(f"{name} ({rating})")
+                    else:
+                        row_text.append("*Unknown*")
+                else:
+                    row_text.append("*Empty*")
+            field_text += f"**{line_name}:**  {', '.join(row_text)}\n"
+
+        field_text += "\n"
+
+        # Interchange
+        int_players = []
+        for pos_name in ["INT1", "INT2", "INT3", "INT4"]:
+            if pos_name in lineup_data:
+                player_id = int(lineup_data[pos_name])
+                if player_id in player_lookup:
+                    name, pos, rating = player_lookup[player_id]
+                    int_players.append(f"{name} ({rating})")
+                else:
+                    int_players.append("*Unknown*")
+            else:
+                int_players.append("*Empty*")
+        field_text += f"**Int:**  {', '.join(int_players)}\n"
+
+        # Sub
+        if "SUB" in lineup_data:
+            player_id = int(lineup_data["SUB"])
+            if player_id in player_lookup:
+                name, pos, rating = player_lookup[player_id]
+                field_text += f"**Sub:**  {name} ({rating})"
+            else:
+                field_text += f"**Sub:**  *Unknown*"
+        else:
+            field_text += f"**Sub:**  *Empty*"
+
+        embed.description = field_text
+        embed.set_footer(text=f"{len(lineup_data)}/23 positions filled")
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
     async def create_menu_embed(self):
         """Create the menu display embed"""
         emoji = self.bot.get_emoji(int(self.emoji_id)) if self.emoji_id else ""
@@ -1078,10 +844,10 @@ class LineupView(discord.ui.View):
         if self.current_group > 0:
             self.add_item(PrevGroupButton(self))
         
-        # Add clear and save buttons
+        # Add clear and main menu buttons
         if self.selected_position and self.selected_position in self.lineup:
             self.add_item(ClearPositionButton(self))
-        self.add_item(SaveLineupButton(self))
+        self.add_item(MainMenuButton(self))
     
     def get_sorted_roster(self):
         """Get roster sorted by relevance to selected position"""
@@ -1527,34 +1293,50 @@ class PlayerSelect(discord.ui.Select):
         await interaction.response.edit_message(embed=embed, view=self.parent_view)
 
 
-class SaveLineupButton(discord.ui.Button):
+class MainMenuButton(discord.ui.Button):
     def __init__(self, parent_view):
-        super().__init__(label="💾 Save", style=discord.ButtonStyle.success)
+        super().__init__(label="🏠 Main Menu", style=discord.ButtonStyle.primary)
         self.parent_view = parent_view
-    
+
     async def callback(self, interaction: discord.Interaction):
-        filled_slots = len(self.parent_view.lineup)
-        
-        if filled_slots < 23:
-            await interaction.response.send_message(
-                f"⚠️ Your lineup has only {filled_slots}/23 players. Continue adding players or save as is?",
-                ephemeral=True
+        # Return to TeamLineupMenu
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Get updated lineup
+            cursor = await db.execute(
+                """SELECT l.position_name, p.name, p.position, p.overall_rating, p.player_id
+                   FROM lineups l
+                   JOIN players p ON l.player_id = p.player_id
+                   WHERE l.team_id = ?
+                   ORDER BY l.slot_number""",
+                (self.parent_view.team_id,)
             )
-        else:
-            await interaction.response.send_message(
-                f"✅ Lineup saved! {filled_slots}/23 players selected.",
-                ephemeral=True
+            lineup_data = await cursor.fetchall()
+
+            # Check if starting lineup exists
+            cursor = await db.execute(
+                "SELECT 1 FROM starting_lineups WHERE team_id = ?",
+                (self.parent_view.team_id,)
             )
-        
-        # Disable all buttons
-        for item in self.parent_view.children:
-            item.disabled = True
-        
-        embed = self.parent_view.create_embed()
-        embed.color = discord.Color.green()
-        embed.title = f"✅ {self.parent_view.team_name} - Lineup Saved"
-        
-        await interaction.message.edit(embed=embed, view=self.parent_view)
+            has_starting_lineup = await cursor.fetchone() is not None
+
+        # Build lineup dict
+        lineup = {}
+        for pos_name, name, pos, rating, player_id in lineup_data:
+            lineup[pos_name] = {'name': name, 'pos': pos, 'rating': rating, 'player_id': player_id}
+
+        # Create TeamLineupMenu
+        menu_view = TeamLineupMenu(
+            self.parent_view.team_id,
+            self.parent_view.team_name,
+            lineup,
+            self.parent_view.roster,
+            self.parent_view.bot,
+            self.parent_view.emoji_id,
+            has_starting_lineup
+        )
+        embed = await menu_view.create_menu_embed()
+
+        await interaction.response.edit_message(embed=embed, view=menu_view)
 
 
 async def setup(bot):
