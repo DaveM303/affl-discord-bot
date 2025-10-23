@@ -259,25 +259,44 @@ class PlayerCommands(commands.Cog):
             embed = discord.Embed(title=f"{team_title}", color=discord.Color.blue())
 
             if players:
-                # Build simple player list
-                player_lines = []
-                for name, pos, rating, age in players:
-                    player_lines.append(f"**{name}** - {pos}, {rating} OVR, {age}yo")
+                # Check if we should group by position
+                if sort_by == "position":
+                    # Group players by position
+                    from positions import POSITION_DISPLAY_ORDER
+                    position_groups = {}
+                    for name, pos, rating, age in players:
+                        if pos not in position_groups:
+                            position_groups[pos] = []
+                        position_groups[pos].append(f"**{name}** - {rating} OVR, {age}yo")
 
-                # Split into chunks if needed (Discord embed description limit is 4096 chars)
-                description = "\n".join(player_lines)
-                if len(description) > 4000:
-                    # If too long, split into fields
-                    chunk_size = 20
-                    for i in range(0, len(player_lines), chunk_size):
-                        chunk = player_lines[i:i + chunk_size]
-                        embed.add_field(
-                            name=f"Players {i+1}-{i+len(chunk)}" if i > 0 else "Players",
-                            value="\n".join(chunk),
-                            inline=False
-                        )
+                    # Add fields in POSITION_DISPLAY_ORDER
+                    for pos in POSITION_DISPLAY_ORDER:
+                        if pos in position_groups:
+                            embed.add_field(
+                                name=pos,
+                                value="\n".join(position_groups[pos]),
+                                inline=False
+                            )
                 else:
-                    embed.description = description
+                    # Build simple player list
+                    player_lines = []
+                    for name, pos, rating, age in players:
+                        player_lines.append(f"**{name}** - {pos}, {rating} OVR, {age}yo")
+
+                    # Split into chunks if needed (Discord embed description limit is 4096 chars)
+                    description = "\n".join(player_lines)
+                    if len(description) > 4000:
+                        # If too long, split into fields
+                        chunk_size = 20
+                        for i in range(0, len(player_lines), chunk_size):
+                            chunk = player_lines[i:i + chunk_size]
+                            embed.add_field(
+                                name=f"Players {i+1}-{i+len(chunk)}" if i > 0 else "Players",
+                                value="\n".join(chunk),
+                                inline=False
+                            )
+                    else:
+                        embed.description = description
 
                 # Add roster size to footer
                 embed.set_footer(text=f"{len(players)} players")
