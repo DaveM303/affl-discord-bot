@@ -130,19 +130,28 @@ class TradeOfferView(discord.ui.View):
         self.receiving_team_name = None
         self.initiating_emoji = None
         self.receiving_emoji = None
+        self.initiating_emoji_obj = None
+        self.receiving_emoji_obj = None
         self.initiating_players = []  # List of player IDs
         self.receiving_players = []   # List of player IDs
         self.all_teams = []
         self.initiating_roster = []
         self.receiving_roster = []
 
-    def get_emoji(self, emoji_id):
-        """Get emoji from ID"""
+    def get_emoji(self, emoji_id, as_string=False):
+        """Get emoji from ID
+
+        Args:
+            emoji_id: The emoji ID to fetch
+            as_string: If True, returns emoji as string (for embeds). If False, returns emoji object (for select menus)
+        """
         if not emoji_id:
             return None
         try:
             emoji = self.bot.get_emoji(int(emoji_id))
-            return str(emoji) if emoji else None
+            if emoji:
+                return str(emoji) if as_string else emoji
+            return None
         except:
             return None
 
@@ -163,7 +172,8 @@ class TradeOfferView(discord.ui.View):
             )
             result = await cursor.fetchone()
             if result:
-                self.initiating_emoji = self.get_emoji(result[0])
+                self.initiating_emoji = self.get_emoji(result[0], as_string=True)
+                self.initiating_emoji_obj = self.get_emoji(result[0], as_string=False)
 
             # Get initiating team roster (include age, order by OVR desc)
             cursor = await db.execute(
@@ -181,7 +191,8 @@ class TradeOfferView(discord.ui.View):
                 result = await cursor.fetchone()
                 if result:
                     self.receiving_team_name = result[0]
-                    self.receiving_emoji = self.get_emoji(result[1])
+                    self.receiving_emoji = self.get_emoji(result[1], as_string=True)
+                    self.receiving_emoji_obj = self.get_emoji(result[1], as_string=False)
 
                 cursor = await db.execute(
                     "SELECT player_id, name, position, overall_rating, age FROM players WHERE team_id = ? ORDER BY overall_rating DESC",
@@ -434,9 +445,13 @@ class TeamSelectMenu(discord.ui.Select):
         self.parent_view = parent_view
         options = []
         for team_id, team_name, emoji_id in parent_view.all_teams[:25]:  # Discord limit
-            emoji = parent_view.get_emoji(emoji_id)
-            label = f"{emoji} {team_name}" if emoji else team_name
-            options.append(discord.SelectOption(label=label, value=str(team_id)))
+            emoji_obj = parent_view.get_emoji(emoji_id, as_string=False)
+            # Discord Select menus support emoji parameter
+            options.append(discord.SelectOption(
+                label=team_name,
+                value=str(team_id),
+                emoji=emoji_obj
+            ))
 
         super().__init__(placeholder="Select a team to trade with...", options=options, row=0)
 
@@ -447,7 +462,8 @@ class TeamSelectMenu(discord.ui.Select):
         for team_id, team_name, emoji_id in self.parent_view.all_teams:
             if team_id == self.parent_view.receiving_team_id:
                 self.parent_view.receiving_team_name = team_name
-                self.parent_view.receiving_emoji = self.parent_view.get_emoji(emoji_id)
+                self.parent_view.receiving_emoji = self.parent_view.get_emoji(emoji_id, as_string=True)
+                self.parent_view.receiving_emoji_obj = self.parent_view.get_emoji(emoji_id, as_string=False)
                 break
 
         # Clear receiving players when changing teams
@@ -461,7 +477,6 @@ class OfferingPlayerSelect(discord.ui.Select):
     """Select menu for choosing players to offer"""
     def __init__(self, parent_view):
         self.parent_view = parent_view
-        emoji_str = f"{parent_view.initiating_emoji} " if parent_view.initiating_emoji else ""
         options = [
             discord.SelectOption(
                 label=f"{name} ({pos}, {ovr} OVR, {age}yo)",
@@ -471,7 +486,7 @@ class OfferingPlayerSelect(discord.ui.Select):
             for player_id, name, pos, ovr, age in parent_view.initiating_roster[:25]  # Discord limit
         ]
         super().__init__(
-            placeholder=f"{emoji_str}{parent_view.initiating_team_name} sends...",
+            placeholder=f"{parent_view.initiating_team_name} sends...",
             options=options,
             min_values=0,
             max_values=len(options),
@@ -487,7 +502,6 @@ class ReceivingPlayerSelect(discord.ui.Select):
     """Select menu for choosing players to receive"""
     def __init__(self, parent_view):
         self.parent_view = parent_view
-        emoji_str = f"{parent_view.receiving_emoji} " if parent_view.receiving_emoji else ""
         options = [
             discord.SelectOption(
                 label=f"{name} ({pos}, {ovr} OVR, {age}yo)",
@@ -497,7 +511,7 @@ class ReceivingPlayerSelect(discord.ui.Select):
             for player_id, name, pos, ovr, age in parent_view.receiving_roster[:25]  # Discord limit
         ]
         super().__init__(
-            placeholder=f"{emoji_str}{parent_view.receiving_team_name} sends...",
+            placeholder=f"{parent_view.receiving_team_name} sends...",
             options=options,
             min_values=0,
             max_values=len(options),
