@@ -262,45 +262,52 @@ class TradeOfferView(discord.ui.View):
         """Add all UI components"""
         self.clear_items()
 
-        # Player selection dropdowns (row 0-1) with pagination buttons
-        if self.initiating_roster:
-            offering_select = OfferingPlayerSelect(self)
-            self.add_item(offering_select)
+        current_row = 0
 
-            # Add next page button for initiating team if needed
+        # Player selection dropdown for initiating team (row 0)
+        if self.initiating_roster:
+            offering_select = OfferingPlayerSelect(self, row=current_row)
+            self.add_item(offering_select)
+            current_row += 1
+
+            # Pagination button for initiating team if needed (row 1)
             if len(self.initiating_roster) > 25:
                 next_page_btn = discord.ui.Button(
-                    label=f"Next Page ({self.initiating_page + 1}/{(len(self.initiating_roster) - 1) // 25 + 1})",
+                    label=f"Page {self.initiating_page + 1}/{(len(self.initiating_roster) - 1) // 25 + 1}",
                     style=discord.ButtonStyle.secondary,
-                    row=0
+                    row=current_row
                 )
                 next_page_btn.callback = self.next_initiating_page
                 self.add_item(next_page_btn)
+                current_row += 1
 
+        # Player selection dropdown for receiving team (row 2 or 1)
         if self.receiving_team_id and self.receiving_roster:
-            receiving_select = ReceivingPlayerSelect(self)
+            receiving_select = ReceivingPlayerSelect(self, row=current_row)
             self.add_item(receiving_select)
+            current_row += 1
 
-            # Add next page button for receiving team if needed
+            # Pagination button for receiving team if needed (row 3 or 2)
             if len(self.receiving_roster) > 25:
                 next_page_btn = discord.ui.Button(
-                    label=f"Next Page ({self.receiving_page + 1}/{(len(self.receiving_roster) - 1) // 25 + 1})",
+                    label=f"Page {self.receiving_page + 1}/{(len(self.receiving_roster) - 1) // 25 + 1}",
                     style=discord.ButtonStyle.secondary,
-                    row=1
+                    row=current_row
                 )
                 next_page_btn.callback = self.next_receiving_page
                 self.add_item(next_page_btn)
+                current_row += 1
 
-        # Action buttons (row 2)
-        clear_btn = discord.ui.Button(label="Clear All", style=discord.ButtonStyle.secondary, row=2)
+        # Action buttons (last row)
+        clear_btn = discord.ui.Button(label="Clear All", style=discord.ButtonStyle.secondary, row=current_row)
         clear_btn.callback = self.clear_callback
         self.add_item(clear_btn)
 
-        send_btn = discord.ui.Button(label="Send Offer", style=discord.ButtonStyle.success, row=2)
+        send_btn = discord.ui.Button(label="Send Offer", style=discord.ButtonStyle.success, row=current_row)
         send_btn.callback = self.send_callback
         self.add_item(send_btn)
 
-        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger, row=2)
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger, row=current_row)
         cancel_btn.callback = self.cancel_callback
         self.add_item(cancel_btn)
 
@@ -487,7 +494,7 @@ class TradeOfferView(discord.ui.View):
 
 class OfferingPlayerSelect(discord.ui.Select):
     """Select menu for choosing players to offer"""
-    def __init__(self, parent_view):
+    def __init__(self, parent_view, row=0):
         self.parent_view = parent_view
         # Get current page of players
         start_idx = parent_view.initiating_page * 25
@@ -507,7 +514,7 @@ class OfferingPlayerSelect(discord.ui.Select):
             options=options,
             min_values=0,
             max_values=len(options),
-            row=0
+            row=row
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -517,7 +524,7 @@ class OfferingPlayerSelect(discord.ui.Select):
 
 class ReceivingPlayerSelect(discord.ui.Select):
     """Select menu for choosing players to receive"""
-    def __init__(self, parent_view):
+    def __init__(self, parent_view, row=1):
         self.parent_view = parent_view
         # Get current page of players
         start_idx = parent_view.receiving_page * 25
@@ -537,7 +544,7 @@ class ReceivingPlayerSelect(discord.ui.Select):
             options=options,
             min_values=0,
             max_values=len(options),
-            row=1
+            row=row
         )
 
     async def callback(self, interaction: discord.Interaction):
