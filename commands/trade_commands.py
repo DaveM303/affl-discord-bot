@@ -107,71 +107,51 @@ class TradeCommands(commands.Cog):
             )
             return
 
-        # Open trade menu
-        view = TradeOfferMenu(team_id, team_name, interaction.user.id, self.bot)
-        await interaction.response.send_message(
-            f"**Create Trade Offer** - {team_name}\n\nSelect a team to trade with:",
-            view=view,
-            ephemeral=True
-        )
+        # Create trade menu
+        view = TradeOfferView(team_id, team_name, interaction.user.id, self.bot, interaction.guild)
+        await view.initialize()
+        embed = view.create_embed()
+
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-class TradeOfferMenu(discord.ui.View):
-    """Main menu for creating a trade offer"""
-    def __init__(self, initiating_team_id, initiating_team_name, user_id, bot, is_counter_offer=False, original_trade_id=None, receiving_team_id=None):
+class TradeOfferView(discord.ui.View):
+    """Streamlined trade offer interface - everything updates in one message"""
+    def __init__(self, initiating_team_id, initiating_team_name, user_id, bot, guild, is_counter_offer=False, original_trade_id=None, receiving_team_id=None):
         super().__init__(timeout=600)
         self.initiating_team_id = initiating_team_id
         self.initiating_team_name = initiating_team_name
         self.user_id = user_id
         self.bot = bot
+        self.guild = guild
         self.is_counter_offer = is_counter_offer
         self.original_trade_id = original_trade_id
         self.receiving_team_id = receiving_team_id
+        self.receiving_team_name = None
         self.initiating_players = []  # List of player IDs
         self.receiving_players = []   # List of player IDs
+        self.all_teams = []
+        self.initiating_roster = []
+        self.receiving_roster = []
 
-        # Add team select button (disabled for counter-offers)
-        if not is_counter_offer:
-            self.add_item(TeamSelectButton(self))
-        else:
-            # For counter-offers, show the team but greyed out
-            team_select = TeamSelectButton(self)
-            team_select.disabled = True
-            team_select.label = f"Trading with: (set)"
-            self.add_item(team_select)
-
-        # Add player selection buttons
-        self.add_item(AddOfferingPlayerButton(self))
-        self.add_item(AddReceivingPlayerButton(self))
-
-        # Add send offer button
-        self.add_item(SendOfferButton(self))
-
-    async def update_message(self, interaction: discord.Interaction):
-        """Update the trade offer message"""
-        # Get player names
-        initiating_player_names = []
-        receiving_player_names = []
-
+    async def initialize(self):
+        """Load initial data"""
         async with aiosqlite.connect(DB_PATH) as db:
-            if self.initiating_players:
-                placeholders = ','.join('?' * len(self.initiating_players))
-                cursor = await db.execute(
-                    f"SELECT name, position, overall_rating FROM players WHERE player_id IN ({placeholders})",
-                    self.initiating_players
-                )
-                initiating_player_names = [f"{name} ({pos}, {ovr} OVR)" for name, pos, ovr in await cursor.fetchall()]
+            # Get all teams except initiating team
+            cursor = await db.execute(
+                "SELECT team_id, team_name FROM teams WHERE team_id != ? ORDER BY team_name",
+                (self.initiating_team_id,)
+            )
+            self.all_teams = await cursor.fetchall()
 
-            if self.receiving_players:
-                placeholders = ','.join('?' * len(self.receiving_players))
-                cursor = await db.execute(
-                    f"SELECT name, position, overall_rating FROM players WHERE player_id IN ({placeholders})",
-                    self.receiving_players
-                )
-                receiving_player_names = [f"{name} ({pos}, {ovr} OVR)" for name, pos, ovr in await cursor.fetchall()]
+            # Get initiating team roster
+            cursor = await db.execute(
+                "SELECT player_id, name, position, overall_rating FROM players WHERE team_id = ? ORDER BY name",
+                (self.initiating_team_id,)
+            )
+            self.initiating_roster = await cursor.fetchall()
 
-            # Get receiving team name
-            receiving_team_name = "Not selected"
+            # If receiving team is set, get their roster and name
             if self.receiving_team_id:
                 cursor = await db.execute(
                     "SELECT team_name FROM teams WHERE team_id = ?",
@@ -179,185 +159,140 @@ class TradeOfferMenu(discord.ui.View):
                 )
                 result = await cursor.fetchone()
                 if result:
-                    receiving_team_name = result[0]
+                    self.receiving_team_name = result[0]
 
+                cursor = await db.execute(
+                    "SELECT player_id, name, position, overall_rating FROM players WHERE team_id = ? ORDER BY name",
+                    (self.receiving_team_id,)
+                )
+                self.receiving_roster = await cursor.fetchall()
+
+        # Add components
+        self.add_components()
+
+    def add_components(self):
+        """Add all UI components"""
+        self.clear_items()
+
+        # Team select (row 0)
+        if not self.is_counter_offer and self.all_teams:
+            team_select = TeamSelectMenu(self)
+            self.add_item(team_select)
+        elif self.is_counter_offer:
+            # Show disabled button for counter-offers
+            disabled_btn = discord.ui.Button(
+                label=f"Trading with: {self.receiving_team_name or 'Unknown'}",
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+                row=0
+            )
+            self.add_item(disabled_btn)
+
+        # Player selection dropdowns (row 1-2)
+        if self.initiating_roster:
+            offering_select = OfferingPlayerSelect(self)
+            self.add_item(offering_select)
+
+        if self.receiving_team_id and self.receiving_roster:
+            receiving_select = ReceivingPlayerSelect(self)
+            self.add_item(receiving_select)
+
+        # Action buttons (row 3)
+        clear_btn = discord.ui.Button(label="Clear All", style=discord.ButtonStyle.secondary, row=3)
+        clear_btn.callback = self.clear_callback
+        self.add_item(clear_btn)
+
+        send_btn = discord.ui.Button(label="Send Offer", style=discord.ButtonStyle.success, row=3)
+        send_btn.callback = self.send_callback
+        self.add_item(send_btn)
+
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger, row=3)
+        cancel_btn.callback = self.cancel_callback
+        self.add_item(cancel_btn)
+
+    def create_embed(self):
+        """Create the trade offer embed"""
         embed = discord.Embed(
-            title="📋 Trade Offer" if not self.is_counter_offer else "📋 Counter Offer",
+            title="📋 Create Trade Offer" if not self.is_counter_offer else "📋 Create Counter Offer",
             color=discord.Color.blue()
         )
 
-        embed.add_field(
-            name=f"Trading with:",
-            value=receiving_team_name,
-            inline=False
-        )
+        # Trading with
+        trading_with = self.receiving_team_name or "*Not selected - use dropdown above*"
+        embed.add_field(name="Trading With", value=trading_with, inline=False)
 
+        # Get player names
+        offering_names = []
+        receiving_names = []
+
+        if self.initiating_players:
+            for player_id in self.initiating_players:
+                player = next((p for p in self.initiating_roster if p[0] == player_id), None)
+                if player:
+                    _, name, pos, ovr = player
+                    offering_names.append(f"**{name}** ({pos}, {ovr} OVR)")
+
+        if self.receiving_players:
+            for player_id in self.receiving_players:
+                player = next((p for p in self.receiving_roster if p[0] == player_id), None)
+                if player:
+                    _, name, pos, ovr = player
+                    receiving_names.append(f"**{name}** ({pos}, {ovr} OVR)")
+
+        # Show what each team sends
         embed.add_field(
             name=f"**{self.initiating_team_name}** sends:",
-            value="\n".join(initiating_player_names) if initiating_player_names else "*No players selected*",
+            value="\n".join(offering_names) if offering_names else "*No players selected*",
             inline=True
         )
 
         embed.add_field(
-            name=f"**{receiving_team_name}** sends:",
-            value="\n".join(receiving_player_names) if receiving_player_names else "*No players selected*",
+            name=f"**{trading_with}** sends:",
+            value="\n".join(receiving_names) if receiving_names else "*No players selected*",
             inline=True
         )
 
-        embed.set_footer(text="Use the buttons below to build your trade offer")
+        embed.set_footer(text="Use the dropdowns to select teams and players, then click Send Offer")
 
+        return embed
+
+    async def update_view(self, interaction: discord.Interaction):
+        """Update the view after changes"""
+        # Refresh rosters if team changed
+        if self.receiving_team_id and not self.receiving_roster:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT player_id, name, position, overall_rating FROM players WHERE team_id = ? ORDER BY name",
+                    (self.receiving_team_id,)
+                )
+                self.receiving_roster = await cursor.fetchall()
+
+        self.add_components()
+        embed = self.create_embed()
         await interaction.response.edit_message(embed=embed, view=self)
 
+    async def clear_callback(self, interaction: discord.Interaction):
+        """Clear all selections"""
+        self.initiating_players = []
+        self.receiving_players = []
+        await self.update_view(interaction)
 
-class TeamSelectButton(discord.ui.Button):
-    def __init__(self, parent_view):
-        super().__init__(label="Select Team", style=discord.ButtonStyle.primary, row=0)
-        self.parent_view = parent_view
+    async def cancel_callback(self, interaction: discord.Interaction):
+        """Cancel the trade offer"""
+        await interaction.response.edit_message(content="Trade offer cancelled.", embed=None, view=None)
 
-    async def callback(self, interaction: discord.Interaction):
-        # Get all teams except the initiating team
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT team_id, team_name FROM teams WHERE team_id != ? ORDER BY team_name",
-                (self.parent_view.initiating_team_id,)
-            )
-            teams = await cursor.fetchall()
-
-        if not teams:
-            await interaction.response.send_message("❌ No other teams found!", ephemeral=True)
-            return
-
-        # Create select menu for teams
-        select = TeamSelectDropdown(teams, self.parent_view)
-        view = discord.ui.View(timeout=60)
-        view.add_item(select)
-
-        await interaction.response.send_message(
-            "Select a team to trade with:",
-            view=view,
-            ephemeral=True
-        )
-
-
-class TeamSelectDropdown(discord.ui.Select):
-    def __init__(self, teams, parent_view):
-        self.parent_view = parent_view
-        options = [
-            discord.SelectOption(label=team_name, value=str(team_id))
-            for team_id, team_name in teams[:25]  # Discord limit
-        ]
-        super().__init__(placeholder="Choose a team...", options=options, row=0)
-
-    async def callback(self, interaction: discord.Interaction):
-        self.parent_view.receiving_team_id = int(self.values[0])
-        await interaction.response.send_message("✅ Team selected!", ephemeral=True)
-
-
-class AddOfferingPlayerButton(discord.ui.Button):
-    def __init__(self, parent_view):
-        super().__init__(label="Add Your Players", style=discord.ButtonStyle.green, row=1)
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction):
-        # Get players from initiating team
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT player_id, name, position, overall_rating FROM players WHERE team_id = ? ORDER BY name",
-                (self.parent_view.initiating_team_id,)
-            )
-            players = await cursor.fetchall()
-
-        if not players:
-            await interaction.response.send_message("❌ Your team has no players!", ephemeral=True)
-            return
-
-        # Create select menu
-        select = PlayerSelectDropdown(players, self.parent_view, is_offering=True)
-        view = discord.ui.View(timeout=60)
-        view.add_item(select)
-
-        await interaction.response.send_message(
-            "Select players to trade away (you can select multiple):",
-            view=view,
-            ephemeral=True
-        )
-
-
-class AddReceivingPlayerButton(discord.ui.Button):
-    def __init__(self, parent_view):
-        super().__init__(label="Add Their Players", style=discord.ButtonStyle.green, row=1)
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction):
-        if not self.parent_view.receiving_team_id:
-            await interaction.response.send_message("❌ Please select a team first!", ephemeral=True)
-            return
-
-        # Get players from receiving team
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT player_id, name, position, overall_rating FROM players WHERE team_id = ? ORDER BY name",
-                (self.parent_view.receiving_team_id,)
-            )
-            players = await cursor.fetchall()
-
-        if not players:
-            await interaction.response.send_message("❌ That team has no players!", ephemeral=True)
-            return
-
-        # Create select menu
-        select = PlayerSelectDropdown(players, self.parent_view, is_offering=False)
-        view = discord.ui.View(timeout=60)
-        view.add_item(select)
-
-        await interaction.response.send_message(
-            "Select players you want to receive (you can select multiple):",
-            view=view,
-            ephemeral=True
-        )
-
-
-class PlayerSelectDropdown(discord.ui.Select):
-    def __init__(self, players, parent_view, is_offering):
-        self.parent_view = parent_view
-        self.is_offering = is_offering
-        options = [
-            discord.SelectOption(
-                label=f"{name} ({pos}, {ovr} OVR)",
-                value=str(player_id)
-            )
-            for player_id, name, pos, ovr in players[:25]  # Discord limit
-        ]
-        super().__init__(placeholder="Choose players...", options=options, max_values=min(len(options), 25), row=0)
-
-    async def callback(self, interaction: discord.Interaction):
-        selected_ids = [int(v) for v in self.values]
-
-        if self.is_offering:
-            self.parent_view.initiating_players = selected_ids
-        else:
-            self.parent_view.receiving_players = selected_ids
-
-        await interaction.response.send_message(
-            f"✅ Selected {len(selected_ids)} player(s)!",
-            ephemeral=True
-        )
-
-
-class SendOfferButton(discord.ui.Button):
-    def __init__(self, parent_view):
-        super().__init__(label="Send Offer", style=discord.ButtonStyle.primary, row=2)
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction):
-        # Validate trade
-        if not self.parent_view.receiving_team_id:
+    async def send_callback(self, interaction: discord.Interaction):
+        """Send the trade offer"""
+        # Validate
+        if not self.receiving_team_id:
             await interaction.response.send_message("❌ Please select a team to trade with!", ephemeral=True)
             return
 
-        if not self.parent_view.initiating_players and not self.parent_view.receiving_players:
+        if not self.initiating_players and not self.receiving_players:
             await interaction.response.send_message("❌ Please add at least one player to the trade!", ephemeral=True)
             return
+
+        await interaction.response.defer()
 
         # Store trade in database
         async with aiosqlite.connect(DB_PATH) as db:
@@ -366,92 +301,154 @@ class SendOfferButton(discord.ui.Button):
                                       receiving_players, status, created_by_user_id, original_trade_id)
                    VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
                 (
-                    self.parent_view.initiating_team_id,
-                    self.parent_view.receiving_team_id,
-                    json.dumps(self.parent_view.initiating_players),
-                    json.dumps(self.parent_view.receiving_players),
-                    str(self.parent_view.user_id),
-                    self.parent_view.original_trade_id
+                    self.initiating_team_id,
+                    self.receiving_team_id,
+                    json.dumps(self.initiating_players),
+                    json.dumps(self.receiving_players),
+                    str(self.user_id),
+                    self.original_trade_id
                 )
             )
             trade_id = cursor.lastrowid
 
-            # Get team info
+            # Get receiving team info
             cursor = await db.execute(
-                """SELECT t1.team_name, t1.channel_id, t1.role_id, t2.team_name
-                   FROM teams t1
-                   JOIN teams t2 ON t2.team_id = ?
-                   WHERE t1.team_id = ?""",
-                (self.parent_view.initiating_team_id, self.parent_view.receiving_team_id)
+                "SELECT channel_id, role_id FROM teams WHERE team_id = ?",
+                (self.receiving_team_id,)
             )
             result = await cursor.fetchone()
-            initiating_team_name, receiving_channel_id, receiving_role_id, receiving_team_name = result
-
-            # Get player names
-            initiating_player_names = []
-            receiving_player_names = []
-
-            if self.parent_view.initiating_players:
-                placeholders = ','.join('?' * len(self.parent_view.initiating_players))
-                cursor = await db.execute(
-                    f"SELECT name, position, overall_rating FROM players WHERE player_id IN ({placeholders})",
-                    self.parent_view.initiating_players
-                )
-                initiating_player_names = [f"**{name}** ({pos}, {ovr} OVR)" for name, pos, ovr in await cursor.fetchall()]
-
-            if self.parent_view.receiving_players:
-                placeholders = ','.join('?' * len(self.parent_view.receiving_players))
-                cursor = await db.execute(
-                    f"SELECT name, position, overall_rating FROM players WHERE player_id IN ({placeholders})",
-                    self.parent_view.receiving_players
-                )
-                receiving_player_names = [f"**{name}** ({pos}, {ovr} OVR)" for name, pos, ovr in await cursor.fetchall()]
+            receiving_channel_id, receiving_role_id = result
 
             await db.commit()
 
         # Send to receiving team channel
         if receiving_channel_id:
-            channel = self.parent_view.bot.get_channel(int(receiving_channel_id))
+            channel = self.bot.get_channel(int(receiving_channel_id))
             if channel:
                 embed = discord.Embed(
-                    title="📨 New Trade Offer!" if not self.parent_view.is_counter_offer else "📨 Counter Offer!",
-                    color=discord.Color.gold(),
-                    description=f"**{initiating_team_name}** has sent you a trade offer!"
+                    title="📨 New Trade Offer!" if not self.is_counter_offer else "📨 Counter Offer!",
+                    color=discord.Color.gold()
                 )
 
+                # Get player names for embed
+                offering_names = []
+                receiving_names = []
+
+                if self.initiating_players:
+                    for player_id in self.initiating_players:
+                        player = next((p for p in self.initiating_roster if p[0] == player_id), None)
+                        if player:
+                            _, name, pos, ovr = player
+                            offering_names.append(f"**{name}** ({pos}, {ovr} OVR)")
+
+                if self.receiving_players:
+                    for player_id in self.receiving_players:
+                        player = next((p for p in self.receiving_roster if p[0] == player_id), None)
+                        if player:
+                            _, name, pos, ovr = player
+                            receiving_names.append(f"**{name}** ({pos}, {ovr} OVR)")
+
                 embed.add_field(
-                    name=f"**{initiating_team_name}** sends:",
-                    value="\n".join(initiating_player_names) if initiating_player_names else "*Nothing*",
+                    name=f"**{self.initiating_team_name}** sends:",
+                    value="\n".join(offering_names) if offering_names else "*Nothing*",
                     inline=True
                 )
 
                 embed.add_field(
-                    name=f"**{receiving_team_name}** sends:",
-                    value="\n".join(receiving_player_names) if receiving_player_names else "*Nothing*",
+                    name=f"**{self.receiving_team_name}** sends:",
+                    value="\n".join(receiving_names) if receiving_names else "*Nothing*",
                     inline=True
                 )
 
                 # Add response buttons
-                view = TradeResponseView(trade_id, self.parent_view.bot)
+                view = TradeResponseView(trade_id, self.bot)
 
                 # Ping the team role
                 role_mention = f"<@&{receiving_role_id}>" if receiving_role_id else ""
                 await channel.send(role_mention, embed=embed, view=view)
 
         # Cancel original trade if this is a counter-offer
-        if self.parent_view.is_counter_offer and self.parent_view.original_trade_id:
+        if self.is_counter_offer and self.original_trade_id:
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
                     "UPDATE trades SET status = 'countered' WHERE trade_id = ?",
-                    (self.parent_view.original_trade_id,)
+                    (self.original_trade_id,)
                 )
                 await db.commit()
 
-        await interaction.response.edit_message(
-            content="✅ **Trade offer sent!**",
-            embed=None,
-            view=None
+        await interaction.edit_original_response(content="✅ **Trade offer sent!**", embed=None, view=None)
+
+
+class TeamSelectMenu(discord.ui.Select):
+    """Select menu for choosing a team to trade with"""
+    def __init__(self, parent_view):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(label=team_name, value=str(team_id))
+            for team_id, team_name in parent_view.all_teams[:25]  # Discord limit
+        ]
+        super().__init__(placeholder="Select a team to trade with...", options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.receiving_team_id = int(self.values[0])
+        self.parent_view.receiving_team_name = next(
+            (name for tid, name in self.parent_view.all_teams if tid == self.parent_view.receiving_team_id),
+            None
         )
+        # Clear receiving players when changing teams
+        self.parent_view.receiving_players = []
+        self.parent_view.receiving_roster = []
+        await self.parent_view.update_view(interaction)
+
+
+class OfferingPlayerSelect(discord.ui.Select):
+    """Select menu for choosing players to offer"""
+    def __init__(self, parent_view):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=f"{name} ({pos}, {ovr} OVR)",
+                value=str(player_id),
+                default=(player_id in parent_view.initiating_players)
+            )
+            for player_id, name, pos, ovr in parent_view.initiating_roster[:25]  # Discord limit
+        ]
+        super().__init__(
+            placeholder="Select your players to trade away...",
+            options=options,
+            min_values=0,
+            max_values=len(options),
+            row=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.initiating_players = [int(v) for v in self.values]
+        await self.parent_view.update_view(interaction)
+
+
+class ReceivingPlayerSelect(discord.ui.Select):
+    """Select menu for choosing players to receive"""
+    def __init__(self, parent_view):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=f"{name} ({pos}, {ovr} OVR)",
+                value=str(player_id),
+                default=(player_id in parent_view.receiving_players)
+            )
+            for player_id, name, pos, ovr in parent_view.receiving_roster[:25]  # Discord limit
+        ]
+        super().__init__(
+            placeholder="Select players you want to receive...",
+            options=options,
+            min_values=0,
+            max_values=len(options),
+            row=2
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.receiving_players = [int(v) for v in self.values]
+        await self.parent_view.update_view(interaction)
 
 
 class TradeResponseView(discord.ui.View):
@@ -519,7 +516,7 @@ class TradeResponseView(discord.ui.View):
         # Verify user has the team role
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
-                """SELECT receiving_team_id, initiating_team_id, status, initiating_players, receiving_players
+                """SELECT receiving_team_id, initiating_team_id, status
                    FROM trades WHERE trade_id = ?""",
                 (self.trade_id,)
             )
@@ -529,7 +526,7 @@ class TradeResponseView(discord.ui.View):
                 await interaction.response.send_message("❌ Trade not found!", ephemeral=True)
                 return
 
-            receiving_team_id, initiating_team_id, status, _, _ = result
+            receiving_team_id, initiating_team_id, status = result
 
             if status != 'pending':
                 await interaction.response.send_message("❌ This trade is no longer active!", ephemeral=True)
@@ -616,11 +613,12 @@ class TradeResponseView(discord.ui.View):
         receiving_players = json.loads(receiving_players_json) if receiving_players_json else []
 
         # Open counter-offer menu (swap teams and players)
-        view = TradeOfferMenu(
+        view = TradeOfferView(
             receiving_team_id,
             role_result[1],
             interaction.user.id,
             self.bot,
+            interaction.guild,
             is_counter_offer=True,
             original_trade_id=self.trade_id,
             receiving_team_id=initiating_team_id
@@ -630,11 +628,10 @@ class TradeResponseView(discord.ui.View):
         view.initiating_players = receiving_players
         view.receiving_players = initiating_players
 
-        await interaction.response.send_message(
-            f"**Counter Offer** - {role_result[1]}\n\nEdit the trade offer below:",
-            view=view,
-            ephemeral=True
-        )
+        await view.initialize()
+        embed = view.create_embed()
+
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     async def send_to_moderators(self, interaction: discord.Interaction):
         """Send accepted trade to moderators for approval"""
