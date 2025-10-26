@@ -135,9 +135,10 @@ class SeasonCommands(commands.Cog):
                     )
                 ''')
 
-                # Create trades table
+                # Drop and recreate trades table with correct schema
+                await db.execute('DROP TABLE IF EXISTS trades')
                 await db.execute('''
-                    CREATE TABLE IF NOT EXISTS trades (
+                    CREATE TABLE trades (
                         trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
                         initiating_team_id INTEGER NOT NULL,
                         receiving_team_id INTEGER NOT NULL,
