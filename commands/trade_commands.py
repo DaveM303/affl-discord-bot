@@ -175,6 +175,314 @@ class TradeCommands(commands.Cog):
 
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
+    @app_commands.command(name="trademenu", description="View and manage your team's trade offers")
+    async def trade_menu(self, interaction: discord.Interaction):
+        # Get user's team
+        team_id, team_name = await self.get_user_team(interaction.user.id, interaction.guild)
+        if not team_id:
+            await interaction.response.send_message(
+                "❌ You don't have a team role!",
+                ephemeral=True
+            )
+            return
+
+        # Create trade menu
+        view = TradeMenuView(team_id, team_name, self.bot, interaction.guild)
+        embed = await view.create_embed()
+
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class TradeMenuView(discord.ui.View):
+    """Central hub for viewing and managing trades"""
+    def __init__(self, team_id, team_name, bot, guild):
+        super().__init__(timeout=600)
+        self.team_id = team_id
+        self.team_name = team_name
+        self.bot = bot
+        self.guild = guild
+
+    async def create_embed(self):
+        """Create the main trade menu embed"""
+        embed = discord.Embed(
+            title="📊 Trade Management",
+            description="━━━━━━━━━━━━━━━━━━",
+            color=discord.Color.blue()
+        )
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Get incoming offers count and details
+            cursor = await db.execute(
+                """SELECT COUNT(*),
+                   SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END)
+                   FROM trades
+                   WHERE receiving_team_id = ? AND status IN ('pending', 'accepted')""",
+                (self.team_id,)
+            )
+            incoming_result = await cursor.fetchone()
+            incoming_total = incoming_result[0] or 0
+            incoming_pending = incoming_result[1] or 0
+            incoming_accepted = incoming_result[2] or 0
+
+            # Get outgoing offers count and details
+            cursor = await db.execute(
+                """SELECT COUNT(*),
+                   SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END)
+                   FROM trades
+                   WHERE initiating_team_id = ? AND status IN ('pending', 'accepted')""",
+                (self.team_id,)
+            )
+            outgoing_result = await cursor.fetchone()
+            outgoing_total = outgoing_result[0] or 0
+            outgoing_pending = outgoing_result[1] or 0
+            outgoing_accepted = outgoing_result[2] or 0
+
+            # Get recent incoming offers (up to 3)
+            cursor = await db.execute(
+                """SELECT t.team_name, t.emoji_id, tr.status
+                   FROM trades tr
+                   JOIN teams t ON tr.initiating_team_id = t.team_id
+                   WHERE tr.receiving_team_id = ? AND tr.status IN ('pending', 'accepted')
+                   ORDER BY tr.created_at DESC
+                   LIMIT 3""",
+                (self.team_id,)
+            )
+            incoming_offers = await cursor.fetchall()
+
+            # Get recent outgoing offers (up to 3)
+            cursor = await db.execute(
+                """SELECT t.team_name, t.emoji_id, tr.status
+                   FROM trades tr
+                   JOIN teams t ON tr.receiving_team_id = t.team_id
+                   WHERE tr.initiating_team_id = ? AND tr.status IN ('pending', 'accepted', 'declined')
+                   ORDER BY tr.created_at DESC
+                   LIMIT 3""",
+                (self.team_id,)
+            )
+            outgoing_offers = await cursor.fetchall()
+
+        # Add summary
+        summary = f"**Incoming:** {incoming_total} active"
+        if incoming_pending:
+            summary += f" ({incoming_pending} 🟡 pending"
+            if incoming_accepted:
+                summary += f", {incoming_accepted} 🟢 awaiting approval)"
+            else:
+                summary += ")"
+        elif incoming_accepted:
+            summary += f" ({incoming_accepted} 🟢 awaiting approval)"
+
+        summary += f"\n**Outgoing:** {outgoing_total} active"
+        if outgoing_pending:
+            summary += f" ({outgoing_pending} 🟡 pending"
+            if outgoing_accepted:
+                summary += f", {outgoing_accepted} 🟢 awaiting approval)"
+            else:
+                summary += ")"
+        elif outgoing_accepted:
+            summary += f" ({outgoing_accepted} 🟢 awaiting approval)"
+
+        embed.add_field(name="Overview", value=summary, inline=False)
+
+        # Add recent incoming offers preview
+        if incoming_offers:
+            incoming_text = []
+            for team_name, emoji_id, status in incoming_offers:
+                emoji = self.bot.get_emoji(int(emoji_id)) if emoji_id else None
+                emoji_str = f"{emoji} " if emoji else ""
+                status_icon = "🟡" if status == "pending" else "🟢"
+                status_text = "Pending" if status == "pending" else "Awaiting Approval"
+                incoming_text.append(f"{status_icon} {emoji_str}**{team_name}** → {status_text}")
+            embed.add_field(
+                name="Recent Incoming Offers",
+                value="\n".join(incoming_text),
+                inline=False
+            )
+
+        # Add recent outgoing offers preview
+        if outgoing_offers:
+            outgoing_text = []
+            for team_name, emoji_id, status in outgoing_offers:
+                emoji = self.bot.get_emoji(int(emoji_id)) if emoji_id else None
+                emoji_str = f"{emoji} " if emoji else ""
+                if status == "pending":
+                    status_icon = "🟡"
+                    status_text = "Pending"
+                elif status == "accepted":
+                    status_icon = "🟢"
+                    status_text = "Awaiting Approval"
+                else:  # declined
+                    status_icon = "🔴"
+                    status_text = "Declined"
+                outgoing_text.append(f"{status_icon} {emoji_str}**{team_name}** → {status_text}")
+            embed.add_field(
+                name="Recent Outgoing Offers",
+                value="\n".join(outgoing_text),
+                inline=False
+            )
+
+        return embed
+
+    @discord.ui.button(label="View Incoming Offers", style=discord.ButtonStyle.primary, row=0)
+    async def view_incoming_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.show_incoming_offers(interaction)
+
+    @discord.ui.button(label="View Outgoing Offers", style=discord.ButtonStyle.primary, row=0)
+    async def view_outgoing_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.show_outgoing_offers(interaction)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, row=1)
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = await self.create_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def show_incoming_offers(self, interaction: discord.Interaction):
+        """Show detailed list of incoming offers"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """SELECT tr.trade_id, t1.team_name, t1.emoji_id, tr.initiating_players, tr.receiving_players, tr.status
+                   FROM trades tr
+                   JOIN teams t1 ON tr.initiating_team_id = t1.team_id
+                   WHERE tr.receiving_team_id = ? AND tr.status IN ('pending', 'accepted')
+                   ORDER BY tr.created_at DESC""",
+                (self.team_id,)
+            )
+            offers = await cursor.fetchall()
+
+            if not offers:
+                await interaction.response.send_message("📭 You have no active incoming trade offers.", ephemeral=True)
+                return
+
+            # Build embed with all incoming offers
+            embed = discord.Embed(
+                title="📥 Incoming Trade Offers",
+                color=discord.Color.blue()
+            )
+
+            for trade_id, team_name, emoji_id, init_players_json, recv_players_json, status in offers:
+                # Get emojis
+                team_emoji = self.bot.get_emoji(int(emoji_id)) if emoji_id else None
+                team_emoji_str = f"{team_emoji} " if team_emoji else ""
+
+                # Status indicator
+                if status == "pending":
+                    status_icon = "🟡"
+                    status_text = "Pending"
+                elif status == "accepted":
+                    status_icon = "🟢"
+                    status_text = "Awaiting Approval"
+
+                # Get player names
+                init_players = json.loads(init_players_json) if init_players_json else []
+                recv_players = json.loads(recv_players_json) if recv_players_json else []
+
+                init_names = []
+                recv_names = []
+
+                if init_players:
+                    placeholders = ','.join('?' * len(init_players))
+                    cursor = await db.execute(
+                        f"SELECT name FROM players WHERE player_id IN ({placeholders})",
+                        init_players
+                    )
+                    init_names = [name for (name,) in await cursor.fetchall()]
+
+                if recv_players:
+                    placeholders = ','.join('?' * len(recv_players))
+                    cursor = await db.execute(
+                        f"SELECT name FROM players WHERE player_id IN ({placeholders})",
+                        recv_players
+                    )
+                    recv_names = [name for (name,) in await cursor.fetchall()]
+
+                # Format offer
+                you_get = ", ".join(init_names) if init_names else "Nothing"
+                they_get = ", ".join(recv_names) if recv_names else "Nothing"
+
+                embed.add_field(
+                    name=f"{status_icon} {team_emoji_str}**{team_name}** • {status_text}",
+                    value=f"**You receive:** {you_get}\n**They receive:** {they_get}",
+                    inline=False
+                )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    async def show_outgoing_offers(self, interaction: discord.Interaction):
+        """Show detailed list of outgoing offers"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """SELECT tr.trade_id, t2.team_name, t2.emoji_id, tr.initiating_players, tr.receiving_players, tr.status
+                   FROM trades tr
+                   JOIN teams t2 ON tr.receiving_team_id = t2.team_id
+                   WHERE tr.initiating_team_id = ? AND tr.status IN ('pending', 'accepted', 'declined')
+                   ORDER BY tr.created_at DESC""",
+                (self.team_id,)
+            )
+            offers = await cursor.fetchall()
+
+            if not offers:
+                await interaction.response.send_message("📭 You have no active outgoing trade offers.", ephemeral=True)
+                return
+
+            # Build embed with all outgoing offers
+            embed = discord.Embed(
+                title="📤 Outgoing Trade Offers",
+                color=discord.Color.orange()
+            )
+
+            for trade_id, team_name, emoji_id, init_players_json, recv_players_json, status in offers:
+                # Get emojis
+                team_emoji = self.bot.get_emoji(int(emoji_id)) if emoji_id else None
+                team_emoji_str = f"{team_emoji} " if team_emoji else ""
+
+                # Status indicator
+                if status == "pending":
+                    status_icon = "🟡"
+                    status_text = "Pending"
+                elif status == "accepted":
+                    status_icon = "🟢"
+                    status_text = "Awaiting Approval"
+                else:  # declined
+                    status_icon = "🔴"
+                    status_text = "Declined"
+
+                # Get player names
+                init_players = json.loads(init_players_json) if init_players_json else []
+                recv_players = json.loads(recv_players_json) if recv_players_json else []
+
+                init_names = []
+                recv_names = []
+
+                if init_players:
+                    placeholders = ','.join('?' * len(init_players))
+                    cursor = await db.execute(
+                        f"SELECT name FROM players WHERE player_id IN ({placeholders})",
+                        init_players
+                    )
+                    init_names = [name for (name,) in await cursor.fetchall()]
+
+                if recv_players:
+                    placeholders = ','.join('?' * len(recv_players))
+                    cursor = await db.execute(
+                        f"SELECT name FROM players WHERE player_id IN ({placeholders})",
+                        recv_players
+                    )
+                    recv_names = [name for (name,) in await cursor.fetchall()]
+
+                # Format offer
+                you_give = ", ".join(init_names) if init_names else "Nothing"
+                you_get = ", ".join(recv_names) if recv_names else "Nothing"
+
+                embed.add_field(
+                    name=f"{status_icon} {team_emoji_str}**{team_name}** • {status_text}",
+                    value=f"**You offer:** {you_give}\n**You receive:** {you_get}",
+                    inline=False
+                )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 class TradeOfferView(discord.ui.View):
     """Streamlined trade offer interface - everything updates in one message"""
@@ -298,19 +606,7 @@ class TradeOfferView(discord.ui.View):
                 self.add_item(next_page_btn)
                 current_row += 1
 
-        # Action buttons (last row - row will be 4 at most)
-        # View Offers buttons (row before last)
-        if current_row < 4:
-            view_incoming_btn = discord.ui.Button(label="View Incoming Offers", style=discord.ButtonStyle.primary, row=current_row)
-            view_incoming_btn.callback = self.view_incoming_callback
-            self.add_item(view_incoming_btn)
-
-            view_outgoing_btn = discord.ui.Button(label="View Outgoing Offers", style=discord.ButtonStyle.primary, row=current_row)
-            view_outgoing_btn.callback = self.view_outgoing_callback
-            self.add_item(view_outgoing_btn)
-            current_row += 1
-
-        # Clear/Send/Cancel buttons (last row)
+        # Action buttons (last row)
         clear_btn = discord.ui.Button(label="Clear All", style=discord.ButtonStyle.secondary, row=current_row)
         clear_btn.callback = self.clear_callback
         self.add_item(clear_btn)
@@ -402,132 +698,6 @@ class TradeOfferView(discord.ui.View):
     async def cancel_callback(self, interaction: discord.Interaction):
         """Cancel the trade offer"""
         await interaction.response.edit_message(content="Trade offer cancelled.", embed=None, view=None)
-
-    async def view_incoming_callback(self, interaction: discord.Interaction):
-        """View all active incoming trade offers"""
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                """SELECT tr.trade_id, t1.team_name, t1.emoji_id, tr.initiating_players, tr.receiving_players
-                   FROM trades tr
-                   JOIN teams t1 ON tr.initiating_team_id = t1.team_id
-                   WHERE tr.receiving_team_id = ? AND tr.status = 'pending'
-                   ORDER BY tr.created_at DESC""",
-                (self.initiating_team_id,)
-            )
-            offers = await cursor.fetchall()
-
-            if not offers:
-                await interaction.response.send_message("📭 You have no incoming trade offers.", ephemeral=True)
-                return
-
-            # Build embed with all incoming offers
-            embed = discord.Embed(
-                title="📥 Incoming Trade Offers",
-                color=discord.Color.blue()
-            )
-
-            for trade_id, team_name, emoji_id, init_players_json, recv_players_json in offers:
-                # Get emojis
-                team_emoji = self.get_emoji(emoji_id, as_string=True)
-                team_emoji_str = f"{team_emoji} " if team_emoji else ""
-
-                # Get player names
-                init_players = json.loads(init_players_json) if init_players_json else []
-                recv_players = json.loads(recv_players_json) if recv_players_json else []
-
-                init_names = []
-                recv_names = []
-
-                if init_players:
-                    placeholders = ','.join('?' * len(init_players))
-                    cursor = await db.execute(
-                        f"SELECT name FROM players WHERE player_id IN ({placeholders})",
-                        init_players
-                    )
-                    init_names = [name for (name,) in await cursor.fetchall()]
-
-                if recv_players:
-                    placeholders = ','.join('?' * len(recv_players))
-                    cursor = await db.execute(
-                        f"SELECT name FROM players WHERE player_id IN ({placeholders})",
-                        recv_players
-                    )
-                    recv_names = [name for (name,) in await cursor.fetchall()]
-
-                # Format offer
-                you_get = ", ".join(init_names) if init_names else "Nothing"
-                they_get = ", ".join(recv_names) if recv_names else "Nothing"
-
-                embed.add_field(
-                    name=f"{team_emoji_str}**{team_name}**",
-                    value=f"**You receive:** {you_get}\n**They receive:** {they_get}",
-                    inline=False
-                )
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def view_outgoing_callback(self, interaction: discord.Interaction):
-        """View all active outgoing trade offers"""
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                """SELECT tr.trade_id, t2.team_name, t2.emoji_id, tr.initiating_players, tr.receiving_players
-                   FROM trades tr
-                   JOIN teams t2 ON tr.receiving_team_id = t2.team_id
-                   WHERE tr.initiating_team_id = ? AND tr.status = 'pending'
-                   ORDER BY tr.created_at DESC""",
-                (self.initiating_team_id,)
-            )
-            offers = await cursor.fetchall()
-
-            if not offers:
-                await interaction.response.send_message("📭 You have no outgoing trade offers.", ephemeral=True)
-                return
-
-            # Build embed with all outgoing offers
-            embed = discord.Embed(
-                title="📤 Outgoing Trade Offers",
-                color=discord.Color.orange()
-            )
-
-            for trade_id, team_name, emoji_id, init_players_json, recv_players_json in offers:
-                # Get emojis
-                team_emoji = self.get_emoji(emoji_id, as_string=True)
-                team_emoji_str = f"{team_emoji} " if team_emoji else ""
-
-                # Get player names
-                init_players = json.loads(init_players_json) if init_players_json else []
-                recv_players = json.loads(recv_players_json) if recv_players_json else []
-
-                init_names = []
-                recv_names = []
-
-                if init_players:
-                    placeholders = ','.join('?' * len(init_players))
-                    cursor = await db.execute(
-                        f"SELECT name FROM players WHERE player_id IN ({placeholders})",
-                        init_players
-                    )
-                    init_names = [name for (name,) in await cursor.fetchall()]
-
-                if recv_players:
-                    placeholders = ','.join('?' * len(recv_players))
-                    cursor = await db.execute(
-                        f"SELECT name FROM players WHERE player_id IN ({placeholders})",
-                        recv_players
-                    )
-                    recv_names = [name for (name,) in await cursor.fetchall()]
-
-                # Format offer
-                you_give = ", ".join(init_names) if init_names else "Nothing"
-                you_get = ", ".join(recv_names) if recv_names else "Nothing"
-
-                embed.add_field(
-                    name=f"{team_emoji_str}**{team_name}**",
-                    value=f"**You offer:** {you_give}\n**You receive:** {you_get}",
-                    inline=False
-                )
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     async def send_callback(self, interaction: discord.Interaction):
         """Send the trade offer"""
