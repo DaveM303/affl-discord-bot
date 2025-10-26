@@ -216,7 +216,7 @@ class TradeMenuView(discord.ui.View):
             self.add_back_button()
         elif self.current_view == "outgoing":
             embed = await self.create_outgoing_embed()
-            self.add_outgoing_buttons()
+            await self.add_outgoing_buttons()
 
         await interaction.response.edit_message(embed=embed, view=self)
 
@@ -240,22 +240,77 @@ class TradeMenuView(discord.ui.View):
         back.callback = self.back_callback
         self.add_item(back)
 
-    def add_outgoing_buttons(self):
+    async def add_outgoing_buttons(self):
         """Add buttons for outgoing view (includes withdraw)"""
+        # Get pending outgoing trades for withdraw dropdown
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """SELECT tr.trade_id, t2.team_name, t2.emoji_id
+                   FROM trades tr
+                   JOIN teams t2 ON tr.receiving_team_id = t2.team_id
+                   WHERE tr.initiating_team_id = ? AND tr.status = 'pending'
+                   ORDER BY tr.created_at DESC
+                   LIMIT 25""",
+                (self.team_id,)
+            )
+            pending_trades = await cursor.fetchall()
+
         back = discord.ui.Button(label="← Back to Main Menu", style=discord.ButtonStyle.secondary, row=0)
         back.callback = self.back_callback
         self.add_item(back)
 
-        # Add withdraw button
-        withdraw = discord.ui.Button(label="Withdraw Offer", style=discord.ButtonStyle.danger, row=0)
-        withdraw.callback = self.withdraw_callback
-        self.add_item(withdraw)
+        # Add withdraw dropdown if there are pending trades
+        if pending_trades:
+            withdraw_select = WithdrawTradeSelect(self, pending_trades)
+            self.add_item(withdraw_select)
 
-    async def withdraw_callback(self, interaction: discord.Interaction):
-        """Show modal to enter trade ID for withdrawal"""
-        # Create a simple text input modal
-        modal = WithdrawTradeModal(self)
-        await interaction.response.send_modal(modal)
+            # Add confirm withdraw button
+            confirm_withdraw = discord.ui.Button(label="Confirm Withdraw", style=discord.ButtonStyle.danger, row=2)
+            confirm_withdraw.callback = self.confirm_withdraw_callback
+            self.add_item(confirm_withdraw)
+
+    async def confirm_withdraw_callback(self, interaction: discord.Interaction):
+        """Confirm and execute the withdrawal"""
+        if not hasattr(self, 'selected_trade_id') or self.selected_trade_id is None:
+            await interaction.response.send_message("❌ Please select a trade offer to withdraw first.", ephemeral=True)
+            return
+
+        # Verify trade is still pending and belongs to user
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """SELECT status, t2.team_name
+                   FROM trades tr
+                   JOIN teams t2 ON tr.receiving_team_id = t2.team_id
+                   WHERE tr.trade_id = ? AND tr.initiating_team_id = ?""",
+                (self.selected_trade_id, self.team_id)
+            )
+            result = await cursor.fetchone()
+
+            if not result:
+                await interaction.response.send_message("❌ Trade not found or you don't have permission to withdraw it.", ephemeral=True)
+                return
+
+            if result[0] != 'pending':
+                await interaction.response.send_message(f"❌ This trade is {result[0]} and cannot be withdrawn.", ephemeral=True)
+                return
+
+            team_name = result[1]
+
+            # Withdraw the trade
+            await db.execute(
+                "UPDATE trades SET status = 'withdrawn' WHERE trade_id = ?",
+                (self.selected_trade_id,)
+            )
+            await db.commit()
+
+        await interaction.response.send_message(f"✅ Trade offer with **{team_name}** has been withdrawn.", ephemeral=True)
+
+        # Reset selection
+        self.selected_trade_id = None
+
+        # Refresh the view
+        self.current_view = "outgoing"
+        await self.update_view(interaction)
 
     async def view_incoming_callback(self, interaction: discord.Interaction):
         self.current_view = "incoming"
@@ -442,63 +497,54 @@ class TradeMenuView(discord.ui.View):
         return embed
 
 
-class WithdrawTradeModal(discord.ui.Modal, title="Withdraw Trade Offer"):
-    """Modal for entering trade ID to withdraw"""
-    trade_id_input = discord.ui.TextInput(
-        label="Trade ID",
-        placeholder="Enter the Trade ID from the list above",
-        required=True,
-        max_length=10
-    )
-
-    def __init__(self, parent_view):
-        super().__init__()
+class WithdrawTradeSelect(discord.ui.Select):
+    """Dropdown for selecting which trade to withdraw"""
+    def __init__(self, parent_view, pending_trades):
         self.parent_view = parent_view
 
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            trade_id = int(self.trade_id_input.value)
-        except ValueError:
-            await interaction.response.send_message("❌ Invalid Trade ID. Please enter a number.", ephemeral=True)
-            return
+        # Create options from pending trades
+        options = []
+        for trade_id, team_name, emoji_id in pending_trades:
+            emoji = parent_view.bot.get_emoji(int(emoji_id)) if emoji_id else None
+            label = f"{team_name}"
+            if emoji:
+                options.append(discord.SelectOption(
+                    label=label,
+                    value=str(trade_id),
+                    emoji=emoji
+                ))
+            else:
+                options.append(discord.SelectOption(
+                    label=label,
+                    value=str(trade_id)
+                ))
 
-        # Verify trade belongs to user's team and is pending
+        super().__init__(
+            placeholder="Select a trade offer to withdraw...",
+            options=options,
+            row=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        # Store the selected trade ID in the parent view
+        self.parent_view.selected_trade_id = int(self.values[0])
+
+        # Get team name for confirmation message
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
-                """SELECT status FROM trades
-                   WHERE trade_id = ? AND initiating_team_id = ?""",
-                (trade_id, self.parent_view.team_id)
+                """SELECT t2.team_name
+                   FROM trades tr
+                   JOIN teams t2 ON tr.receiving_team_id = t2.team_id
+                   WHERE tr.trade_id = ?""",
+                (self.parent_view.selected_trade_id,)
             )
             result = await cursor.fetchone()
+            team_name = result[0] if result else "Unknown"
 
-            if not result:
-                await interaction.response.send_message("❌ Trade not found or you don't have permission to withdraw it.", ephemeral=True)
-                return
-
-            if result[0] != 'pending':
-                await interaction.response.send_message(f"❌ This trade is {result[0]} and cannot be withdrawn.", ephemeral=True)
-                return
-
-            # Withdraw the trade
-            await db.execute(
-                "UPDATE trades SET status = 'withdrawn' WHERE trade_id = ?",
-                (trade_id,)
-            )
-            await db.commit()
-
-        await interaction.response.send_message(f"✅ Trade offer #{trade_id} has been withdrawn.", ephemeral=True)
-
-        # Refresh the view
-        self.parent_view.current_view = "outgoing"
-        embed = await self.parent_view.create_outgoing_embed()
-        self.parent_view.clear_items()
-        self.parent_view.add_outgoing_buttons()
-
-        # Get the original message and update it
-        try:
-            await interaction.message.edit(embed=embed, view=self.parent_view)
-        except:
-            pass  # If we can't edit, that's okay
+        await interaction.response.send_message(
+            f"✓ Selected trade with **{team_name}**. Click 'Confirm Withdraw' to withdraw this offer.",
+            ephemeral=True
+        )
 
 
 class TradeOfferView(discord.ui.View):
