@@ -162,7 +162,7 @@ class PlayerCommands(commands.Cog):
     @app_commands.command(name="roster", description="View a team's roster")
     @app_commands.describe(
         team_name="Name of the team (leave empty for your team)",
-        sort_by="Sort by (default: OVR desc)"
+        sort_by="Sort by (default: Position)"
     )
     @app_commands.autocomplete(team_name=team_name_autocomplete)
     @app_commands.choices(sort_by=[
@@ -172,7 +172,7 @@ class PlayerCommands(commands.Cog):
         app_commands.Choice(name="Age (Youngest to Oldest)", value="age_asc"),
         app_commands.Choice(name="Position", value="position"),
     ])
-    async def roster(self, interaction: discord.Interaction, team_name: str = None, sort_by: str = "ovr_desc"):
+    async def roster(self, interaction: discord.Interaction, team_name: str = None, sort_by: str = "position"):
         async with aiosqlite.connect(DB_PATH) as db:
             # If no team specified, get user's team
             if not team_name:
