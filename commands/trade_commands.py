@@ -128,25 +128,46 @@ class TradeOfferView(discord.ui.View):
         self.original_trade_id = original_trade_id
         self.receiving_team_id = receiving_team_id
         self.receiving_team_name = None
+        self.initiating_emoji = None
+        self.receiving_emoji = None
         self.initiating_players = []  # List of player IDs
         self.receiving_players = []   # List of player IDs
         self.all_teams = []
         self.initiating_roster = []
         self.receiving_roster = []
 
+    def get_emoji(self, emoji_id):
+        """Get emoji from ID"""
+        if not emoji_id:
+            return None
+        try:
+            emoji = self.bot.get_emoji(int(emoji_id))
+            return str(emoji) if emoji else None
+        except:
+            return None
+
     async def initialize(self):
         """Load initial data"""
         async with aiosqlite.connect(DB_PATH) as db:
-            # Get all teams except initiating team
+            # Get all teams except initiating team (with emojis)
             cursor = await db.execute(
-                "SELECT team_id, team_name FROM teams WHERE team_id != ? ORDER BY team_name",
+                "SELECT team_id, team_name, emoji_id FROM teams WHERE team_id != ? ORDER BY team_name",
                 (self.initiating_team_id,)
             )
             self.all_teams = await cursor.fetchall()
 
-            # Get initiating team roster
+            # Get initiating team info (with emoji)
             cursor = await db.execute(
-                "SELECT player_id, name, position, overall_rating FROM players WHERE team_id = ? ORDER BY name",
+                "SELECT emoji_id FROM teams WHERE team_id = ?",
+                (self.initiating_team_id,)
+            )
+            result = await cursor.fetchone()
+            if result:
+                self.initiating_emoji = self.get_emoji(result[0])
+
+            # Get initiating team roster (include age, order by OVR desc)
+            cursor = await db.execute(
+                "SELECT player_id, name, position, overall_rating, age FROM players WHERE team_id = ? ORDER BY overall_rating DESC",
                 (self.initiating_team_id,)
             )
             self.initiating_roster = await cursor.fetchall()
@@ -154,15 +175,16 @@ class TradeOfferView(discord.ui.View):
             # If receiving team is set, get their roster and name
             if self.receiving_team_id:
                 cursor = await db.execute(
-                    "SELECT team_name FROM teams WHERE team_id = ?",
+                    "SELECT team_name, emoji_id FROM teams WHERE team_id = ?",
                     (self.receiving_team_id,)
                 )
                 result = await cursor.fetchone()
                 if result:
                     self.receiving_team_name = result[0]
+                    self.receiving_emoji = self.get_emoji(result[1])
 
                 cursor = await db.execute(
-                    "SELECT player_id, name, position, overall_rating FROM players WHERE team_id = ? ORDER BY name",
+                    "SELECT player_id, name, position, overall_rating, age FROM players WHERE team_id = ? ORDER BY overall_rating DESC",
                     (self.receiving_team_id,)
                 )
                 self.receiving_roster = await cursor.fetchall()
@@ -174,14 +196,19 @@ class TradeOfferView(discord.ui.View):
         """Add all UI components"""
         self.clear_items()
 
-        # Team select (row 0)
-        if not self.is_counter_offer and self.all_teams:
-            team_select = TeamSelectMenu(self)
-            self.add_item(team_select)
+        # Team select button (row 0)
+        if not self.is_counter_offer:
+            team_select_btn = discord.ui.Button(
+                label="Select Team to Trade With" if not self.receiving_team_id else f"Trading with: {self.receiving_emoji or ''} {self.receiving_team_name}",
+                style=discord.ButtonStyle.primary if not self.receiving_team_id else discord.ButtonStyle.secondary,
+                row=0
+            )
+            team_select_btn.callback = self.team_select_callback
+            self.add_item(team_select_btn)
         elif self.is_counter_offer:
             # Show disabled button for counter-offers
             disabled_btn = discord.ui.Button(
-                label=f"Trading with: {self.receiving_team_name or 'Unknown'}",
+                label=f"Trading with: {self.receiving_emoji or ''} {self.receiving_team_name or 'Unknown'}",
                 style=discord.ButtonStyle.secondary,
                 disabled=True,
                 row=0
@@ -213,13 +240,9 @@ class TradeOfferView(discord.ui.View):
     def create_embed(self):
         """Create the trade offer embed"""
         embed = discord.Embed(
-            title="📋 Create Trade Offer" if not self.is_counter_offer else "📋 Create Counter Offer",
+            title=":arrows_clockwise: Create Trade Offer" if not self.is_counter_offer else ":arrows_clockwise: Create Counter Offer",
             color=discord.Color.blue()
         )
-
-        # Trading with
-        trading_with = self.receiving_team_name or "*Not selected - use dropdown above*"
-        embed.add_field(name="Trading With", value=trading_with, inline=False)
 
         # Get player names
         offering_names = []
@@ -229,25 +252,30 @@ class TradeOfferView(discord.ui.View):
             for player_id in self.initiating_players:
                 player = next((p for p in self.initiating_roster if p[0] == player_id), None)
                 if player:
-                    _, name, pos, ovr = player
-                    offering_names.append(f"**{name}** ({pos}, {ovr} OVR)")
+                    _, name, pos, ovr, age = player
+                    offering_names.append(f"**{name}** ({pos}, {ovr} OVR, {age}yo)")
 
         if self.receiving_players:
             for player_id in self.receiving_players:
                 player = next((p for p in self.receiving_roster if p[0] == player_id), None)
                 if player:
-                    _, name, pos, ovr = player
-                    receiving_names.append(f"**{name}** ({pos}, {ovr} OVR)")
+                    _, name, pos, ovr, age = player
+                    receiving_names.append(f"**{name}** ({pos}, {ovr} OVR, {age}yo)")
 
-        # Show what each team sends
+        # Show what each team receives
+        initiating_emoji_str = f"{self.initiating_emoji} " if self.initiating_emoji else ""
+        receiving_emoji_str = f"{self.receiving_emoji} " if self.receiving_emoji else ""
+
+        receiving_team_display = self.receiving_team_name or "*Not selected*"
+
         embed.add_field(
-            name=f"**{self.initiating_team_name}** sends:",
+            name=f"{receiving_emoji_str}**{receiving_team_display}** receives:",
             value="\n".join(offering_names) if offering_names else "*No players selected*",
             inline=True
         )
 
         embed.add_field(
-            name=f"**{trading_with}** sends:",
+            name=f"{initiating_emoji_str}**{self.initiating_team_name}** receives:",
             value="\n".join(receiving_names) if receiving_names else "*No players selected*",
             inline=True
         )
@@ -262,7 +290,7 @@ class TradeOfferView(discord.ui.View):
         if self.receiving_team_id and not self.receiving_roster:
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
-                    "SELECT player_id, name, position, overall_rating FROM players WHERE team_id = ? ORDER BY name",
+                    "SELECT player_id, name, position, overall_rating, age FROM players WHERE team_id = ? ORDER BY overall_rating DESC",
                     (self.receiving_team_id,)
                 )
                 self.receiving_roster = await cursor.fetchall()
@@ -270,6 +298,16 @@ class TradeOfferView(discord.ui.View):
         self.add_components()
         embed = self.create_embed()
         await interaction.response.edit_message(embed=embed, view=self)
+
+    async def team_select_callback(self, interaction: discord.Interaction):
+        """Open team selection modal"""
+        # Create team select dropdown view
+        view = TeamSelectView(self)
+        await interaction.response.send_message(
+            "Select a team to trade with:",
+            view=view,
+            ephemeral=True
+        )
 
     async def clear_callback(self, interaction: discord.Interaction):
         """Clear all selections"""
@@ -326,7 +364,7 @@ class TradeOfferView(discord.ui.View):
             channel = self.bot.get_channel(int(receiving_channel_id))
             if channel:
                 embed = discord.Embed(
-                    title="📨 New Trade Offer!" if not self.is_counter_offer else "📨 Counter Offer!",
+                    title=":arrows_clockwise: New Trade Offer!" if not self.is_counter_offer else ":arrows_clockwise: Counter Offer!",
                     color=discord.Color.gold()
                 )
 
@@ -338,24 +376,27 @@ class TradeOfferView(discord.ui.View):
                     for player_id in self.initiating_players:
                         player = next((p for p in self.initiating_roster if p[0] == player_id), None)
                         if player:
-                            _, name, pos, ovr = player
-                            offering_names.append(f"**{name}** ({pos}, {ovr} OVR)")
+                            _, name, pos, ovr, age = player
+                            offering_names.append(f"**{name}** ({pos}, {ovr} OVR, {age}yo)")
 
                 if self.receiving_players:
                     for player_id in self.receiving_players:
                         player = next((p for p in self.receiving_roster if p[0] == player_id), None)
                         if player:
-                            _, name, pos, ovr = player
-                            receiving_names.append(f"**{name}** ({pos}, {ovr} OVR)")
+                            _, name, pos, ovr, age = player
+                            receiving_names.append(f"**{name}** ({pos}, {ovr} OVR, {age}yo)")
+
+                initiating_emoji_str = f"{self.initiating_emoji} " if self.initiating_emoji else ""
+                receiving_emoji_str = f"{self.receiving_emoji} " if self.receiving_emoji else ""
 
                 embed.add_field(
-                    name=f"**{self.initiating_team_name}** sends:",
+                    name=f"{receiving_emoji_str}**{self.receiving_team_name}** receives:",
                     value="\n".join(offering_names) if offering_names else "*Nothing*",
                     inline=True
                 )
 
                 embed.add_field(
-                    name=f"**{self.receiving_team_name}** sends:",
+                    name=f"{initiating_emoji_str}**{self.initiating_team_name}** receives:",
                     value="\n".join(receiving_names) if receiving_names else "*Nothing*",
                     inline=True
                 )
@@ -379,42 +420,58 @@ class TradeOfferView(discord.ui.View):
         await interaction.edit_original_response(content="✅ **Trade offer sent!**", embed=None, view=None)
 
 
+class TeamSelectView(discord.ui.View):
+    """View for selecting a team in a separate message"""
+    def __init__(self, parent_view):
+        super().__init__(timeout=60)
+        self.parent_view = parent_view
+        self.add_item(TeamSelectMenu(parent_view))
+
+
 class TeamSelectMenu(discord.ui.Select):
     """Select menu for choosing a team to trade with"""
     def __init__(self, parent_view):
         self.parent_view = parent_view
-        options = [
-            discord.SelectOption(label=team_name, value=str(team_id))
-            for team_id, team_name in parent_view.all_teams[:25]  # Discord limit
-        ]
+        options = []
+        for team_id, team_name, emoji_id in parent_view.all_teams[:25]:  # Discord limit
+            emoji = parent_view.get_emoji(emoji_id)
+            label = f"{emoji} {team_name}" if emoji else team_name
+            options.append(discord.SelectOption(label=label, value=str(team_id)))
+
         super().__init__(placeholder="Select a team to trade with...", options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction):
         self.parent_view.receiving_team_id = int(self.values[0])
-        self.parent_view.receiving_team_name = next(
-            (name for tid, name in self.parent_view.all_teams if tid == self.parent_view.receiving_team_id),
-            None
-        )
+
+        # Get team info
+        for team_id, team_name, emoji_id in self.parent_view.all_teams:
+            if team_id == self.parent_view.receiving_team_id:
+                self.parent_view.receiving_team_name = team_name
+                self.parent_view.receiving_emoji = self.parent_view.get_emoji(emoji_id)
+                break
+
         # Clear receiving players when changing teams
         self.parent_view.receiving_players = []
         self.parent_view.receiving_roster = []
-        await self.parent_view.update_view(interaction)
+
+        await interaction.response.send_message("✅ Team selected!", ephemeral=True)
 
 
 class OfferingPlayerSelect(discord.ui.Select):
     """Select menu for choosing players to offer"""
     def __init__(self, parent_view):
         self.parent_view = parent_view
+        emoji_str = f"{parent_view.initiating_emoji} " if parent_view.initiating_emoji else ""
         options = [
             discord.SelectOption(
-                label=f"{name} ({pos}, {ovr} OVR)",
+                label=f"{name} ({pos}, {ovr} OVR, {age}yo)",
                 value=str(player_id),
                 default=(player_id in parent_view.initiating_players)
             )
-            for player_id, name, pos, ovr in parent_view.initiating_roster[:25]  # Discord limit
+            for player_id, name, pos, ovr, age in parent_view.initiating_roster[:25]  # Discord limit
         ]
         super().__init__(
-            placeholder="Select your players to trade away...",
+            placeholder=f"{emoji_str}{parent_view.initiating_team_name} sends...",
             options=options,
             min_values=0,
             max_values=len(options),
@@ -430,16 +487,17 @@ class ReceivingPlayerSelect(discord.ui.Select):
     """Select menu for choosing players to receive"""
     def __init__(self, parent_view):
         self.parent_view = parent_view
+        emoji_str = f"{parent_view.receiving_emoji} " if parent_view.receiving_emoji else ""
         options = [
             discord.SelectOption(
-                label=f"{name} ({pos}, {ovr} OVR)",
+                label=f"{name} ({pos}, {ovr} OVR, {age}yo)",
                 value=str(player_id),
                 default=(player_id in parent_view.receiving_players)
             )
-            for player_id, name, pos, ovr in parent_view.receiving_roster[:25]  # Discord limit
+            for player_id, name, pos, ovr, age in parent_view.receiving_roster[:25]  # Discord limit
         ]
         super().__init__(
-            placeholder="Select players you want to receive...",
+            placeholder=f"{emoji_str}{parent_view.receiving_team_name} sends...",
             options=options,
             min_values=0,
             max_values=len(options),
