@@ -328,11 +328,11 @@ class LineupCommands(commands.Cog):
         # Check if it's offseason
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
-                "SELECT status FROM seasons WHERE status = 'active' LIMIT 1"
+                "SELECT status FROM seasons WHERE status = 'offseason' LIMIT 1"
             )
             season = await cursor.fetchone()
 
-            if not season or season[0] != 'offseason':
+            if not season:
                 await interaction.response.send_message(
                     "❌ Players can only be delisted during the offseason!",
                     ephemeral=True
