@@ -135,6 +135,28 @@ class SeasonCommands(commands.Cog):
                     )
                 ''')
 
+                # Create trades table
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS trades (
+                        trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        initiating_team_id INTEGER NOT NULL,
+                        receiving_team_id INTEGER NOT NULL,
+                        initiating_players TEXT,
+                        receiving_players TEXT,
+                        status TEXT DEFAULT 'pending',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        responded_at TIMESTAMP,
+                        approved_at TIMESTAMP,
+                        created_by_user_id TEXT,
+                        responded_by_user_id TEXT,
+                        approved_by_user_id TEXT,
+                        original_trade_id INTEGER,
+                        FOREIGN KEY (initiating_team_id) REFERENCES teams(team_id),
+                        FOREIGN KEY (receiving_team_id) REFERENCES teams(team_id),
+                        FOREIGN KEY (original_trade_id) REFERENCES trades(trade_id)
+                    )
+                ''')
+
                 # Remove lineup_channel_id from teams if it exists (moved to settings)
                 cursor = await db.execute("PRAGMA table_info(teams)")
                 columns = await cursor.fetchall()
@@ -150,6 +172,7 @@ class SeasonCommands(commands.Cog):
                     "✅ Database migrated successfully!\n"
                     "• Seasons table created (existing data preserved)\n"
                     "• Injuries table created\n"
+                    "• Trades table created\n"
                     "• Suspensions table created\n"
                     "• Starting Lineups table created\n"
                     "• Settings table created\n\n"

@@ -189,6 +189,7 @@ async def on_ready():
     await bot.load_extension('commands.season_commands')
     await bot.load_extension('commands.injury_commands')
     await bot.load_extension('commands.suspension_commands')
+    await bot.load_extension('commands.trade_commands')
     
     try:
         if GUILD_ID:

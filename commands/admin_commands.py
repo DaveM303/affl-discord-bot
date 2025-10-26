@@ -251,19 +251,25 @@ class AdminCommands(commands.Cog):
     @app_commands.command(name="config", description="[ADMIN] Configure bot settings")
     @app_commands.describe(
         lineups_channel="Channel where all lineup submissions are posted",
-        delist_log_channel="Channel where player delistings are logged"
+        delist_log_channel="Channel where player delistings are logged",
+        trade_approval_channel="Channel where trades are sent for moderator approval",
+        trade_log_channel="Channel where approved trades are announced"
     )
     async def config(
         self,
         interaction: discord.Interaction,
         lineups_channel: discord.TextChannel = None,
-        delist_log_channel: discord.TextChannel = None
+        delist_log_channel: discord.TextChannel = None,
+        trade_approval_channel: discord.TextChannel = None,
+        trade_log_channel: discord.TextChannel = None
     ):
         # If no parameters provided, show current settings
-        if lineups_channel is None and delist_log_channel is None:
+        if all(ch is None for ch in [lineups_channel, delist_log_channel, trade_approval_channel, trade_log_channel]):
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
-                    "SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('lineups_channel_id', 'delist_log_channel_id')"
+                    """SELECT setting_key, setting_value FROM settings
+                       WHERE setting_key IN ('lineups_channel_id', 'delist_log_channel_id',
+                                             'trade_approval_channel_id', 'trade_log_channel_id')"""
                 )
                 results = await cursor.fetchall()
 
@@ -287,6 +293,22 @@ class AdminCommands(commands.Cog):
                 channel_display = "*Not set*"
             embed.add_field(name="Delist Log Channel", value=channel_display, inline=False)
 
+            # Trade Approval Channel
+            if 'trade_approval_channel_id' in settings and settings['trade_approval_channel_id']:
+                channel = interaction.guild.get_channel(int(settings['trade_approval_channel_id']))
+                channel_display = channel.mention if channel else f"<#{settings['trade_approval_channel_id']}> (channel not found)"
+            else:
+                channel_display = "*Not set*"
+            embed.add_field(name="Trade Approval Channel", value=channel_display, inline=False)
+
+            # Trade Log Channel
+            if 'trade_log_channel_id' in settings and settings['trade_log_channel_id']:
+                channel = interaction.guild.get_channel(int(settings['trade_log_channel_id']))
+                channel_display = channel.mention if channel else f"<#{settings['trade_log_channel_id']}> (channel not found)"
+            else:
+                channel_display = "*Not set*"
+            embed.add_field(name="Trade Log Channel", value=channel_display, inline=False)
+
             embed.set_footer(text="Use /config with parameters to update settings")
 
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -308,6 +330,20 @@ class AdminCommands(commands.Cog):
                     ("delist_log_channel_id", str(delist_log_channel.id))
                 )
                 updates.append(f"Delist Log Channel → {delist_log_channel.mention}")
+
+            if trade_approval_channel:
+                await db.execute(
+                    "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
+                    ("trade_approval_channel_id", str(trade_approval_channel.id))
+                )
+                updates.append(f"Trade Approval Channel → {trade_approval_channel.mention}")
+
+            if trade_log_channel:
+                await db.execute(
+                    "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
+                    ("trade_log_channel_id", str(trade_log_channel.id))
+                )
+                updates.append(f"Trade Log Channel → {trade_log_channel.mention}")
 
             await db.commit()
 
