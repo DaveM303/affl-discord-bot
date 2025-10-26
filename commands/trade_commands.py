@@ -341,13 +341,13 @@ class TradeOfferView(discord.ui.View):
         initiating_field_name = self.initiating_emoji if self.initiating_emoji else self.initiating_team_name
 
         embed.add_field(
-            name=f"# {receiving_field_name} receive:",
+            name=f"**{receiving_field_name} receive:**",
             value="\n".join(offering_names) if offering_names else "*No players selected*",
             inline=True
         )
 
         embed.add_field(
-            name=f"# {initiating_field_name} receive:",
+            name=f"**{initiating_field_name} receive:**",
             value="\n".join(receiving_names) if receiving_names else "*No players selected*",
             inline=True
         )
@@ -401,8 +401,6 @@ class TradeOfferView(discord.ui.View):
         if not self.initiating_players and not self.receiving_players:
             await interaction.response.send_message("❌ Please add at least one player to the trade!", ephemeral=True)
             return
-
-        await interaction.response.defer()
 
         # Store trade in database
         async with aiosqlite.connect(DB_PATH) as db:
@@ -489,7 +487,7 @@ class TradeOfferView(discord.ui.View):
                 )
                 await db.commit()
 
-        await interaction.edit_original_response(content="✅ **Trade offer sent!**", embed=None, view=None)
+        await interaction.response.send_message("✅ **Trade offer sent!**", ephemeral=True)
 
 
 class OfferingPlayerSelect(discord.ui.Select):
