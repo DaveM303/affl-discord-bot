@@ -197,6 +197,8 @@ class TradeOfferView(discord.ui.View):
         self.receiving_players = []   # List of player IDs
         self.initiating_roster = []
         self.receiving_roster = []
+        self.initiating_page = 0  # Current page for initiating team roster
+        self.receiving_page = 0   # Current page for receiving team roster
 
     def get_emoji(self, emoji_id, as_string=False):
         """Get emoji from ID
@@ -260,14 +262,34 @@ class TradeOfferView(discord.ui.View):
         """Add all UI components"""
         self.clear_items()
 
-        # Player selection dropdowns (row 0-1)
+        # Player selection dropdowns (row 0-1) with pagination buttons
         if self.initiating_roster:
             offering_select = OfferingPlayerSelect(self)
             self.add_item(offering_select)
 
+            # Add next page button for initiating team if needed
+            if len(self.initiating_roster) > 25:
+                next_page_btn = discord.ui.Button(
+                    label=f"Next Page ({self.initiating_page + 1}/{(len(self.initiating_roster) - 1) // 25 + 1})",
+                    style=discord.ButtonStyle.secondary,
+                    row=0
+                )
+                next_page_btn.callback = self.next_initiating_page
+                self.add_item(next_page_btn)
+
         if self.receiving_team_id and self.receiving_roster:
             receiving_select = ReceivingPlayerSelect(self)
             self.add_item(receiving_select)
+
+            # Add next page button for receiving team if needed
+            if len(self.receiving_roster) > 25:
+                next_page_btn = discord.ui.Button(
+                    label=f"Next Page ({self.receiving_page + 1}/{(len(self.receiving_roster) - 1) // 25 + 1})",
+                    style=discord.ButtonStyle.secondary,
+                    row=1
+                )
+                next_page_btn.callback = self.next_receiving_page
+                self.add_item(next_page_btn)
 
         # Action buttons (row 2)
         clear_btn = discord.ui.Button(label="Clear All", style=discord.ButtonStyle.secondary, row=2)
@@ -298,36 +320,30 @@ class TradeOfferView(discord.ui.View):
                 player = next((p for p in self.initiating_roster if p[0] == player_id), None)
                 if player:
                     _, name, pos, ovr, age = player
-                    offering_names.append(f"**{name}** ({pos}, {ovr} OVR, {age}yo)")
+                    offering_names.append(f"**{name}** ({pos}, {age}, {ovr})")
 
         if self.receiving_players:
             for player_id in self.receiving_players:
                 player = next((p for p in self.receiving_roster if p[0] == player_id), None)
                 if player:
                     _, name, pos, ovr, age = player
-                    receiving_names.append(f"**{name}** ({pos}, {ovr} OVR, {age}yo)")
+                    receiving_names.append(f"**{name}** ({pos}, {age}, {ovr})")
 
         # Show what each team receives (emoji only, or "Select team" if not selected)
         receiving_field_name = self.receiving_emoji if self.receiving_emoji else "Select team"
         initiating_field_name = self.initiating_emoji if self.initiating_emoji else self.initiating_team_name
 
         embed.add_field(
-            name=f"{receiving_field_name} receives:",
+            name=f"# {receiving_field_name} receive:",
             value="\n".join(offering_names) if offering_names else "*No players selected*",
             inline=True
         )
 
         embed.add_field(
-            name=f"{initiating_field_name} receives:",
+            name=f"# {initiating_field_name} receive:",
             value="\n".join(receiving_names) if receiving_names else "*No players selected*",
             inline=True
         )
-
-        # Add footer with note about player limits if applicable
-        footer_text = "Use the dropdowns to select players, then click Send Offer"
-        if len(self.initiating_roster) > 25 or (self.receiving_roster and len(self.receiving_roster) > 25):
-            footer_text += " • Showing top 25 players by OVR"
-        embed.set_footer(text=footer_text)
 
         return embed
 
@@ -345,6 +361,18 @@ class TradeOfferView(discord.ui.View):
         self.add_components()
         embed = self.create_embed()
         await interaction.response.edit_message(embed=embed, view=self)
+
+    async def next_initiating_page(self, interaction: discord.Interaction):
+        """Go to next page of initiating team roster"""
+        max_page = (len(self.initiating_roster) - 1) // 25
+        self.initiating_page = (self.initiating_page + 1) % (max_page + 1)
+        await self.update_view(interaction)
+
+    async def next_receiving_page(self, interaction: discord.Interaction):
+        """Go to next page of receiving team roster"""
+        max_page = (len(self.receiving_roster) - 1) // 25
+        self.receiving_page = (self.receiving_page + 1) % (max_page + 1)
+        await self.update_view(interaction)
 
     async def clear_callback(self, interaction: discord.Interaction):
         """Clear all selections"""
@@ -414,14 +442,14 @@ class TradeOfferView(discord.ui.View):
                         player = next((p for p in self.initiating_roster if p[0] == player_id), None)
                         if player:
                             _, name, pos, ovr, age = player
-                            offering_names.append(f"**{name}** ({pos}, {ovr} OVR, {age}yo)")
+                            offering_names.append(f"**{name}** ({pos}, {age}, {ovr})")
 
                 if self.receiving_players:
                     for player_id in self.receiving_players:
                         player = next((p for p in self.receiving_roster if p[0] == player_id), None)
                         if player:
                             _, name, pos, ovr, age = player
-                            receiving_names.append(f"**{name}** ({pos}, {ovr} OVR, {age}yo)")
+                            receiving_names.append(f"**{name}** ({pos}, {age}, {ovr})")
 
                 initiating_emoji_str = f"{self.initiating_emoji} " if self.initiating_emoji else ""
                 receiving_emoji_str = f"{self.receiving_emoji} " if self.receiving_emoji else ""
@@ -461,13 +489,18 @@ class OfferingPlayerSelect(discord.ui.Select):
     """Select menu for choosing players to offer"""
     def __init__(self, parent_view):
         self.parent_view = parent_view
+        # Get current page of players
+        start_idx = parent_view.initiating_page * 25
+        end_idx = start_idx + 25
+        page_players = parent_view.initiating_roster[start_idx:end_idx]
+
         options = [
             discord.SelectOption(
-                label=f"{name} ({pos}, {ovr} OVR, {age}yo)",
+                label=f"{name} ({pos}, {age}, {ovr})",
                 value=str(player_id),
                 default=(player_id in parent_view.initiating_players)
             )
-            for player_id, name, pos, ovr, age in parent_view.initiating_roster[:25]  # Discord limit
+            for player_id, name, pos, ovr, age in page_players
         ]
         super().__init__(
             placeholder=f"{parent_view.initiating_team_name} sends...",
@@ -486,13 +519,18 @@ class ReceivingPlayerSelect(discord.ui.Select):
     """Select menu for choosing players to receive"""
     def __init__(self, parent_view):
         self.parent_view = parent_view
+        # Get current page of players
+        start_idx = parent_view.receiving_page * 25
+        end_idx = start_idx + 25
+        page_players = parent_view.receiving_roster[start_idx:end_idx]
+
         options = [
             discord.SelectOption(
-                label=f"{name} ({pos}, {ovr} OVR, {age}yo)",
+                label=f"{name} ({pos}, {age}, {ovr})",
                 value=str(player_id),
                 default=(player_id in parent_view.receiving_players)
             )
-            for player_id, name, pos, ovr, age in parent_view.receiving_roster[:25]  # Discord limit
+            for player_id, name, pos, ovr, age in page_players
         ]
         super().__init__(
             placeholder=f"{parent_view.receiving_team_name} sends...",
