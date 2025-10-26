@@ -341,7 +341,7 @@ class LineupCommands(commands.Cog):
 
             # Find player by name on this team
             cursor = await db.execute(
-                """SELECT player_id, name FROM players
+                """SELECT player_id, name, position, overall_rating, age FROM players
                    WHERE team_id = ? AND LOWER(name) LIKE LOWER(?)
                    ORDER BY name LIMIT 5""",
                 (team_id, f"%{player_name}%")
@@ -357,14 +357,14 @@ class LineupCommands(commands.Cog):
 
             if len(matches) > 1:
                 # Multiple matches - list them
-                names = [f"• {name}" for _, name in matches]
+                names = [f"• {name}" for _, name, _, _, _ in matches]
                 await interaction.response.send_message(
                     f"❌ Multiple players match '{player_name}':\n" + "\n".join(names) + "\n\nPlease be more specific.",
                     ephemeral=True
                 )
                 return
 
-            player_id, full_name = matches[0]
+            player_id, full_name, position, rating, age = matches[0]
 
             # Delist the player
             await db.execute(
@@ -380,9 +380,31 @@ class LineupCommands(commands.Cog):
 
             await db.commit()
 
+            # Get delist log channel
+            cursor = await db.execute(
+                "SELECT setting_value FROM settings WHERE setting_key = 'delist_log_channel_id'"
+            )
+            result = await cursor.fetchone()
+
         await interaction.response.send_message(
             f"✅ **{full_name}** has been delisted from **{team_name}**."
         )
+
+        # Log to delist channel if configured
+        if result and result[0]:
+            try:
+                log_channel = interaction.guild.get_channel(int(result[0]))
+                if log_channel:
+                    embed = discord.Embed(
+                        title="Player Delisted",
+                        color=discord.Color.red(),
+                        description=f"**{full_name}** ({position}, {rating} OVR, {age}yo) has been delisted from **{team_name}**."
+                    )
+                    embed.set_footer(text=f"Delisted by {interaction.user.display_name}")
+                    await log_channel.send(embed=embed)
+            except Exception as e:
+                # Don't fail the command if logging fails
+                print(f"Failed to log delist: {e}")
 
 
 class TeamLineupMenu(discord.ui.View):

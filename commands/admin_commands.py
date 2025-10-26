@@ -250,30 +250,43 @@ class AdminCommands(commands.Cog):
 
     @app_commands.command(name="config", description="[ADMIN] Configure bot settings")
     @app_commands.describe(
-        lineups_channel="Channel where all lineup submissions are posted"
+        lineups_channel="Channel where all lineup submissions are posted",
+        delist_log_channel="Channel where player delistings are logged"
     )
     async def config(
         self,
         interaction: discord.Interaction,
-        lineups_channel: discord.TextChannel = None
+        lineups_channel: discord.TextChannel = None,
+        delist_log_channel: discord.TextChannel = None
     ):
         # If no parameters provided, show current settings
-        if lineups_channel is None:
+        if lineups_channel is None and delist_log_channel is None:
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
-                    "SELECT setting_key, setting_value FROM settings WHERE setting_key = 'lineups_channel_id'"
+                    "SELECT setting_key, setting_value FROM settings WHERE setting_key IN ('lineups_channel_id', 'delist_log_channel_id')"
                 )
-                result = await cursor.fetchone()
+                results = await cursor.fetchall()
 
             embed = discord.Embed(title="⚙️ Bot Configuration", color=discord.Color.blue())
 
-            if result and result[1]:
-                channel = interaction.guild.get_channel(int(result[1]))
-                channel_display = channel.mention if channel else f"<#{result[1]}> (channel not found)"
+            settings = {key: value for key, value in results}
+
+            # Lineups Channel
+            if 'lineups_channel_id' in settings and settings['lineups_channel_id']:
+                channel = interaction.guild.get_channel(int(settings['lineups_channel_id']))
+                channel_display = channel.mention if channel else f"<#{settings['lineups_channel_id']}> (channel not found)"
             else:
                 channel_display = "*Not set*"
-
             embed.add_field(name="Lineups Channel", value=channel_display, inline=False)
+
+            # Delist Log Channel
+            if 'delist_log_channel_id' in settings and settings['delist_log_channel_id']:
+                channel = interaction.guild.get_channel(int(settings['delist_log_channel_id']))
+                channel_display = channel.mention if channel else f"<#{settings['delist_log_channel_id']}> (channel not found)"
+            else:
+                channel_display = "*Not set*"
+            embed.add_field(name="Delist Log Channel", value=channel_display, inline=False)
+
             embed.set_footer(text="Use /config with parameters to update settings")
 
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -288,6 +301,13 @@ class AdminCommands(commands.Cog):
                     ("lineups_channel_id", str(lineups_channel.id))
                 )
                 updates.append(f"Lineups Channel → {lineups_channel.mention}")
+
+            if delist_log_channel:
+                await db.execute(
+                    "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
+                    ("delist_log_channel_id", str(delist_log_channel.id))
+                )
+                updates.append(f"Delist Log Channel → {delist_log_channel.mention}")
 
             await db.commit()
 
