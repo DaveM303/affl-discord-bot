@@ -733,32 +733,29 @@ class AdminCommands(commands.Cog):
                 teams_df['Emoji_ID'] = teams_df['Emoji_ID'].fillna('')
                 teams_df['Channel_ID'] = teams_df['Channel_ID'].fillna('')
                 
-                # Export Players with Lineup Positions
+                # Export Players (core data only, no lineup positions)
                 cursor = await db.execute(
-                    """SELECT p.name as Name, t.team_name as Team, p.age as Age, 
-                              p.position as Pos, p.overall_rating as OVR, l.position_name as Lineup_Pos
+                    """SELECT p.name as Name, t.team_name as Team, p.age as Age,
+                              p.position as Pos, p.overall_rating as OVR
                        FROM players p
                        LEFT JOIN teams t ON p.team_id = t.team_id
-                       LEFT JOIN lineups l ON p.player_id = l.player_id
                        ORDER BY p.name"""
                 )
                 players = await cursor.fetchall()
-                players_df = pd.DataFrame(players, columns=['Name', 'Team', 'Age', 'Pos', 'OVR', 'Lineup_Pos'])
+                players_df = pd.DataFrame(players, columns=['Name', 'Team', 'Age', 'Pos', 'OVR'])
                 players_df['Team'] = players_df['Team'].fillna('')
-                players_df['Lineup_Pos'] = players_df['Lineup_Pos'].fillna('')
                 
-                # Export Lineups as read-only summary view (formatted by team)
+                # Export Current Lineups (editable)
                 cursor = await db.execute(
                     """SELECT t.team_name as Team_Name, l.position_name as Position,
-                              p.name as Player_Name, p.position as Player_Position,
-                              p.overall_rating as OVR
+                              p.name as Player_Name
                        FROM lineups l
                        JOIN teams t ON l.team_id = t.team_id
                        JOIN players p ON l.player_id = p.player_id
                        ORDER BY t.team_name, l.slot_number"""
                 )
-                lineups = await cursor.fetchall()
-                lineups_df = pd.DataFrame(lineups, columns=['Team_Name', 'Position', 'Player_Name', 'Player_Position', 'OVR'])
+                current_lineups = await cursor.fetchall()
+                current_lineups_df = pd.DataFrame(current_lineups, columns=['Team_Name', 'Position', 'Player_Name'])
 
                 # Export Seasons
                 cursor = await db.execute(
@@ -825,58 +822,147 @@ class AdminCommands(commands.Cog):
                 settings_df = pd.DataFrame(settings, columns=['Setting_Key', 'Setting_Value'])
                 settings_df = settings_df.fillna('')
 
-                # Export Starting Lineups (stored as JSON)
+                # Export Starting Lineups (flatten JSON to Team/Position/Player_Name format)
                 cursor = await db.execute(
-                    """SELECT t.team_name as Team_Name, sl.lineup_data as Lineup_Data
+                    """SELECT t.team_name, sl.lineup_data
                        FROM starting_lineups sl
                        JOIN teams t ON sl.team_id = t.team_id
                        ORDER BY t.team_name"""
                 )
-                starting_lineups = await cursor.fetchall()
-                starting_lineups_df = pd.DataFrame(starting_lineups, columns=['Team_Name', 'Lineup_Data'])
-                starting_lineups_df = starting_lineups_df.fillna('')
+                starting_lineup_rows = await cursor.fetchall()
+
+                # Convert JSON lineups to rows
+                starting_lineups_list = []
+                for team_name, lineup_json in starting_lineup_rows:
+                    if lineup_json:
+                        lineup_data = json.loads(lineup_json)
+                        for position_name, player_id in lineup_data.items():
+                            # Get player name
+                            cursor = await db.execute("SELECT name FROM players WHERE player_id = ?", (int(player_id),))
+                            player = await cursor.fetchone()
+                            player_name = player[0] if player else f"Unknown ({player_id})"
+                            starting_lineups_list.append({
+                                'Team_Name': team_name,
+                                'Position': position_name,
+                                'Player_Name': player_name
+                            })
+
+                starting_lineups_df = pd.DataFrame(starting_lineups_list)
+                if starting_lineups_df.empty:
+                    starting_lineups_df = pd.DataFrame(columns=['Team_Name', 'Position', 'Player_Name'])
+
+                # Export Matches
+                cursor = await db.execute(
+                    """SELECT m.match_id as Match_ID, s.season_number as Season,
+                              m.round_number as Round, ht.team_name as Home_Team,
+                              at.team_name as Away_Team, m.home_score as Home_Score,
+                              m.away_score as Away_Score, m.simulated as Simulated
+                       FROM matches m
+                       JOIN seasons s ON m.season_id = s.season_id
+                       JOIN teams ht ON m.home_team_id = ht.team_id
+                       JOIN teams at ON m.away_team_id = at.team_id
+                       ORDER BY s.season_number, m.round_number, m.match_id"""
+                )
+                matches = await cursor.fetchall()
+                matches_df = pd.DataFrame(matches, columns=['Match_ID', 'Season', 'Round', 'Home_Team', 'Away_Team', 'Home_Score', 'Away_Score', 'Simulated'])
+
+                # Export Draft Picks
+                cursor = await db.execute(
+                    """SELECT dp.pick_id as Pick_ID, s.season_number as Season,
+                              dp.round_number as Round, dp.pick_number as Pick,
+                              ot.team_name as Original_Team, ct.team_name as Current_Team,
+                              p.name as Player_Selected
+                       FROM draft_picks dp
+                       JOIN seasons s ON dp.season_id = s.season_id
+                       JOIN teams ot ON dp.original_team_id = ot.team_id
+                       JOIN teams ct ON dp.current_team_id = ct.team_id
+                       LEFT JOIN players p ON dp.player_selected_id = p.player_id
+                       ORDER BY s.season_number, dp.round_number, dp.pick_number"""
+                )
+                draft_picks = await cursor.fetchall()
+                draft_picks_df = pd.DataFrame(draft_picks, columns=['Pick_ID', 'Season', 'Round', 'Pick', 'Original_Team', 'Current_Team', 'Player_Selected'])
+                draft_picks_df['Player_Selected'] = draft_picks_df['Player_Selected'].fillna('')
+
+                # Export Submitted Lineups
+                cursor = await db.execute(
+                    """SELECT sl.submission_id as Submission_ID, t.team_name as Team_Name,
+                              s.season_number as Season, sl.round_number as Round,
+                              sl.player_ids as Player_IDs, sl.submitted_at as Submitted_At
+                       FROM submitted_lineups sl
+                       JOIN teams t ON sl.team_id = t.team_id
+                       JOIN seasons s ON sl.season_id = s.season_id
+                       ORDER BY s.season_number, sl.round_number, t.team_name"""
+                )
+                submitted_lineups = await cursor.fetchall()
+                submitted_lineups_df = pd.DataFrame(submitted_lineups, columns=['Submission_ID', 'Team_Name', 'Season', 'Round', 'Player_IDs', 'Submitted_At'])
 
             # Create Excel file in memory
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                # Core data sheets (editable)
                 teams_df.to_excel(writer, sheet_name='Teams', index=False)
                 players_df.to_excel(writer, sheet_name='Players', index=False)
-                lineups_df.to_excel(writer, sheet_name='Lineups', index=False)
                 seasons_df.to_excel(writer, sheet_name='Seasons', index=False)
+                settings_df.to_excel(writer, sheet_name='Settings', index=False)
+
+                # Relationship/State sheets (editable)
+                current_lineups_df.to_excel(writer, sheet_name='Current_Lineups', index=False)
+                starting_lineups_df.to_excel(writer, sheet_name='Starting_Lineups', index=False)
                 injuries_df.to_excel(writer, sheet_name='Injuries', index=False)
                 suspensions_df.to_excel(writer, sheet_name='Suspensions', index=False)
+                draft_picks_df.to_excel(writer, sheet_name='Draft_Picks', index=False)
+
+                # History/Read-only sheets
                 trades_df.to_excel(writer, sheet_name='Trades', index=False)
-                settings_df.to_excel(writer, sheet_name='Settings', index=False)
-                starting_lineups_df.to_excel(writer, sheet_name='Starting_Lineups', index=False)
+                matches_df.to_excel(writer, sheet_name='Matches', index=False)
+                submitted_lineups_df.to_excel(writer, sheet_name='Submitted_Lineups', index=False)
                 
                 # Add instructions sheet
                 instructions = pd.DataFrame({
                     'IMPORTANT INSTRUCTIONS': [
-                        '1. BEFORE editing the Teams sheet:',
-                        '   - Select the entire Role_ID column',
-                        '   - Right-click > Format Cells > Text',
-                        '   - Then edit your role IDs',
+                        '=== EXCEL IMPORT/EXPORT GUIDE ===',
                         '',
-                        '2. This prevents Excel from converting long numbers to scientific notation',
+                        'IMPORTANT: Before editing Teams sheet:',
+                        '  - Select entire Role_ID column → Right-click → Format Cells → Text',
+                        '  - This prevents Excel from corrupting Discord IDs',
                         '',
-                        '3. To import: Use /importdata command and attach this file',
+                        'To import: Use /importdata command and attach this file',
                         '',
-                        '4. Teams sheet columns:',
-                        '   - Team_Name: Your team name',
-                        '   - Role_ID: Discord role ID (copy from Server Settings > Roles)',
-                        '   - Emoji_ID: Server emoji ID (right-click emoji > Copy Link > ID at end)',
+                        '=== SHEET ORGANIZATION ===',
                         '',
-                        '5. Players sheet columns:',
-                        '   - Name: Player name',
-                        '   - Team: Team name (leave blank for delisted players)',
-                        '   - Age: Player age',
-                        '   - Pos: Position (MID, KEY FWD, RUCK, etc.)',
-                        '   - OVR: Overall rating (1-100)',
-                        '   - Lineup_Pos: Field position (FB, CHB, LW, etc. - leave blank for bench)',
+                        'CORE DATA (Editable):',
+                        '  • Teams - Team info, Discord role/emoji IDs',
+                        '  • Players - Name, team, age, position, rating (NO lineup positions)',
+                        '  • Seasons - Season configuration',
+                        '  • Settings - Bot settings',
                         '',
-                        '6. Lineups sheet (read-only summary):',
-                        '   - Shows team lineups formatted by team for easy viewing',
-                        '   - Edit lineup positions in the Players sheet instead',
+                        'RELATIONSHIPS/STATE (Editable):',
+                        '  • Current_Lineups - Active team lineups (Team/Position/Player)',
+                        '  • Starting_Lineups - Saved lineup templates (Team/Position/Player)',
+                        '  • Injuries - Player injury status',
+                        '  • Suspensions - Player suspension status',
+                        '  • Draft_Picks - Draft pick ownership',
+                        '',
+                        'HISTORY (Read-only - import supported):',
+                        '  • Trades - Trade history',
+                        '  • Matches - Match results',
+                        '  • Submitted_Lineups - Historical lineup submissions',
+                        '',
+                        '=== KEY CHANGES ===',
+                        '',
+                        '1. Players sheet NO LONGER has Lineup_Pos column',
+                        '   - Edit lineups in Current_Lineups sheet instead',
+                        '',
+                        '2. Current_Lineups and Starting_Lineups use same format',
+                        '   - Team_Name, Position, Player_Name',
+                        '   - Consistent and easy to edit',
+                        '',
+                        '3. All tables now exported for complete backup',
+                        '',
+                        '=== VALID POSITIONS ===',
+                        '',
+                        'Player Positions: MID, KEY FWD, RUCK, GEN DEF, etc.',
+                        'Lineup Positions: FB, CHB, LW, C, RW, CHF, FF, R, RR, RO, INT1-4, SUB',
                     ]
                 })
                 instructions.to_excel(writer, sheet_name='README', index=False)
@@ -887,13 +973,16 @@ class AdminCommands(commands.Cog):
             stats = [
                 f"{len(teams_df)} teams",
                 f"{len(players_df)} players",
-                f"{len(lineups_df)} lineup positions",
+                f"{len(current_lineups_df)} current lineup positions",
+                f"{len(starting_lineups_df)} starting lineup positions",
                 f"{len(seasons_df)} seasons",
                 f"{len(injuries_df)} injuries",
                 f"{len(suspensions_df)} suspensions",
+                f"{len(draft_picks_df)} draft picks",
                 f"{len(trades_df)} trades",
-                f"{len(settings_df)} settings",
-                f"{len(starting_lineups_df)} starting lineup entries"
+                f"{len(matches_df)} matches",
+                f"{len(submitted_lineups_df)} submitted lineups",
+                f"{len(settings_df)} settings"
             ]
             await interaction.followup.send(
                 f"✅ Exported: {', '.join(stats)}",
@@ -961,42 +1050,26 @@ class AdminCommands(commands.Cog):
                     cursor = await db.execute("SELECT team_id, team_name FROM teams")
                     teams = await cursor.fetchall()
                     team_map = {name.lower(): id for id, name in teams}
-                    
-                    # Valid lineup positions
-                    valid_lineup_positions = [
-                        "LBP", "FB", "RBP", "LHB", "CHB", "RHB",
-                        "LW", "C", "RW", "LHF", "CHF", "RHF",
-                        "LFP", "FF", "RFP", "R", "RR", "RO",
-                        "INT1", "INT2", "INT3", "INT4", "SUB"
-                    ]
-                    
+
                     for _, row in players_df.iterrows():
                         try:
                             name = str(row['Name']).strip()
                             position = str(row['Pos']).strip()
                             rating = int(row['OVR'])
                             age = int(row['Age'])
-                            
+
                             # Validate position
                             is_valid, normalized_pos = validate_position(position)
                             if not is_valid:
                                 errors.append(f"Player '{name}': Invalid position '{position}'")
                                 continue
-                            
+
                             # Get team ID
                             team_id = None
                             if 'Team' in players_df.columns and pd.notna(row['Team']) and row['Team']:
                                 team_name_lower = str(row['Team']).strip().lower()
                                 team_id = team_map.get(team_name_lower)
-                            
-                            # Get lineup position if provided
-                            lineup_pos = None
-                            if 'Lineup_Pos' in players_df.columns and pd.notna(row['Lineup_Pos']) and str(row['Lineup_Pos']).strip():
-                                lineup_pos = str(row['Lineup_Pos']).strip().upper()
-                                if lineup_pos not in valid_lineup_positions:
-                                    errors.append(f"Player '{name}': Invalid lineup position '{lineup_pos}'")
-                                    lineup_pos = None
-                            
+
                             # Check if player exists
                             cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (name,))
                             existing = await cursor.fetchone()
@@ -1008,9 +1081,8 @@ class AdminCommands(commands.Cog):
                                 duplicate_warnings.append(f"'{name}' is similar to existing player '{duplicate[1]}' (ID: {duplicate[0]})")
 
                             if existing:
-                                player_id = existing[0]
                                 await db.execute(
-                                    """UPDATE players 
+                                    """UPDATE players
                                        SET position = ?, overall_rating = ?, age = ?, team_id = ?
                                        WHERE name = ?""",
                                     (normalized_pos, rating, age, team_id, name)
@@ -1022,34 +1094,7 @@ class AdminCommands(commands.Cog):
                                        VALUES (?, ?, ?, ?, ?)""",
                                     (name, normalized_pos, rating, age, team_id)
                                 )
-                                # Get the newly inserted player_id
-                                cursor = await db.execute("SELECT last_insert_rowid()")
-                                player_id = (await cursor.fetchone())[0]
                                 players_added += 1
-                            
-                            # Handle lineup position
-                            if lineup_pos and team_id:
-                                # Get slot number for this position
-                                slot_number = valid_lineup_positions.index(lineup_pos) + 1
-                                
-                                # Remove player from any existing lineup position
-                                await db.execute(
-                                    "DELETE FROM lineups WHERE player_id = ?",
-                                    (player_id,)
-                                )
-                                
-                                # Add to new position
-                                await db.execute(
-                                    """INSERT OR REPLACE INTO lineups (team_id, player_id, slot_number, position_name)
-                                       VALUES (?, ?, ?, ?)""",
-                                    (team_id, player_id, slot_number, lineup_pos)
-                                )
-                            elif not lineup_pos:
-                                # If no lineup position specified, remove from lineup
-                                await db.execute(
-                                    "DELETE FROM lineups WHERE player_id = ?",
-                                    (player_id,)
-                                )
                                 
                         except Exception as e:
                             errors.append(f"Player '{name}': {str(e)}")
@@ -1057,6 +1102,48 @@ class AdminCommands(commands.Cog):
                     await db.commit()
                 except Exception as e:
                     errors.append(f"Players sheet error: {str(e)}")
+
+                # Import Current Lineups
+                current_lineups_imported = 0
+                try:
+                    current_lineups_df = pd.read_excel(excel_file, sheet_name='Current_Lineups')
+
+                    # Valid lineup positions with slot numbers
+                    valid_lineup_positions = [
+                        "LBP", "FB", "RBP", "LHB", "CHB", "RHB",
+                        "LW", "C", "RW", "LHF", "CHF", "RHF",
+                        "LFP", "FF", "RFP", "R", "RR", "RO",
+                        "INT1", "INT2", "INT3", "INT4", "SUB"
+                    ]
+
+                    for _, row in current_lineups_df.iterrows():
+                        try:
+                            # Get team ID
+                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Team_Name']),))
+                            team = await cursor.fetchone()
+
+                            # Get player ID
+                            cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (str(row['Player_Name']),))
+                            player = await cursor.fetchone()
+
+                            position = str(row['Position']).strip().upper()
+
+                            if team and player and position in valid_lineup_positions:
+                                slot_number = valid_lineup_positions.index(position) + 1
+                                await db.execute(
+                                    """INSERT OR REPLACE INTO lineups (team_id, player_id, slot_number, position_name)
+                                       VALUES (?, ?, ?, ?)""",
+                                    (team[0], player[0], slot_number, position)
+                                )
+                                current_lineups_imported += 1
+                            elif position not in valid_lineup_positions:
+                                errors.append(f"Current lineup: Invalid position '{position}' for {row['Player_Name']}")
+                        except Exception as e:
+                            errors.append(f"Current lineup for {row['Team_Name']}: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Current_Lineups' not in str(e):
+                        errors.append(f"Current Lineups sheet error: {str(e)}")
 
                 # Import Seasons
                 seasons_imported = 0
@@ -1188,47 +1275,183 @@ class AdminCommands(commands.Cog):
                     if 'Worksheet Settings' not in str(e):
                         errors.append(f"Settings sheet error: {str(e)}")
 
-                # Import Starting Lineups
+                # Import Starting Lineups (convert from flattened format to JSON)
                 starting_lineups_imported = 0
                 try:
                     starting_lineups_df = pd.read_excel(excel_file, sheet_name='Starting_Lineups')
+
+                    # Group by team and build JSON lineups
+                    team_lineups = {}
                     for _, row in starting_lineups_df.iterrows():
                         try:
+                            team_name = str(row['Team_Name'])
+                            position = str(row['Position']).strip()
+                            player_name = str(row['Player_Name'])
+
+                            # Get player ID
+                            cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (player_name,))
+                            player = await cursor.fetchone()
+
+                            if player:
+                                if team_name not in team_lineups:
+                                    team_lineups[team_name] = {}
+                                team_lineups[team_name][position] = player[0]
+                        except Exception as e:
+                            errors.append(f"Starting lineup row error: {str(e)}")
+
+                    # Insert/update starting lineups for each team
+                    for team_name, lineup_dict in team_lineups.items():
+                        try:
                             # Get team ID
-                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Team_Name']),))
+                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
                             team = await cursor.fetchone()
 
-                            if team and pd.notna(row['Lineup_Data']) and row['Lineup_Data']:
-                                # Store the JSON lineup data directly
+                            if team:
+                                lineup_json = json.dumps(lineup_dict)
                                 await db.execute(
                                     """INSERT OR REPLACE INTO starting_lineups (team_id, lineup_data, last_updated)
                                        VALUES (?, ?, CURRENT_TIMESTAMP)""",
-                                    (team[0], str(row['Lineup_Data']))
+                                    (team[0], lineup_json)
                                 )
                                 starting_lineups_imported += 1
                         except Exception as e:
-                            errors.append(f"Starting lineup for {row['Team_Name']}: {str(e)}")
+                            errors.append(f"Starting lineup for {team_name}: {str(e)}")
+
                     await db.commit()
                 except Exception as e:
                     if 'Worksheet Starting_Lineups' not in str(e):
                         errors.append(f"Starting Lineups sheet error: {str(e)}")
 
+                # Import Matches
+                matches_imported = 0
+                try:
+                    matches_df = pd.read_excel(excel_file, sheet_name='Matches')
+                    for _, row in matches_df.iterrows():
+                        try:
+                            # Get season ID
+                            cursor = await db.execute("SELECT season_id FROM seasons WHERE season_number = ?", (int(row['Season']),))
+                            season = await cursor.fetchone()
+
+                            # Get home team ID
+                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Home_Team']),))
+                            home_team = await cursor.fetchone()
+
+                            # Get away team ID
+                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Away_Team']),))
+                            away_team = await cursor.fetchone()
+
+                            if season and home_team and away_team:
+                                await db.execute(
+                                    """INSERT OR REPLACE INTO matches
+                                       (match_id, season_id, round_number, home_team_id, away_team_id, home_score, away_score, simulated)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                    (int(row['Match_ID']), season[0], int(row['Round']), home_team[0], away_team[0],
+                                     int(row['Home_Score']), int(row['Away_Score']), int(row['Simulated']))
+                                )
+                                matches_imported += 1
+                        except Exception as e:
+                            errors.append(f"Match {row['Match_ID']}: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Matches' not in str(e):
+                        errors.append(f"Matches sheet error: {str(e)}")
+
+                # Import Draft Picks
+                draft_picks_imported = 0
+                try:
+                    draft_picks_df = pd.read_excel(excel_file, sheet_name='Draft_Picks')
+                    for _, row in draft_picks_df.iterrows():
+                        try:
+                            # Get season ID
+                            cursor = await db.execute("SELECT season_id FROM seasons WHERE season_number = ?", (int(row['Season']),))
+                            season = await cursor.fetchone()
+
+                            # Get original team ID
+                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Original_Team']),))
+                            original_team = await cursor.fetchone()
+
+                            # Get current team ID
+                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Current_Team']),))
+                            current_team = await cursor.fetchone()
+
+                            # Get player ID if selected
+                            player_id = None
+                            if pd.notna(row['Player_Selected']) and row['Player_Selected']:
+                                cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (str(row['Player_Selected']),))
+                                player = await cursor.fetchone()
+                                if player:
+                                    player_id = player[0]
+
+                            if season and original_team and current_team:
+                                await db.execute(
+                                    """INSERT OR REPLACE INTO draft_picks
+                                       (pick_id, season_id, round_number, pick_number, original_team_id, current_team_id, player_selected_id)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                    (int(row['Pick_ID']), season[0], int(row['Round']), int(row['Pick']),
+                                     original_team[0], current_team[0], player_id)
+                                )
+                                draft_picks_imported += 1
+                        except Exception as e:
+                            errors.append(f"Draft Pick {row['Pick_ID']}: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Draft_Picks' not in str(e):
+                        errors.append(f"Draft Picks sheet error: {str(e)}")
+
+                # Import Submitted Lineups
+                submitted_lineups_imported = 0
+                try:
+                    submitted_lineups_df = pd.read_excel(excel_file, sheet_name='Submitted_Lineups')
+                    for _, row in submitted_lineups_df.iterrows():
+                        try:
+                            # Get team ID
+                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Team_Name']),))
+                            team = await cursor.fetchone()
+
+                            # Get season ID
+                            cursor = await db.execute("SELECT season_id FROM seasons WHERE season_number = ?", (int(row['Season']),))
+                            season = await cursor.fetchone()
+
+                            if team and season:
+                                await db.execute(
+                                    """INSERT OR REPLACE INTO submitted_lineups
+                                       (submission_id, team_id, season_id, round_number, player_ids, submitted_at)
+                                       VALUES (?, ?, ?, ?, ?, ?)""",
+                                    (int(row['Submission_ID']), team[0], season[0], int(row['Round']),
+                                     str(row['Player_IDs']), str(row['Submitted_At']))
+                                )
+                                submitted_lineups_imported += 1
+                        except Exception as e:
+                            errors.append(f"Submitted Lineup {row['Submission_ID']}: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Submitted_Lineups' not in str(e):
+                        errors.append(f"Submitted Lineups sheet error: {str(e)}")
+
             # Build response
             response = "✅ **Import Complete!**\n\n"
             response += f"**Teams:** {teams_added} added, {teams_updated} updated\n"
             response += f"**Players:** {players_added} added, {players_updated} updated\n"
+            if current_lineups_imported > 0:
+                response += f"**Current Lineups:** {current_lineups_imported} imported\n"
+            if starting_lineups_imported > 0:
+                response += f"**Starting Lineups:** {starting_lineups_imported} teams imported\n"
             if seasons_imported > 0:
                 response += f"**Seasons:** {seasons_imported} imported\n"
             if injuries_imported > 0:
                 response += f"**Injuries:** {injuries_imported} imported\n"
             if suspensions_imported > 0:
                 response += f"**Suspensions:** {suspensions_imported} imported\n"
+            if draft_picks_imported > 0:
+                response += f"**Draft Picks:** {draft_picks_imported} imported\n"
             if trades_imported > 0:
                 response += f"**Trades:** {trades_imported} imported\n"
+            if matches_imported > 0:
+                response += f"**Matches:** {matches_imported} imported\n"
+            if submitted_lineups_imported > 0:
+                response += f"**Submitted Lineups:** {submitted_lineups_imported} imported\n"
             if settings_imported > 0:
                 response += f"**Settings:** {settings_imported} imported\n"
-            if starting_lineups_imported > 0:
-                response += f"**Starting Lineups:** {starting_lineups_imported} imported\n"
 
             if duplicate_warnings:
                 response += f"\n⚠️ **{len(duplicate_warnings)} Duplicate Name Warning(s):**\n"
