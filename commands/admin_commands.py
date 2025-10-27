@@ -785,6 +785,59 @@ class AdminCommands(commands.Cog):
                 injuries_df = pd.DataFrame(injuries, columns=['Player_Name', 'Team', 'Injury_Type', 'Injury_Round', 'Recovery_Rounds', 'Return_Round', 'Status'])
                 injuries_df['Team'] = injuries_df['Team'].fillna('Delisted')
 
+                # Export Suspensions
+                cursor = await db.execute(
+                    """SELECT p.name as Player_Name, t.team_name as Team,
+                              s.suspension_round as Suspension_Round, s.suspension_duration as Duration,
+                              s.return_round as Return_Round, s.reason as Reason, s.status as Status
+                       FROM suspensions s
+                       JOIN players p ON s.player_id = p.player_id
+                       LEFT JOIN teams t ON p.team_id = t.team_id
+                       ORDER BY s.status, s.return_round"""
+                )
+                suspensions = await cursor.fetchall()
+                suspensions_df = pd.DataFrame(suspensions, columns=['Player_Name', 'Team', 'Suspension_Round', 'Duration', 'Return_Round', 'Reason', 'Status'])
+                suspensions_df['Team'] = suspensions_df['Team'].fillna('Delisted')
+
+                # Export Trades
+                cursor = await db.execute(
+                    """SELECT tr.trade_id as Trade_ID, t1.team_name as Initiating_Team, t2.team_name as Receiving_Team,
+                              tr.initiating_players as Initiating_Players, tr.receiving_players as Receiving_Players,
+                              tr.status as Status, tr.created_at as Created_At, tr.responded_at as Responded_At,
+                              tr.approved_at as Approved_At, tr.created_by_user_id as Created_By_User_ID,
+                              tr.responded_by_user_id as Responded_By_User_ID, tr.approved_by_user_id as Approved_By_User_ID,
+                              tr.original_trade_id as Original_Trade_ID
+                       FROM trades tr
+                       JOIN teams t1 ON tr.initiating_team_id = t1.team_id
+                       JOIN teams t2 ON tr.receiving_team_id = t2.team_id
+                       ORDER BY tr.created_at DESC"""
+                )
+                trades = await cursor.fetchall()
+                trades_df = pd.DataFrame(trades, columns=['Trade_ID', 'Initiating_Team', 'Receiving_Team', 'Initiating_Players', 'Receiving_Players', 'Status', 'Created_At', 'Responded_At', 'Approved_At', 'Created_By_User_ID', 'Responded_By_User_ID', 'Approved_By_User_ID', 'Original_Trade_ID'])
+                trades_df = trades_df.fillna('')
+
+                # Export Settings
+                cursor = await db.execute(
+                    """SELECT setting_key as Setting_Key, setting_value as Setting_Value
+                       FROM settings ORDER BY setting_key"""
+                )
+                settings = await cursor.fetchall()
+                settings_df = pd.DataFrame(settings, columns=['Setting_Key', 'Setting_Value'])
+                settings_df = settings_df.fillna('')
+
+                # Export Starting Lineups
+                cursor = await db.execute(
+                    """SELECT t.team_name as Team_Name, sl.position_name as Position,
+                              p.name as Player_Name, sl.slot_number as Slot_Number
+                       FROM starting_lineups sl
+                       JOIN teams t ON sl.team_id = t.team_id
+                       LEFT JOIN players p ON sl.player_id = p.player_id
+                       ORDER BY t.team_name, sl.slot_number"""
+                )
+                starting_lineups = await cursor.fetchall()
+                starting_lineups_df = pd.DataFrame(starting_lineups, columns=['Team_Name', 'Position', 'Player_Name', 'Slot_Number'])
+                starting_lineups_df = starting_lineups_df.fillna('')
+
             # Create Excel file in memory
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -793,6 +846,10 @@ class AdminCommands(commands.Cog):
                 lineups_df.to_excel(writer, sheet_name='Lineups', index=False)
                 seasons_df.to_excel(writer, sheet_name='Seasons', index=False)
                 injuries_df.to_excel(writer, sheet_name='Injuries', index=False)
+                suspensions_df.to_excel(writer, sheet_name='Suspensions', index=False)
+                trades_df.to_excel(writer, sheet_name='Trades', index=False)
+                settings_df.to_excel(writer, sheet_name='Settings', index=False)
+                starting_lineups_df.to_excel(writer, sheet_name='Starting_Lineups', index=False)
                 
                 # Add instructions sheet
                 instructions = pd.DataFrame({
@@ -829,8 +886,19 @@ class AdminCommands(commands.Cog):
             
             # Send file
             file = discord.File(output, filename='league_data.xlsx')
+            stats = [
+                f"{len(teams_df)} teams",
+                f"{len(players_df)} players",
+                f"{len(lineups_df)} lineup positions",
+                f"{len(seasons_df)} seasons",
+                f"{len(injuries_df)} injuries",
+                f"{len(suspensions_df)} suspensions",
+                f"{len(trades_df)} trades",
+                f"{len(settings_df)} settings",
+                f"{len(starting_lineups_df)} starting lineup entries"
+            ]
             await interaction.followup.send(
-                f"✅ Exported {len(teams_df)} teams, {len(players_df)} players, {len(lineups_df)} lineup positions, {len(seasons_df)} seasons, and {len(injuries_df)} injuries",
+                f"✅ Exported: {', '.join(stats)}",
                 file=file,
                 ephemeral=True
             )
@@ -991,11 +1059,185 @@ class AdminCommands(commands.Cog):
                     await db.commit()
                 except Exception as e:
                     errors.append(f"Players sheet error: {str(e)}")
-            
+
+                # Import Seasons
+                seasons_imported = 0
+                try:
+                    seasons_df = pd.read_excel(excel_file, sheet_name='Seasons')
+                    for _, row in seasons_df.iterrows():
+                        try:
+                            await db.execute(
+                                """INSERT OR REPLACE INTO seasons
+                                   (season_number, current_round, regular_rounds, total_rounds, round_name, status)
+                                   VALUES (?, ?, ?, ?, ?, ?)""",
+                                (int(row['Season']), int(row['Current_Round']), int(row['Regular_Rounds']),
+                                 int(row['Total_Rounds']), str(row['Round_Name']), str(row['Status']))
+                            )
+                            seasons_imported += 1
+                        except Exception as e:
+                            errors.append(f"Season {row['Season']}: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Seasons' not in str(e):
+                        errors.append(f"Seasons sheet error: {str(e)}")
+
+                # Import Injuries
+                injuries_imported = 0
+                try:
+                    injuries_df = pd.read_excel(excel_file, sheet_name='Injuries')
+                    for _, row in injuries_df.iterrows():
+                        try:
+                            # Find player by name
+                            cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (str(row['Player_Name']),))
+                            player = await cursor.fetchone()
+                            if player:
+                                await db.execute(
+                                    """INSERT OR REPLACE INTO injuries
+                                       (player_id, injury_type, injury_round, recovery_rounds, return_round, status)
+                                       VALUES (?, ?, ?, ?, ?, ?)""",
+                                    (player[0], str(row['Injury_Type']), int(row['Injury_Round']),
+                                     int(row['Recovery_Rounds']), int(row['Return_Round']), str(row['Status']))
+                                )
+                                injuries_imported += 1
+                        except Exception as e:
+                            errors.append(f"Injury for {row['Player_Name']}: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Injuries' not in str(e):
+                        errors.append(f"Injuries sheet error: {str(e)}")
+
+                # Import Suspensions
+                suspensions_imported = 0
+                try:
+                    suspensions_df = pd.read_excel(excel_file, sheet_name='Suspensions')
+                    for _, row in suspensions_df.iterrows():
+                        try:
+                            # Find player by name
+                            cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (str(row['Player_Name']),))
+                            player = await cursor.fetchone()
+                            if player:
+                                await db.execute(
+                                    """INSERT OR REPLACE INTO suspensions
+                                       (player_id, suspension_round, suspension_duration, return_round, reason, status)
+                                       VALUES (?, ?, ?, ?, ?, ?)""",
+                                    (player[0], int(row['Suspension_Round']), int(row['Duration']),
+                                     int(row['Return_Round']), str(row['Reason']), str(row['Status']))
+                                )
+                                suspensions_imported += 1
+                        except Exception as e:
+                            errors.append(f"Suspension for {row['Player_Name']}: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Suspensions' not in str(e):
+                        errors.append(f"Suspensions sheet error: {str(e)}")
+
+                # Import Trades
+                trades_imported = 0
+                try:
+                    trades_df = pd.read_excel(excel_file, sheet_name='Trades', dtype={'Created_By_User_ID': str, 'Responded_By_User_ID': str, 'Approved_By_User_ID': str})
+                    for _, row in trades_df.iterrows():
+                        try:
+                            # Get team IDs
+                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Initiating_Team']),))
+                            init_team = await cursor.fetchone()
+                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Receiving_Team']),))
+                            recv_team = await cursor.fetchone()
+
+                            if init_team and recv_team:
+                                original_trade_id = int(row['Original_Trade_ID']) if pd.notna(row['Original_Trade_ID']) and row['Original_Trade_ID'] else None
+                                created_by = str(row['Created_By_User_ID']) if pd.notna(row['Created_By_User_ID']) and row['Created_By_User_ID'] else None
+                                responded_by = str(row['Responded_By_User_ID']) if pd.notna(row['Responded_By_User_ID']) and row['Responded_By_User_ID'] else None
+                                approved_by = str(row['Approved_By_User_ID']) if pd.notna(row['Approved_By_User_ID']) and row['Approved_By_User_ID'] else None
+                                created_at = str(row['Created_At']) if pd.notna(row['Created_At']) and row['Created_At'] else None
+                                responded_at = str(row['Responded_At']) if pd.notna(row['Responded_At']) and row['Responded_At'] else None
+                                approved_at = str(row['Approved_At']) if pd.notna(row['Approved_At']) and row['Approved_At'] else None
+
+                                await db.execute(
+                                    """INSERT OR REPLACE INTO trades
+                                       (trade_id, initiating_team_id, receiving_team_id, initiating_players, receiving_players,
+                                        status, created_at, responded_at, approved_at, created_by_user_id,
+                                        responded_by_user_id, approved_by_user_id, original_trade_id)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                    (int(row['Trade_ID']), init_team[0], recv_team[0], str(row['Initiating_Players']),
+                                     str(row['Receiving_Players']), str(row['Status']), created_at, responded_at,
+                                     approved_at, created_by, responded_by, approved_by, original_trade_id)
+                                )
+                                trades_imported += 1
+                        except Exception as e:
+                            errors.append(f"Trade {row['Trade_ID']}: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Trades' not in str(e):
+                        errors.append(f"Trades sheet error: {str(e)}")
+
+                # Import Settings
+                settings_imported = 0
+                try:
+                    settings_df = pd.read_excel(excel_file, sheet_name='Settings', dtype={'Setting_Value': str})
+                    for _, row in settings_df.iterrows():
+                        try:
+                            setting_value = str(row['Setting_Value']) if pd.notna(row['Setting_Value']) and row['Setting_Value'] else None
+                            await db.execute(
+                                """INSERT OR REPLACE INTO settings (setting_key, setting_value)
+                                   VALUES (?, ?)""",
+                                (str(row['Setting_Key']), setting_value)
+                            )
+                            settings_imported += 1
+                        except Exception as e:
+                            errors.append(f"Setting {row['Setting_Key']}: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Settings' not in str(e):
+                        errors.append(f"Settings sheet error: {str(e)}")
+
+                # Import Starting Lineups
+                starting_lineups_imported = 0
+                try:
+                    starting_lineups_df = pd.read_excel(excel_file, sheet_name='Starting_Lineups')
+                    for _, row in starting_lineups_df.iterrows():
+                        try:
+                            # Get team ID
+                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Team_Name']),))
+                            team = await cursor.fetchone()
+
+                            # Get player ID if player name is provided
+                            player_id = None
+                            if pd.notna(row['Player_Name']) and row['Player_Name']:
+                                cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (str(row['Player_Name']),))
+                                player = await cursor.fetchone()
+                                if player:
+                                    player_id = player[0]
+
+                            if team:
+                                await db.execute(
+                                    """INSERT OR REPLACE INTO starting_lineups (team_id, slot_number, position_name, player_id)
+                                       VALUES (?, ?, ?, ?)""",
+                                    (team[0], int(row['Slot_Number']), str(row['Position']), player_id)
+                                )
+                                starting_lineups_imported += 1
+                        except Exception as e:
+                            errors.append(f"Starting lineup for {row['Team_Name']}: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Starting_Lineups' not in str(e):
+                        errors.append(f"Starting Lineups sheet error: {str(e)}")
+
             # Build response
             response = "✅ **Import Complete!**\n\n"
             response += f"**Teams:** {teams_added} added, {teams_updated} updated\n"
             response += f"**Players:** {players_added} added, {players_updated} updated\n"
+            if seasons_imported > 0:
+                response += f"**Seasons:** {seasons_imported} imported\n"
+            if injuries_imported > 0:
+                response += f"**Injuries:** {injuries_imported} imported\n"
+            if suspensions_imported > 0:
+                response += f"**Suspensions:** {suspensions_imported} imported\n"
+            if trades_imported > 0:
+                response += f"**Trades:** {trades_imported} imported\n"
+            if settings_imported > 0:
+                response += f"**Settings:** {settings_imported} imported\n"
+            if starting_lineups_imported > 0:
+                response += f"**Starting Lineups:** {starting_lineups_imported} imported\n"
 
             if duplicate_warnings:
                 response += f"\n⚠️ **{len(duplicate_warnings)} Duplicate Name Warning(s):**\n"
