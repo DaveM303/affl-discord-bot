@@ -825,17 +825,15 @@ class AdminCommands(commands.Cog):
                 settings_df = pd.DataFrame(settings, columns=['Setting_Key', 'Setting_Value'])
                 settings_df = settings_df.fillna('')
 
-                # Export Starting Lineups
+                # Export Starting Lineups (stored as JSON)
                 cursor = await db.execute(
-                    """SELECT t.team_name as Team_Name, sl.position_name as Position,
-                              p.name as Player_Name, sl.slot_number as Slot_Number
+                    """SELECT t.team_name as Team_Name, sl.lineup_data as Lineup_Data
                        FROM starting_lineups sl
                        JOIN teams t ON sl.team_id = t.team_id
-                       LEFT JOIN players p ON sl.player_id = p.player_id
-                       ORDER BY t.team_name, sl.slot_number"""
+                       ORDER BY t.team_name"""
                 )
                 starting_lineups = await cursor.fetchall()
-                starting_lineups_df = pd.DataFrame(starting_lineups, columns=['Team_Name', 'Position', 'Player_Name', 'Slot_Number'])
+                starting_lineups_df = pd.DataFrame(starting_lineups, columns=['Team_Name', 'Lineup_Data'])
                 starting_lineups_df = starting_lineups_df.fillna('')
 
             # Create Excel file in memory
@@ -1200,19 +1198,12 @@ class AdminCommands(commands.Cog):
                             cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Team_Name']),))
                             team = await cursor.fetchone()
 
-                            # Get player ID if player name is provided
-                            player_id = None
-                            if pd.notna(row['Player_Name']) and row['Player_Name']:
-                                cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (str(row['Player_Name']),))
-                                player = await cursor.fetchone()
-                                if player:
-                                    player_id = player[0]
-
-                            if team:
+                            if team and pd.notna(row['Lineup_Data']) and row['Lineup_Data']:
+                                # Store the JSON lineup data directly
                                 await db.execute(
-                                    """INSERT OR REPLACE INTO starting_lineups (team_id, slot_number, position_name, player_id)
-                                       VALUES (?, ?, ?, ?)""",
-                                    (team[0], int(row['Slot_Number']), str(row['Position']), player_id)
+                                    """INSERT OR REPLACE INTO starting_lineups (team_id, lineup_data, last_updated)
+                                       VALUES (?, ?, CURRENT_TIMESTAMP)""",
+                                    (team[0], str(row['Lineup_Data']))
                                 )
                                 starting_lineups_imported += 1
                         except Exception as e:
