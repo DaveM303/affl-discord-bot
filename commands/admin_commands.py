@@ -788,15 +788,15 @@ class AdminCommands(commands.Cog):
                 # Export Suspensions
                 cursor = await db.execute(
                     """SELECT p.name as Player_Name, t.team_name as Team,
-                              s.suspension_round as Suspension_Round, s.suspension_duration as Duration,
-                              s.return_round as Return_Round, s.reason as Reason, s.status as Status
+                              s.suspension_round as Suspension_Round, s.games_missed as Games_Missed,
+                              s.return_round as Return_Round, s.suspension_reason as Reason, s.status as Status
                        FROM suspensions s
                        JOIN players p ON s.player_id = p.player_id
                        LEFT JOIN teams t ON p.team_id = t.team_id
                        ORDER BY s.status, s.return_round"""
                 )
                 suspensions = await cursor.fetchall()
-                suspensions_df = pd.DataFrame(suspensions, columns=['Player_Name', 'Team', 'Suspension_Round', 'Duration', 'Return_Round', 'Reason', 'Status'])
+                suspensions_df = pd.DataFrame(suspensions, columns=['Player_Name', 'Team', 'Suspension_Round', 'Games_Missed', 'Return_Round', 'Reason', 'Status'])
                 suspensions_df['Team'] = suspensions_df['Team'].fillna('Delisted')
 
                 # Export Trades
@@ -1118,9 +1118,9 @@ class AdminCommands(commands.Cog):
                             if player:
                                 await db.execute(
                                     """INSERT OR REPLACE INTO suspensions
-                                       (player_id, suspension_round, suspension_duration, return_round, reason, status)
+                                       (player_id, suspension_round, games_missed, return_round, suspension_reason, status)
                                        VALUES (?, ?, ?, ?, ?, ?)""",
-                                    (player[0], int(row['Suspension_Round']), int(row['Duration']),
+                                    (player[0], int(row['Suspension_Round']), int(row['Games_Missed']),
                                      int(row['Return_Round']), str(row['Reason']), str(row['Status']))
                                 )
                                 suspensions_imported += 1
