@@ -41,6 +41,31 @@ class AdminCommands(commands.Cog):
         # Return up to 25 choices (Discord limit)
         return choices[:25]
 
+    async def team_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete for team names"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT team_name FROM teams ORDER BY team_name"
+            )
+            teams = await cursor.fetchall()
+
+        # Filter teams based on what the user has typed
+        choices = []
+        for (team_name,) in teams:
+            if current.lower() in team_name.lower():
+                choices.append(app_commands.Choice(name=team_name, value=team_name))
+
+        # Add special "delisted" option
+        if current.lower() in "delisted":
+            choices.insert(0, app_commands.Choice(name="delisted", value="delisted"))
+
+        # Return up to 25 choices (Discord limit)
+        return choices[:25]
+
     async def position_autocomplete(
         self,
         interaction: discord.Interaction,
@@ -510,7 +535,7 @@ class AdminCommands(commands.Cog):
         position="New position (optional)",
         team="New team (optional, use 'delisted' to release)"
     )
-    @app_commands.autocomplete(position=position_autocomplete, name=player_name_autocomplete)
+    @app_commands.autocomplete(position=position_autocomplete, name=player_name_autocomplete, team=team_autocomplete)
     async def update_player(
         self,
         interaction: discord.Interaction,

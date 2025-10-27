@@ -284,13 +284,32 @@ class LineupCommands(commands.Cog):
 
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="delist", description="Delist a player from your team (offseason only)")
+    @app_commands.command(name="delist", description="Delist player(s) from your team (offseason only)")
     @app_commands.describe(
-        player_name="Player to delist",
-        team_name="[ADMIN ONLY] Team name to delist player from"
+        player1="First player to delist",
+        player2="Second player to delist (optional)",
+        player3="Third player to delist (optional)",
+        player4="Fourth player to delist (optional)",
+        player5="Fifth player to delist (optional)",
+        player6="Sixth player to delist (optional)",
+        player7="Seventh player to delist (optional)",
+        player8="Eighth player to delist (optional)",
+        team_name="[ADMIN ONLY] Team name to delist players from"
     )
     @app_commands.autocomplete(team_name=team_autocomplete)
-    async def delist_player(self, interaction: discord.Interaction, player_name: str, team_name: str = None):
+    async def delist_player(
+        self,
+        interaction: discord.Interaction,
+        player1: str,
+        player2: str = None,
+        player3: str = None,
+        player4: str = None,
+        player5: str = None,
+        player6: str = None,
+        player7: str = None,
+        player8: str = None,
+        team_name: str = None
+    ):
         # If team_name specified, check if user is admin
         if team_name:
             if not await self.is_admin(interaction):
@@ -339,44 +358,48 @@ class LineupCommands(commands.Cog):
                 )
                 return
 
-            # Find player by name on this team
-            cursor = await db.execute(
-                """SELECT player_id, name, position, overall_rating, age FROM players
-                   WHERE team_id = ? AND LOWER(name) LIKE LOWER(?)
-                   ORDER BY name LIMIT 5""",
-                (team_id, f"%{player_name}%")
-            )
-            matches = await cursor.fetchall()
+            # Collect all player names
+            player_names = [player1, player2, player3, player4, player5, player6, player7, player8]
+            player_names = [p for p in player_names if p is not None]  # Remove None values
 
-            if not matches:
-                await interaction.response.send_message(
-                    f"❌ No player found matching '{player_name}' on your team.",
-                    ephemeral=True
+            delisted_players = []
+            errors = []
+
+            for player_name in player_names:
+                # Find player by name on this team
+                cursor = await db.execute(
+                    """SELECT player_id, name, position, overall_rating, age FROM players
+                       WHERE team_id = ? AND LOWER(name) LIKE LOWER(?)
+                       ORDER BY name LIMIT 5""",
+                    (team_id, f"%{player_name}%")
                 )
-                return
+                matches = await cursor.fetchall()
 
-            if len(matches) > 1:
-                # Multiple matches - list them
-                names = [f"• {name}" for _, name, _, _, _ in matches]
-                await interaction.response.send_message(
-                    f"❌ Multiple players match '{player_name}':\n" + "\n".join(names) + "\n\nPlease be more specific.",
-                    ephemeral=True
+                if not matches:
+                    errors.append(f"❌ No player found matching '{player_name}'")
+                    continue
+
+                if len(matches) > 1:
+                    # Multiple matches - list them
+                    names = [f"• {name}" for _, name, _, _, _ in matches]
+                    errors.append(f"❌ Multiple players match '{player_name}':\n" + "\n".join(names))
+                    continue
+
+                player_id, full_name, position, rating, age = matches[0]
+
+                # Delist the player
+                await db.execute(
+                    "UPDATE players SET team_id = NULL WHERE player_id = ?",
+                    (player_id,)
                 )
-                return
 
-            player_id, full_name, position, rating, age = matches[0]
+                # Remove from lineups
+                await db.execute(
+                    "DELETE FROM lineups WHERE player_id = ?",
+                    (player_id,)
+                )
 
-            # Delist the player
-            await db.execute(
-                "UPDATE players SET team_id = NULL WHERE player_id = ?",
-                (player_id,)
-            )
-
-            # Remove from lineups
-            await db.execute(
-                "DELETE FROM lineups WHERE player_id = ?",
-                (player_id,)
-            )
+                delisted_players.append((full_name, position, rating, age))
 
             await db.commit()
 
@@ -386,22 +409,50 @@ class LineupCommands(commands.Cog):
             )
             result = await cursor.fetchone()
 
-        await interaction.response.send_message(
-            f"✅ **{full_name}** has been delisted from **{team_name}**."
-        )
+        # Build response message
+        response = ""
+        if delisted_players:
+            if len(delisted_players) == 1:
+                response += f"✅ **{delisted_players[0][0]}** has been delisted from **{team_name}**."
+            else:
+                player_list = ", ".join([f"**{name}**" for name, _, _, _ in delisted_players])
+                response += f"✅ {len(delisted_players)} players delisted from **{team_name}**: {player_list}"
+
+        if errors:
+            if response:
+                response += "\n\n"
+            response += "\n".join(errors)
+
+        await interaction.response.send_message(response)
 
         # Log to delist channel if configured
-        if result and result[0]:
+        if result and result[0] and delisted_players:
             try:
                 log_channel = interaction.guild.get_channel(int(result[0]))
                 if log_channel:
-                    embed = discord.Embed(
-                        title="Player Delisted",
-                        color=discord.Color.red(),
-                        description=f"**{full_name}** ({position}, {rating} OVR, {age}yo) has been delisted from **{team_name}**."
-                    )
-                    embed.set_footer(text=f"Delisted by {interaction.user.display_name}")
-                    await log_channel.send(embed=embed)
+                    if len(delisted_players) == 1:
+                        full_name, position, rating, age = delisted_players[0]
+                        embed = discord.Embed(
+                            title="Player Delisted",
+                            color=discord.Color.red(),
+                            description=f"**{full_name}** ({position}, {rating} OVR, {age}yo) has been delisted from **{team_name}**."
+                        )
+                        embed.set_footer(text=f"Delisted by {interaction.user.display_name}")
+                        await log_channel.send(embed=embed)
+                    else:
+                        embed = discord.Embed(
+                            title=f"{len(delisted_players)} Players Delisted",
+                            color=discord.Color.red(),
+                            description=f"**{team_name}** delisted:"
+                        )
+                        for full_name, position, rating, age in delisted_players:
+                            embed.add_field(
+                                name=full_name,
+                                value=f"{position}, {rating} OVR, {age}yo",
+                                inline=True
+                            )
+                        embed.set_footer(text=f"Delisted by {interaction.user.display_name}")
+                        await log_channel.send(embed=embed)
             except Exception as e:
                 # Don't fail the command if logging fails
                 print(f"Failed to log delist: {e}")
