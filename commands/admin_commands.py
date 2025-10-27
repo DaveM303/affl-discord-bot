@@ -4,6 +4,7 @@ from discord import app_commands
 import aiosqlite
 import pandas as pd
 import io
+import json
 from config import DB_PATH, ADMIN_ROLE_ID
 from positions import validate_position, get_positions_string
 
