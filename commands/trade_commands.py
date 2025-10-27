@@ -196,13 +196,22 @@ class TradeCommands(commands.Cog):
 
 class TradeMenuView(discord.ui.View):
     """Central hub for viewing and managing trades"""
-    def __init__(self, team_id, team_name, bot, guild):
+    def __init__(self, team_id, team_name, bot, guild, specific_trade_id=None):
         super().__init__(timeout=600)
         self.team_id = team_id
         self.team_name = team_name
         self.bot = bot
         self.guild = guild
         self.current_view = "main"  # Track current view: "main", "incoming", "outgoing"
+        self.incoming_page = 0  # Current page for incoming offers
+        self.outgoing_page = 0  # Current page for outgoing offers
+        self.incoming_trades = []  # List of incoming trade IDs
+        self.outgoing_trades = []  # List of outgoing trade IDs
+        self.specific_trade_id = specific_trade_id  # If opening to a specific trade
+
+        # If opening to specific trade, set up the view
+        if specific_trade_id:
+            self.current_view = "incoming"
 
     async def update_view(self, interaction: discord.Interaction):
         """Update the message with current view"""
@@ -212,11 +221,11 @@ class TradeMenuView(discord.ui.View):
             embed = await self.create_main_embed()
             self.add_main_buttons()
         elif self.current_view == "incoming":
-            embed = await self.create_incoming_embed()
-            self.add_back_button()
+            embed = await self.create_incoming_page_embed()
+            await self.add_incoming_page_buttons()
         elif self.current_view == "outgoing":
-            embed = await self.create_outgoing_embed()
-            await self.add_outgoing_buttons()
+            embed = await self.create_outgoing_page_embed()
+            await self.add_outgoing_page_buttons()
 
         await interaction.response.edit_message(embed=embed, view=self)
 
@@ -234,83 +243,6 @@ class TradeMenuView(discord.ui.View):
         refresh.callback = self.refresh_callback
         self.add_item(refresh)
 
-    def add_back_button(self):
-        """Add back button to return to main menu"""
-        back = discord.ui.Button(label="← Back to Main Menu", style=discord.ButtonStyle.secondary, row=0)
-        back.callback = self.back_callback
-        self.add_item(back)
-
-    async def add_outgoing_buttons(self):
-        """Add buttons for outgoing view (includes withdraw)"""
-        # Get pending outgoing trades for withdraw dropdown
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                """SELECT tr.trade_id, t2.team_name, t2.emoji_id
-                   FROM trades tr
-                   JOIN teams t2 ON tr.receiving_team_id = t2.team_id
-                   WHERE tr.initiating_team_id = ? AND tr.status = 'pending'
-                   ORDER BY tr.created_at DESC
-                   LIMIT 25""",
-                (self.team_id,)
-            )
-            pending_trades = await cursor.fetchall()
-
-        back = discord.ui.Button(label="← Back to Main Menu", style=discord.ButtonStyle.secondary, row=0)
-        back.callback = self.back_callback
-        self.add_item(back)
-
-        # Add withdraw dropdown if there are pending trades
-        if pending_trades:
-            withdraw_select = WithdrawTradeSelect(self, pending_trades)
-            self.add_item(withdraw_select)
-
-            # Add confirm withdraw button
-            confirm_withdraw = discord.ui.Button(label="Confirm Withdraw", style=discord.ButtonStyle.danger, row=2)
-            confirm_withdraw.callback = self.confirm_withdraw_callback
-            self.add_item(confirm_withdraw)
-
-    async def confirm_withdraw_callback(self, interaction: discord.Interaction):
-        """Confirm and execute the withdrawal"""
-        if not hasattr(self, 'selected_trade_id') or self.selected_trade_id is None:
-            await interaction.response.send_message("❌ Please select a trade offer to withdraw first.", ephemeral=True)
-            return
-
-        # Verify trade is still pending and belongs to user
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                """SELECT status, t2.team_name
-                   FROM trades tr
-                   JOIN teams t2 ON tr.receiving_team_id = t2.team_id
-                   WHERE tr.trade_id = ? AND tr.initiating_team_id = ?""",
-                (self.selected_trade_id, self.team_id)
-            )
-            result = await cursor.fetchone()
-
-            if not result:
-                await interaction.response.send_message("❌ Trade not found or you don't have permission to withdraw it.", ephemeral=True)
-                return
-
-            if result[0] != 'pending':
-                await interaction.response.send_message(f"❌ This trade is {result[0]} and cannot be withdrawn.", ephemeral=True)
-                return
-
-            team_name = result[1]
-
-            # Withdraw the trade
-            await db.execute(
-                "UPDATE trades SET status = 'withdrawn' WHERE trade_id = ?",
-                (self.selected_trade_id,)
-            )
-            await db.commit()
-
-        await interaction.response.send_message(f"✅ Trade offer with **{team_name}** has been withdrawn.", ephemeral=True)
-
-        # Reset selection
-        self.selected_trade_id = None
-
-        # Refresh the view
-        self.current_view = "outgoing"
-        await self.update_view(interaction)
 
     async def view_incoming_callback(self, interaction: discord.Interaction):
         self.current_view = "incoming"
@@ -369,182 +301,411 @@ class TradeMenuView(discord.ui.View):
 
         return embed
 
-    async def create_incoming_embed(self):
-        """Create embed for incoming offers view"""
+    async def create_incoming_page_embed(self):
+        """Create embed for single incoming offer (paginated)"""
         async with aiosqlite.connect(DB_PATH) as db:
+            # Get all pending incoming trades
             cursor = await db.execute(
-                """SELECT tr.trade_id, t1.team_name, t1.emoji_id, tr.initiating_players, tr.receiving_players
+                """SELECT tr.trade_id
                    FROM trades tr
-                   JOIN teams t1 ON tr.initiating_team_id = t1.team_id
                    WHERE tr.receiving_team_id = ? AND tr.status = 'pending'
                    ORDER BY tr.created_at DESC""",
                 (self.team_id,)
             )
-            offers = await cursor.fetchall()
+            self.incoming_trades = [row[0] for row in await cursor.fetchall()]
 
-            embed = discord.Embed(
-                title="📥 Incoming Trade Offers",
-                description="Pending offers awaiting your response",
-                color=discord.Color.blue()
-            )
-
-            if not offers:
-                embed.description = "📭 You have no pending incoming trade offers."
+            if not self.incoming_trades:
+                embed = discord.Embed(
+                    title="📥 Incoming Trade Offers",
+                    description="📭 You have no pending incoming trade offers.",
+                    color=discord.Color.blue()
+                )
                 return embed
 
-            for trade_id, team_name, emoji_id, init_players_json, recv_players_json in offers:
-                # Get emojis
-                team_emoji = self.bot.get_emoji(int(emoji_id)) if emoji_id else None
-                team_emoji_str = f"{team_emoji} " if team_emoji else ""
+            # If specific trade ID is set, find its index
+            if self.specific_trade_id and self.specific_trade_id in self.incoming_trades:
+                self.incoming_page = self.incoming_trades.index(self.specific_trade_id)
+                self.specific_trade_id = None  # Clear it after using
 
-                # Get player names
-                init_players = json.loads(init_players_json) if init_players_json else []
-                recv_players = json.loads(recv_players_json) if recv_players_json else []
+            # Ensure page is within bounds
+            if self.incoming_page >= len(self.incoming_trades):
+                self.incoming_page = 0
 
-                init_names = []
-                recv_names = []
+            # Get current trade
+            current_trade_id = self.incoming_trades[self.incoming_page]
 
-                if init_players:
-                    placeholders = ','.join('?' * len(init_players))
-                    cursor = await db.execute(
-                        f"SELECT name FROM players WHERE player_id IN ({placeholders})",
-                        init_players
-                    )
-                    init_names = [name for (name,) in await cursor.fetchall()]
+            cursor = await db.execute(
+                """SELECT tr.trade_id, t1.team_name, t1.emoji_id, t2.emoji_id, tr.initiating_players, tr.receiving_players
+                   FROM trades tr
+                   JOIN teams t1 ON tr.initiating_team_id = t1.team_id
+                   JOIN teams t2 ON tr.receiving_team_id = t2.team_id
+                   WHERE tr.trade_id = ?""",
+                (current_trade_id,)
+            )
+            trade_data = await cursor.fetchone()
 
-                if recv_players:
-                    placeholders = ','.join('?' * len(recv_players))
-                    cursor = await db.execute(
-                        f"SELECT name FROM players WHERE player_id IN ({placeholders})",
-                        recv_players
-                    )
-                    recv_names = [name for (name,) in await cursor.fetchall()]
-
-                # Format offer
-                you_get = ", ".join(init_names) if init_names else "Nothing"
-                they_get = ", ".join(recv_names) if recv_names else "Nothing"
-
-                embed.add_field(
-                    name=f"🟡 {team_emoji_str}**{team_name}**",
-                    value=f"**You receive:** {you_get}\n**They receive:** {they_get}",
-                    inline=False
+            if not trade_data:
+                embed = discord.Embed(
+                    title="📥 Incoming Trade Offers",
+                    description="❌ Trade not found.",
+                    color=discord.Color.red()
                 )
+                return embed
+
+            trade_id, team_name, team_emoji_id, your_emoji_id, init_players_json, recv_players_json = trade_data
+
+            # Get emojis
+            team_emoji = self.bot.get_emoji(int(team_emoji_id)) if team_emoji_id else None
+            your_emoji = self.bot.get_emoji(int(your_emoji_id)) if your_emoji_id else None
+            team_emoji_str = f"{team_emoji} " if team_emoji else ""
+            your_emoji_str = f"{your_emoji} " if your_emoji else ""
+
+            embed = discord.Embed(
+                title=f"{team_emoji_str}**{team_name}** have sent you a trade offer!",
+                color=discord.Color.gold()
+            )
+
+            # Get player names
+            init_players = json.loads(init_players_json) if init_players_json else []
+            recv_players = json.loads(recv_players_json) if recv_players_json else []
+
+            init_names = []
+            recv_names = []
+
+            if init_players:
+                placeholders = ','.join('?' * len(init_players))
+                cursor = await db.execute(
+                    f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                    init_players
+                )
+                init_names = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
+
+            if recv_players:
+                placeholders = ','.join('?' * len(recv_players))
+                cursor = await db.execute(
+                    f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                    recv_players
+                )
+                recv_names = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
+
+            embed.add_field(
+                name=f"**{your_emoji_str}receive:**",
+                value="\n".join(init_names) if init_names else "*Nothing*",
+                inline=True
+            )
+
+            embed.add_field(
+                name=f"**{team_emoji_str}receive:**",
+                value="\n".join(recv_names) if recv_names else "*Nothing*",
+                inline=True
+            )
+
+            embed.set_footer(text=f"Offer {self.incoming_page + 1} of {len(self.incoming_trades)}")
 
         return embed
 
-    async def create_outgoing_embed(self):
-        """Create embed for outgoing offers view"""
+    async def create_outgoing_page_embed(self):
+        """Create embed for single outgoing offer (paginated)"""
         async with aiosqlite.connect(DB_PATH) as db:
+            # Get all pending outgoing trades
             cursor = await db.execute(
-                """SELECT tr.trade_id, t2.team_name, t2.emoji_id, tr.initiating_players, tr.receiving_players
+                """SELECT tr.trade_id
                    FROM trades tr
-                   JOIN teams t2 ON tr.receiving_team_id = t2.team_id
                    WHERE tr.initiating_team_id = ? AND tr.status = 'pending'
                    ORDER BY tr.created_at DESC""",
                 (self.team_id,)
             )
-            offers = await cursor.fetchall()
+            self.outgoing_trades = [row[0] for row in await cursor.fetchall()]
+
+            if not self.outgoing_trades:
+                embed = discord.Embed(
+                    title="📤 Outgoing Trade Offers",
+                    description="📭 You have no pending outgoing trade offers.",
+                    color=discord.Color.orange()
+                )
+                return embed
+
+            # Ensure page is within bounds
+            if self.outgoing_page >= len(self.outgoing_trades):
+                self.outgoing_page = 0
+
+            # Get current trade
+            current_trade_id = self.outgoing_trades[self.outgoing_page]
+
+            cursor = await db.execute(
+                """SELECT tr.trade_id, t1.emoji_id, t2.team_name, t2.emoji_id, tr.initiating_players, tr.receiving_players
+                   FROM trades tr
+                   JOIN teams t1 ON tr.initiating_team_id = t1.team_id
+                   JOIN teams t2 ON tr.receiving_team_id = t2.team_id
+                   WHERE tr.trade_id = ?""",
+                (current_trade_id,)
+            )
+            trade_data = await cursor.fetchone()
+
+            if not trade_data:
+                embed = discord.Embed(
+                    title="📤 Outgoing Trade Offers",
+                    description="❌ Trade not found.",
+                    color=discord.Color.red()
+                )
+                return embed
+
+            _, your_emoji_id, team_name, team_emoji_id, init_players_json, recv_players_json = trade_data
+
+            # Get emojis
+            team_emoji = self.bot.get_emoji(int(team_emoji_id)) if team_emoji_id else None
+            your_emoji = self.bot.get_emoji(int(your_emoji_id)) if your_emoji_id else None
+            team_emoji_str = f"{team_emoji} " if team_emoji else ""
+            your_emoji_str = f"{your_emoji} " if your_emoji else ""
 
             embed = discord.Embed(
-                title="📤 Outgoing Trade Offers",
-                description="Your pending offers awaiting response",
+                title=f"📤 Trade Offer to {team_emoji_str}**{team_name}**",
                 color=discord.Color.orange()
             )
 
-            if not offers:
-                embed.description = "📭 You have no pending outgoing trade offers."
-                return embed
+            # Get player names
+            init_players = json.loads(init_players_json) if init_players_json else []
+            recv_players = json.loads(recv_players_json) if recv_players_json else []
 
-            for trade_id, team_name, emoji_id, init_players_json, recv_players_json in offers:
-                # Get emojis
-                team_emoji = self.bot.get_emoji(int(emoji_id)) if emoji_id else None
-                team_emoji_str = f"{team_emoji} " if team_emoji else ""
+            init_names = []
+            recv_names = []
 
-                # Get player names
-                init_players = json.loads(init_players_json) if init_players_json else []
-                recv_players = json.loads(recv_players_json) if recv_players_json else []
-
-                init_names = []
-                recv_names = []
-
-                if init_players:
-                    placeholders = ','.join('?' * len(init_players))
-                    cursor = await db.execute(
-                        f"SELECT name FROM players WHERE player_id IN ({placeholders})",
-                        init_players
-                    )
-                    init_names = [name for (name,) in await cursor.fetchall()]
-
-                if recv_players:
-                    placeholders = ','.join('?' * len(recv_players))
-                    cursor = await db.execute(
-                        f"SELECT name FROM players WHERE player_id IN ({placeholders})",
-                        recv_players
-                    )
-                    recv_names = [name for (name,) in await cursor.fetchall()]
-
-                # Format offer
-                you_give = ", ".join(init_names) if init_names else "Nothing"
-                you_get = ", ".join(recv_names) if recv_names else "Nothing"
-
-                # Add withdraw button data to field name for identification
-                embed.add_field(
-                    name=f"🟡 {team_emoji_str}**{team_name}** • Trade ID: {trade_id}",
-                    value=f"**You offer:** {you_give}\n**You receive:** {you_get}",
-                    inline=False
+            if init_players:
+                placeholders = ','.join('?' * len(init_players))
+                cursor = await db.execute(
+                    f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                    init_players
                 )
+                init_names = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
+
+            if recv_players:
+                placeholders = ','.join('?' * len(recv_players))
+                cursor = await db.execute(
+                    f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                    recv_players
+                )
+                recv_names = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
+
+            embed.add_field(
+                name=f"**{team_emoji_str}receive:**",
+                value="\n".join(init_names) if init_names else "*Nothing*",
+                inline=True
+            )
+
+            embed.add_field(
+                name=f"**{your_emoji_str}receive:**",
+                value="\n".join(recv_names) if recv_names else "*Nothing*",
+                inline=True
+            )
+
+            embed.set_footer(text=f"Offer {self.outgoing_page + 1} of {len(self.outgoing_trades)}")
 
         return embed
 
+    async def add_incoming_page_buttons(self):
+        """Add buttons for incoming offers page view"""
+        # Navigation buttons
+        if len(self.incoming_trades) > 1:
+            prev_btn = discord.ui.Button(label="◀ Previous", style=discord.ButtonStyle.secondary, row=0)
+            prev_btn.callback = self.prev_incoming_callback
+            self.add_item(prev_btn)
 
-class WithdrawTradeSelect(discord.ui.Select):
-    """Dropdown for selecting which trade to withdraw"""
-    def __init__(self, parent_view, pending_trades):
-        self.parent_view = parent_view
+            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, row=0)
+            next_btn.callback = self.next_incoming_callback
+            self.add_item(next_btn)
 
-        # Create options from pending trades
-        options = []
-        for trade_id, team_name, emoji_id in pending_trades:
-            emoji = parent_view.bot.get_emoji(int(emoji_id)) if emoji_id else None
-            label = f"{team_name}"
-            if emoji:
-                options.append(discord.SelectOption(
-                    label=label,
-                    value=str(trade_id),
-                    emoji=emoji
-                ))
-            else:
-                options.append(discord.SelectOption(
-                    label=label,
-                    value=str(trade_id)
-                ))
+        # Action buttons
+        if self.incoming_trades:
+            accept_btn = discord.ui.Button(label="Accept", style=discord.ButtonStyle.green, row=1)
+            accept_btn.callback = self.accept_incoming_callback
+            self.add_item(accept_btn)
 
-        super().__init__(
-            placeholder="Select a trade offer to withdraw...",
-            options=options,
-            row=1
-        )
+            decline_btn = discord.ui.Button(label="Decline", style=discord.ButtonStyle.red, row=1)
+            decline_btn.callback = self.decline_incoming_callback
+            self.add_item(decline_btn)
 
-    async def callback(self, interaction: discord.Interaction):
-        # Store the selected trade ID in the parent view
-        self.parent_view.selected_trade_id = int(self.values[0])
+            counter_btn = discord.ui.Button(label="Send Counter Offer", style=discord.ButtonStyle.blurple, row=1)
+            counter_btn.callback = self.counter_incoming_callback
+            self.add_item(counter_btn)
 
-        # Get team name for confirmation message
+        # Back button
+        back_btn = discord.ui.Button(label="← Back to Main Menu", style=discord.ButtonStyle.secondary, row=2)
+        back_btn.callback = self.back_callback
+        self.add_item(back_btn)
+
+    async def add_outgoing_page_buttons(self):
+        """Add buttons for outgoing offers page view"""
+        # Navigation buttons
+        if len(self.outgoing_trades) > 1:
+            prev_btn = discord.ui.Button(label="◀ Previous", style=discord.ButtonStyle.secondary, row=0)
+            prev_btn.callback = self.prev_outgoing_callback
+            self.add_item(prev_btn)
+
+            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, row=0)
+            next_btn.callback = self.next_outgoing_callback
+            self.add_item(next_btn)
+
+        # Withdraw button
+        if self.outgoing_trades:
+            withdraw_btn = discord.ui.Button(label="Withdraw Offer", style=discord.ButtonStyle.danger, row=1)
+            withdraw_btn.callback = self.withdraw_outgoing_callback
+            self.add_item(withdraw_btn)
+
+        # Back button
+        back_btn = discord.ui.Button(label="← Back to Main Menu", style=discord.ButtonStyle.secondary, row=2)
+        back_btn.callback = self.back_callback
+        self.add_item(back_btn)
+
+    async def prev_incoming_callback(self, interaction: discord.Interaction):
+        self.incoming_page = (self.incoming_page - 1) % len(self.incoming_trades)
+        await self.update_view(interaction)
+
+    async def next_incoming_callback(self, interaction: discord.Interaction):
+        self.incoming_page = (self.incoming_page + 1) % len(self.incoming_trades)
+        await self.update_view(interaction)
+
+    async def prev_outgoing_callback(self, interaction: discord.Interaction):
+        self.outgoing_page = (self.outgoing_page - 1) % len(self.outgoing_trades)
+        await self.update_view(interaction)
+
+    async def next_outgoing_callback(self, interaction: discord.Interaction):
+        self.outgoing_page = (self.outgoing_page + 1) % len(self.outgoing_trades)
+        await self.update_view(interaction)
+
+    async def accept_incoming_callback(self, interaction: discord.Interaction):
+        """Accept the current incoming trade offer"""
+        if not self.incoming_trades:
+            await interaction.response.send_message("❌ No trade to accept!", ephemeral=True)
+            return
+
+        trade_id = self.incoming_trades[self.incoming_page]
+
+        # Use the existing accept logic from TradeResponseView
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """UPDATE trades SET status = 'accepted', responded_at = CURRENT_TIMESTAMP,
+                   responded_by_user_id = ? WHERE trade_id = ?""",
+                (str(interaction.user.id), trade_id)
+            )
+            await db.commit()
+
+        await interaction.response.send_message("✅ Trade accepted! Sent to moderators for approval.", ephemeral=True)
+
+        # Refresh view (will show next trade or go back to main)
+        self.incoming_trades.pop(self.incoming_page)
+        if self.incoming_page >= len(self.incoming_trades) and self.incoming_page > 0:
+            self.incoming_page -= 1
+
+        if not self.incoming_trades:
+            self.current_view = "main"
+
+        await self.update_view(interaction)
+
+    async def decline_incoming_callback(self, interaction: discord.Interaction):
+        """Decline the current incoming trade offer"""
+        if not self.incoming_trades:
+            await interaction.response.send_message("❌ No trade to decline!", ephemeral=True)
+            return
+
+        trade_id = self.incoming_trades[self.incoming_page]
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """UPDATE trades SET status = 'declined', responded_at = CURRENT_TIMESTAMP,
+                   responded_by_user_id = ? WHERE trade_id = ?""",
+                (str(interaction.user.id), trade_id)
+            )
+            await db.commit()
+
+        await interaction.response.send_message("✅ Trade declined.", ephemeral=True)
+
+        # Refresh view
+        self.incoming_trades.pop(self.incoming_page)
+        if self.incoming_page >= len(self.incoming_trades) and self.incoming_page > 0:
+            self.incoming_page -= 1
+
+        if not self.incoming_trades:
+            self.current_view = "main"
+
+        await self.update_view(interaction)
+
+    async def counter_incoming_callback(self, interaction: discord.Interaction):
+        """Send counter offer for the current incoming trade"""
+        if not self.incoming_trades:
+            await interaction.response.send_message("❌ No trade to counter!", ephemeral=True)
+            return
+
+        trade_id = self.incoming_trades[self.incoming_page]
+
+        # Get trade details and open counter offer view
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
-                """SELECT t2.team_name
-                   FROM trades tr
-                   JOIN teams t2 ON tr.receiving_team_id = t2.team_id
-                   WHERE tr.trade_id = ?""",
-                (self.parent_view.selected_trade_id,)
+                """SELECT receiving_team_id, initiating_team_id, initiating_players, receiving_players
+                   FROM trades WHERE trade_id = ?""",
+                (trade_id,)
             )
             result = await cursor.fetchone()
-            team_name = result[0] if result else "Unknown"
 
-        await interaction.response.send_message(
-            f"✓ Selected trade with **{team_name}**. Click 'Confirm Withdraw' to withdraw this offer.",
-            ephemeral=True
+            if not result:
+                await interaction.response.send_message("❌ Trade not found!", ephemeral=True)
+                return
+
+            receiving_team_id, initiating_team_id, init_players_json, recv_players_json = result
+
+            cursor = await db.execute(
+                "SELECT team_name FROM teams WHERE team_id = ?",
+                (receiving_team_id,)
+            )
+            team_result = await cursor.fetchone()
+
+        # Open trade offer view as counter offer
+        from commands.trade_commands import TradeOfferView
+        view = TradeOfferView(
+            receiving_team_id,
+            team_result[0],
+            interaction.user.id,
+            self.bot,
+            self.guild,
+            is_counter_offer=True,
+            original_trade_id=trade_id,
+            receiving_team_id=initiating_team_id
         )
+
+        # Swap the players
+        view.initiating_players = json.loads(recv_players_json) if recv_players_json else []
+        view.receiving_players = json.loads(init_players_json) if init_players_json else []
+
+        await view.initialize()
+        embed = view.create_embed()
+
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    async def withdraw_outgoing_callback(self, interaction: discord.Interaction):
+        """Withdraw the current outgoing trade offer"""
+        if not self.outgoing_trades:
+            await interaction.response.send_message("❌ No trade to withdraw!", ephemeral=True)
+            return
+
+        trade_id = self.outgoing_trades[self.outgoing_page]
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE trades SET status = 'withdrawn' WHERE trade_id = ?",
+                (trade_id,)
+            )
+            await db.commit()
+
+        await interaction.response.send_message("✅ Trade offer withdrawn.", ephemeral=True)
+
+        # Refresh view
+        self.outgoing_trades.pop(self.outgoing_page)
+        if self.outgoing_page >= len(self.outgoing_trades) and self.outgoing_page > 0:
+            self.outgoing_page -= 1
+
+        if not self.outgoing_trades:
+            self.current_view = "main"
+
+        await self.update_view(interaction)
 
 
 class TradeOfferView(discord.ui.View):
@@ -934,12 +1095,12 @@ class TradeResponseView(discord.ui.View):
         self.trade_id = trade_id
         self.bot = bot
 
-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.green, custom_id="accept_trade")
-    async def accept_trade(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Verify user has the team role
+    @discord.ui.button(label="Respond to Offer", style=discord.ButtonStyle.primary, custom_id="respond_trade")
+    async def respond_trade(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Verify user has the team role and get team info
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
-                """SELECT receiving_team_id, initiating_team_id, status
+                """SELECT receiving_team_id, status
                    FROM trades WHERE trade_id = ?""",
                 (self.trade_id,)
             )
@@ -949,176 +1110,7 @@ class TradeResponseView(discord.ui.View):
                 await interaction.response.send_message("❌ Trade not found!", ephemeral=True)
                 return
 
-            receiving_team_id, initiating_team_id, status = result
-
-            if status != 'pending':
-                await interaction.response.send_message("❌ This trade is no longer active!", ephemeral=True)
-                return
-
-            # Check if user has the receiving team role
-            cursor = await db.execute(
-                "SELECT role_id FROM teams WHERE team_id = ?",
-                (receiving_team_id,)
-            )
-            role_result = await cursor.fetchone()
-
-        if role_result and role_result[0]:
-            role = interaction.guild.get_role(int(role_result[0]))
-            if not role or role not in interaction.user.roles:
-                await interaction.response.send_message("❌ You don't have permission to accept this trade!", ephemeral=True)
-                return
-
-        # Update trade status
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                """UPDATE trades SET status = 'accepted', responded_at = CURRENT_TIMESTAMP,
-                   responded_by_user_id = ? WHERE trade_id = ?""",
-                (str(interaction.user.id), self.trade_id)
-            )
-            await db.commit()
-
-        # Send to moderator approval channel
-        await self.send_to_moderators(interaction)
-
-        # Disable buttons
-        for item in self.children:
-            item.disabled = True
-
-        await interaction.response.edit_message(view=self)
-        await interaction.followup.send("✅ Trade accepted! Sent to moderators for approval.", ephemeral=True)
-
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.red, custom_id="decline_trade")
-    async def decline_trade(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Verify user has the team role
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                """SELECT receiving_team_id, initiating_team_id, status, initiating_players, receiving_players
-                   FROM trades WHERE trade_id = ?""",
-                (self.trade_id,)
-            )
-            result = await cursor.fetchone()
-
-            if not result:
-                await interaction.response.send_message("❌ Trade not found!", ephemeral=True)
-                return
-
-            receiving_team_id, initiating_team_id, status, initiating_players_json, receiving_players_json = result
-
-            if status != 'pending':
-                await interaction.response.send_message("❌ This trade is no longer active!", ephemeral=True)
-                return
-
-            # Check if user has the receiving team role
-            cursor = await db.execute(
-                "SELECT role_id, team_name, channel_id FROM teams WHERE team_id = ?",
-                (receiving_team_id,)
-            )
-            role_result = await cursor.fetchone()
-
-        if role_result and role_result[0]:
-            role = interaction.guild.get_role(int(role_result[0]))
-            if not role or role not in interaction.user.roles:
-                await interaction.response.send_message("❌ You don't have permission to decline this trade!", ephemeral=True)
-                return
-
-        # Update trade status
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                """UPDATE trades SET status = 'declined', responded_at = CURRENT_TIMESTAMP,
-                   responded_by_user_id = ? WHERE trade_id = ?""",
-                (str(interaction.user.id), self.trade_id)
-            )
-
-            # Get initiating team info and emojis
-            cursor = await db.execute(
-                "SELECT channel_id, team_name, emoji_id FROM teams WHERE team_id = ?",
-                (initiating_team_id,)
-            )
-            initiating_team = await cursor.fetchone()
-
-            cursor = await db.execute(
-                "SELECT emoji_id FROM teams WHERE team_id = ?",
-                (receiving_team_id,)
-            )
-            receiving_emoji_result = await cursor.fetchone()
-
-            # Get player details
-            initiating_players = json.loads(initiating_players_json) if initiating_players_json else []
-            receiving_players = json.loads(receiving_players_json) if receiving_players_json else []
-
-            init_player_details = []
-            recv_player_details = []
-
-            if initiating_players:
-                placeholders = ','.join('?' * len(initiating_players))
-                cursor = await db.execute(
-                    f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
-                    initiating_players
-                )
-                init_player_details = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
-
-            if receiving_players:
-                placeholders = ','.join('?' * len(receiving_players))
-                cursor = await db.execute(
-                    f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
-                    receiving_players
-                )
-                recv_player_details = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
-
-            await db.commit()
-
-        # Notify initiating team with trade details
-        if initiating_team and initiating_team[0]:
-            channel = self.bot.get_channel(int(initiating_team[0]))
-            if channel:
-                # Get emojis
-                init_emoji = self.bot.get_emoji(int(initiating_team[2])) if initiating_team[2] else None
-                recv_emoji = self.bot.get_emoji(int(receiving_emoji_result[0])) if receiving_emoji_result and receiving_emoji_result[0] else None
-                init_emoji_str = f"{init_emoji} " if init_emoji else ""
-                recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
-
-                embed = discord.Embed(
-                    title=f"❌ Your trade offer to **{role_result[1]}** was declined.",
-                    color=discord.Color.red()
-                )
-
-                embed.add_field(
-                    name=f"**{recv_emoji_str}receive:**",
-                    value="\n".join(init_player_details) if init_player_details else "*Nothing*",
-                    inline=True
-                )
-
-                embed.add_field(
-                    name=f"**{init_emoji_str}receive:**",
-                    value="\n".join(recv_player_details) if recv_player_details else "*Nothing*",
-                    inline=True
-                )
-
-                await channel.send(embed=embed)
-
-        # Disable buttons
-        for item in self.children:
-            item.disabled = True
-
-        await interaction.response.edit_message(view=self)
-        await interaction.followup.send("✅ Trade declined.", ephemeral=True)
-
-    @discord.ui.button(label="Counter Offer", style=discord.ButtonStyle.blurple, custom_id="counter_trade")
-    async def counter_trade(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Verify user has the team role
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                """SELECT receiving_team_id, initiating_team_id, status, initiating_players, receiving_players
-                   FROM trades WHERE trade_id = ?""",
-                (self.trade_id,)
-            )
-            result = await cursor.fetchone()
-
-            if not result:
-                await interaction.response.send_message("❌ Trade not found!", ephemeral=True)
-                return
-
-            receiving_team_id, initiating_team_id, status, initiating_players_json, receiving_players_json = result
+            receiving_team_id, status = result
 
             if status != 'pending':
                 await interaction.response.send_message("❌ This trade is no longer active!", ephemeral=True)
@@ -1134,31 +1126,13 @@ class TradeResponseView(discord.ui.View):
         if role_result and role_result[0]:
             role = interaction.guild.get_role(int(role_result[0]))
             if not role or role not in interaction.user.roles:
-                await interaction.response.send_message("❌ You don't have permission to counter this trade!", ephemeral=True)
+                await interaction.response.send_message("❌ You don't have permission to respond to this trade!", ephemeral=True)
                 return
 
-        # Load existing players
-        initiating_players = json.loads(initiating_players_json) if initiating_players_json else []
-        receiving_players = json.loads(receiving_players_json) if receiving_players_json else []
-
-        # Open counter-offer menu (swap teams and players)
-        view = TradeOfferView(
-            receiving_team_id,
-            role_result[1],
-            interaction.user.id,
-            self.bot,
-            interaction.guild,
-            is_counter_offer=True,
-            original_trade_id=self.trade_id,
-            receiving_team_id=initiating_team_id
-        )
-
-        # Swap the players (what they were offering is now what we're asking for)
-        view.initiating_players = receiving_players
-        view.receiving_players = initiating_players
-
-        await view.initialize()
-        embed = view.create_embed()
+        # Open trade menu to this specific offer
+        view = TradeMenuView(receiving_team_id, role_result[1], self.bot, interaction.guild, specific_trade_id=self.trade_id)
+        embed = await view.create_incoming_page_embed()
+        await view.add_incoming_page_buttons()
 
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
