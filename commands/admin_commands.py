@@ -921,7 +921,7 @@ class AdminCommands(commands.Cog):
                 # Add instructions sheet
                 instructions = pd.DataFrame({
                     'IMPORTANT INSTRUCTIONS': [
-                        '=== EXCEL IMPORT/EXPORT GUIDE ===',
+                        '--- EXCEL IMPORT/EXPORT GUIDE ---',
                         '',
                         'IMPORTANT: Before editing Teams sheet:',
                         '  - Select entire Role_ID column → Right-click → Format Cells → Text',
@@ -929,7 +929,7 @@ class AdminCommands(commands.Cog):
                         '',
                         'To import: Use /importdata command and attach this file',
                         '',
-                        '=== SHEET ORGANIZATION ===',
+                        '--- SHEET ORGANIZATION ---',
                         '',
                         'CORE DATA (Editable):',
                         '  • Teams - Team info, Discord role/emoji IDs',
@@ -949,7 +949,7 @@ class AdminCommands(commands.Cog):
                         '  • Matches - Match results',
                         '  • Submitted_Lineups - Historical lineup submissions',
                         '',
-                        '=== KEY CHANGES ===',
+                        '--- KEY CHANGES ---',
                         '',
                         '1. Players sheet NO LONGER has Lineup_Pos column',
                         '   - Edit lineups in Current_Lineups sheet instead',
@@ -960,7 +960,7 @@ class AdminCommands(commands.Cog):
                         '',
                         '3. All tables now exported for complete backup',
                         '',
-                        '=== VALID POSITIONS ===',
+                        '--- VALID POSITIONS ---',
                         '',
                         'Player Positions: MID, KEY FWD, RUCK, GEN DEF, etc.',
                         'Lineup Positions: FB, CHB, LW, C, RW, CHF, FF, R, RR, RO, INT1-4, SUB',
