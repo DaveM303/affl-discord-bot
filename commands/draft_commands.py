@@ -244,8 +244,7 @@ class DraftCommands(commands.Cog):
         draft_name="Name of the draft",
         insert_at="Position to insert pick at (pushes others back)",
         team="Team that owns the pick",
-        round_number="Draft round",
-        pick_origin="Origin description (e.g., 'Adelaide R1', 'Compensation Pick')"
+        pick_origin="Origin description (e.g., 'Adelaide R1', 'Compensation Pick') - optional"
     )
     @app_commands.autocomplete(draft_name=draft_name_autocomplete, team=team_autocomplete)
     async def add_pick(
@@ -254,7 +253,6 @@ class DraftCommands(commands.Cog):
         draft_name: str,
         insert_at: int,
         team: str,
-        round_number: int,
         pick_origin: str = None
     ):
         await interaction.response.defer(ephemeral=True)
@@ -262,10 +260,6 @@ class DraftCommands(commands.Cog):
         # Check if user has admin role
         if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
             await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
-            return
-
-        if round_number < 1:
-            await interaction.followup.send("❌ Round number must be at least 1!", ephemeral=True)
             return
 
         try:
@@ -279,18 +273,47 @@ class DraftCommands(commands.Cog):
 
                 team_id, team_name = team_data
 
-                # Default pick_origin if not provided
-                if not pick_origin:
-                    pick_origin = f"{team_name} R{round_number}"
+                # Determine round number based on the pick at insert_at position (or the one before)
+                cursor = await db.execute(
+                    """SELECT round_number FROM draft_picks
+                       WHERE draft_name = ? AND pick_number >= ?
+                       ORDER BY pick_number ASC LIMIT 1""",
+                    (draft_name, insert_at)
+                )
+                pick_at_position = await cursor.fetchone()
 
-                # Shift all picks at or after insert position back by 1
-                await db.execute(
-                    """UPDATE draft_picks
-                       SET pick_number = pick_number + 1
+                if pick_at_position:
+                    round_number = pick_at_position[0]
+                else:
+                    # If no pick at or after this position, check the last pick
+                    cursor = await db.execute(
+                        """SELECT round_number FROM draft_picks
+                           WHERE draft_name = ?
+                           ORDER BY pick_number DESC LIMIT 1""",
+                        (draft_name,)
+                    )
+                    last_pick = await cursor.fetchone()
+                    round_number = last_pick[0] if last_pick else 1
+
+                # Use pick_origin as-is (defaults to None/empty if not provided)
+                if pick_origin is None:
+                    pick_origin = ""
+
+                # Get all picks that need to be shifted (we need to update them in reverse order)
+                cursor = await db.execute(
+                    """SELECT pick_id FROM draft_picks
                        WHERE draft_name = ? AND pick_number >= ?
                        ORDER BY pick_number DESC""",
                     (draft_name, insert_at)
                 )
+                picks_to_shift = await cursor.fetchall()
+
+                # Shift picks one by one in reverse order to avoid conflicts
+                for (pick_id,) in picks_to_shift:
+                    await db.execute(
+                        "UPDATE draft_picks SET pick_number = pick_number + 1 WHERE pick_id = ?",
+                        (pick_id,)
+                    )
 
                 # Insert the new pick
                 await db.execute(
