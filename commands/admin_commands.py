@@ -872,19 +872,18 @@ class AdminCommands(commands.Cog):
 
                 # Export Draft Picks
                 cursor = await db.execute(
-                    """SELECT dp.pick_id as Pick_ID, s.season_number as Season,
+                    """SELECT dp.pick_id as Pick_ID, dp.draft_name as Draft_Name,
                               dp.round_number as Round, dp.pick_number as Pick,
                               ot.team_name as Original_Team, ct.team_name as Current_Team,
                               p.name as Player_Selected
                        FROM draft_picks dp
-                       JOIN seasons s ON dp.season_id = s.season_id
                        JOIN teams ot ON dp.original_team_id = ot.team_id
                        JOIN teams ct ON dp.current_team_id = ct.team_id
                        LEFT JOIN players p ON dp.player_selected_id = p.player_id
-                       ORDER BY s.season_number, dp.round_number, dp.pick_number"""
+                       ORDER BY dp.draft_name, dp.round_number, dp.pick_number"""
                 )
                 draft_picks = await cursor.fetchall()
-                draft_picks_df = pd.DataFrame(draft_picks, columns=['Pick_ID', 'Season', 'Round', 'Pick', 'Original_Team', 'Current_Team', 'Player_Selected'])
+                draft_picks_df = pd.DataFrame(draft_picks, columns=['Pick_ID', 'Draft_Name', 'Round', 'Pick', 'Original_Team', 'Current_Team', 'Player_Selected'])
                 draft_picks_df['Player_Selected'] = draft_picks_df['Player_Selected'].fillna('')
 
                 # Export Submitted Lineups
@@ -1436,10 +1435,6 @@ class AdminCommands(commands.Cog):
                     draft_picks_df = pd.read_excel(excel_file, sheet_name='Draft_Picks')
                     for _, row in draft_picks_df.iterrows():
                         try:
-                            # Get season ID
-                            cursor = await db.execute("SELECT season_id FROM seasons WHERE season_number = ?", (int(row['Season']),))
-                            season = await cursor.fetchone()
-
                             # Get original team ID
                             cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Original_Team']),))
                             original_team = await cursor.fetchone()
@@ -1456,12 +1451,12 @@ class AdminCommands(commands.Cog):
                                 if player:
                                     player_id = player[0]
 
-                            if season and original_team and current_team:
+                            if original_team and current_team:
                                 await db.execute(
                                     """INSERT OR REPLACE INTO draft_picks
-                                       (pick_id, season_id, round_number, pick_number, original_team_id, current_team_id, player_selected_id)
+                                       (pick_id, draft_name, round_number, pick_number, original_team_id, current_team_id, player_selected_id)
                                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                                    (int(row['Pick_ID']), season[0], int(row['Round']), int(row['Pick']),
+                                    (int(row['Pick_ID']), str(row['Draft_Name']), int(row['Round']), int(row['Pick']),
                                      original_team[0], current_team[0], player_id)
                                 )
                                 draft_picks_imported += 1
