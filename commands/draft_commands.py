@@ -8,6 +8,50 @@ class DraftCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+    async def draft_name_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete for draft names"""
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT DISTINCT draft_name FROM draft_picks ORDER BY draft_name DESC"
+                )
+                drafts = await cursor.fetchall()
+
+            choices = []
+            for (draft_name,) in drafts:
+                if current.lower() in draft_name.lower():
+                    choices.append(app_commands.Choice(name=draft_name, value=draft_name))
+
+            return choices[:25]
+        except:
+            return []
+
+    async def team_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete for team names"""
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT team_name FROM teams ORDER BY team_name"
+                )
+                teams = await cursor.fetchall()
+
+            choices = []
+            for (team_name,) in teams:
+                if current.lower() in team_name.lower():
+                    choices.append(app_commands.Choice(name=team_name, value=team_name))
+
+            return choices[:25]
+        except:
+            return []
+
     @app_commands.command(name="createdraft", description="[ADMIN] Create a draft by setting ladder order")
     @app_commands.describe(
         draft_name="Name for this draft (e.g. 'Season 9 Draft', 'Mid-Season Draft')",
@@ -78,8 +122,9 @@ class DraftCommands(commands.Cog):
 
     @app_commands.command(name="draftorder", description="View the draft order")
     @app_commands.describe(draft_name="Optional: Name of the draft to view (defaults to latest)")
+    @app_commands.autocomplete(draft_name=draft_name_autocomplete)
     async def draft_order(self, interaction: discord.Interaction, draft_name: str = None):
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
         try:
             async with aiosqlite.connect(DB_PATH) as db:
@@ -103,11 +148,10 @@ class DraftCommands(commands.Cog):
                 # Get draft picks with team emojis
                 cursor = await db.execute(
                     """SELECT dp.pick_number, dp.round_number,
-                              ot.team_name as original_team, ot.emoji_id as original_emoji,
+                              dp.pick_origin,
                               ct.team_name as current_team, ct.emoji_id as current_emoji,
                               p.name as player_selected
                        FROM draft_picks dp
-                       JOIN teams ot ON dp.original_team_id = ot.team_id
                        JOIN teams ct ON dp.current_team_id = ct.team_id
                        LEFT JOIN players p ON dp.player_selected_id = p.player_id
                        WHERE dp.draft_name = ?
@@ -137,6 +181,7 @@ class DraftCommands(commands.Cog):
         pick_number="Overall pick number to transfer",
         to_team="Team to transfer pick to"
     )
+    @app_commands.autocomplete(draft_name=draft_name_autocomplete, to_team=team_autocomplete)
     async def transfer_pick(self, interaction: discord.Interaction, draft_name: str, pick_number: int, to_team: str):
         await interaction.response.defer(ephemeral=True)
 
@@ -158,9 +203,8 @@ class DraftCommands(commands.Cog):
 
                 # Get the pick
                 cursor = await db.execute(
-                    """SELECT dp.pick_id, ot.team_name, dp.round_number, ct.team_name
+                    """SELECT dp.pick_id, dp.pick_origin, dp.round_number, ct.team_name
                        FROM draft_picks dp
-                       JOIN teams ot ON dp.original_team_id = ot.team_id
                        JOIN teams ct ON dp.current_team_id = ct.team_id
                        WHERE dp.draft_name = ? AND dp.pick_number = ?""",
                     (draft_name, pick_number)
@@ -174,7 +218,7 @@ class DraftCommands(commands.Cog):
                     )
                     return
 
-                pick_id, original_team, round_num, current_team = pick_data
+                pick_id, pick_origin, round_num, current_team = pick_data
 
                 # Transfer the pick
                 await db.execute(
@@ -186,7 +230,7 @@ class DraftCommands(commands.Cog):
                 await interaction.followup.send(
                     f"✅ **Pick Transferred!**\n\n"
                     f"**Draft:** {draft_name}\n"
-                    f"**Pick:** #{pick_number} ({original_team} Round {round_num})\n"
+                    f"**Pick:** #{pick_number} ({pick_origin})\n"
                     f"**From:** {current_team}\n"
                     f"**To:** {new_team_name}",
                     ephemeral=True
@@ -200,15 +244,18 @@ class DraftCommands(commands.Cog):
         draft_name="Name of the draft",
         insert_at="Position to insert pick at (pushes others back)",
         team="Team that owns the pick",
-        round_number="Draft round"
+        round_number="Draft round",
+        pick_origin="Origin description (e.g., 'Adelaide R1', 'Compensation Pick')"
     )
+    @app_commands.autocomplete(draft_name=draft_name_autocomplete, team=team_autocomplete)
     async def add_pick(
         self,
         interaction: discord.Interaction,
         draft_name: str,
         insert_at: int,
         team: str,
-        round_number: int
+        round_number: int,
+        pick_origin: str = None
     ):
         await interaction.response.defer(ephemeral=True)
 
@@ -232,6 +279,10 @@ class DraftCommands(commands.Cog):
 
                 team_id, team_name = team_data
 
+                # Default pick_origin if not provided
+                if not pick_origin:
+                    pick_origin = f"{team_name} R{round_number}"
+
                 # Shift all picks at or after insert position back by 1
                 await db.execute(
                     """UPDATE draft_picks
@@ -243,9 +294,9 @@ class DraftCommands(commands.Cog):
 
                 # Insert the new pick
                 await db.execute(
-                    """INSERT INTO draft_picks (draft_name, round_number, pick_number, original_team_id, current_team_id)
+                    """INSERT INTO draft_picks (draft_name, round_number, pick_number, pick_origin, current_team_id)
                        VALUES (?, ?, ?, ?, ?)""",
-                    (draft_name, round_number, insert_at, team_id, team_id)
+                    (draft_name, round_number, insert_at, pick_origin, team_id)
                 )
 
                 await db.commit()
@@ -255,7 +306,8 @@ class DraftCommands(commands.Cog):
                     f"**Draft:** {draft_name}\n"
                     f"**Position:** #{insert_at}\n"
                     f"**Team:** {team_name}\n"
-                    f"**Round:** {round_number}\n\n"
+                    f"**Round:** {round_number}\n"
+                    f"**Origin:** {pick_origin}\n\n"
                     f"All picks after #{insert_at} have been shifted back.",
                     ephemeral=True
                 )
@@ -268,6 +320,7 @@ class DraftCommands(commands.Cog):
         draft_name="Name of the draft",
         pick_number="Overall pick number to remove"
     )
+    @app_commands.autocomplete(draft_name=draft_name_autocomplete)
     async def remove_pick(self, interaction: discord.Interaction, draft_name: str, pick_number: int):
         await interaction.response.defer(ephemeral=True)
 
@@ -280,9 +333,8 @@ class DraftCommands(commands.Cog):
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get the pick info
                 cursor = await db.execute(
-                    """SELECT dp.pick_id, ot.team_name, dp.round_number
+                    """SELECT dp.pick_id, dp.pick_origin, dp.round_number
                        FROM draft_picks dp
-                       JOIN teams ot ON dp.original_team_id = ot.team_id
                        WHERE dp.draft_name = ? AND dp.pick_number = ?""",
                     (draft_name, pick_number)
                 )
@@ -295,7 +347,7 @@ class DraftCommands(commands.Cog):
                     )
                     return
 
-                pick_id, original_team, round_num = pick_data
+                pick_id, pick_origin, round_num = pick_data
 
                 # Delete the pick
                 await db.execute("DELETE FROM draft_picks WHERE pick_id = ?", (pick_id,))
@@ -314,8 +366,49 @@ class DraftCommands(commands.Cog):
                     f"✅ **Pick Removed!**\n\n"
                     f"**Draft:** {draft_name}\n"
                     f"**Position:** #{pick_number}\n"
-                    f"**Description:** {original_team} Round {round_num}\n\n"
+                    f"**Description:** {pick_origin}\n\n"
                     f"All picks after #{pick_number} have been shifted forward.",
+                    ephemeral=True
+                )
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+    @app_commands.command(name="deletedraft", description="[ADMIN] Delete an entire draft")
+    @app_commands.describe(draft_name="Name of the draft to delete")
+    @app_commands.autocomplete(draft_name=draft_name_autocomplete)
+    async def delete_draft(self, interaction: discord.Interaction, draft_name: str):
+        await interaction.response.defer(ephemeral=True)
+
+        # Check if user has admin role
+        if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
+            await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Check if draft exists
+                cursor = await db.execute(
+                    "SELECT COUNT(*) FROM draft_picks WHERE draft_name = ?",
+                    (draft_name,)
+                )
+                count = (await cursor.fetchone())[0]
+
+                if count == 0:
+                    await interaction.followup.send(
+                        f"❌ No draft found with name '{draft_name}'!",
+                        ephemeral=True
+                    )
+                    return
+
+                # Delete all picks from this draft
+                await db.execute("DELETE FROM draft_picks WHERE draft_name = ?", (draft_name,))
+                await db.commit()
+
+                await interaction.followup.send(
+                    f"✅ **Draft Deleted!**\n\n"
+                    f"**Draft:** {draft_name}\n"
+                    f"**Picks Removed:** {count}",
                     ephemeral=True
                 )
 
@@ -421,10 +514,11 @@ class LadderEntryModal(discord.ui.Modal):
                 pick_counter = 1
                 for round_num in range(1, self.rounds + 1):
                     for team_id, team_name, position in reversed(team_order):
+                        pick_origin = f"{team_name} R{round_num}"
                         await db.execute(
-                            """INSERT INTO draft_picks (draft_name, round_number, pick_number, original_team_id, current_team_id)
+                            """INSERT INTO draft_picks (draft_name, round_number, pick_number, pick_origin, current_team_id)
                                VALUES (?, ?, ?, ?, ?)""",
-                            (self.draft_name, round_num, pick_counter, team_id, team_id)
+                            (self.draft_name, round_num, pick_counter, pick_origin, team_id)
                         )
                         pick_counter += 1
 
@@ -494,17 +588,16 @@ class DraftOrderView(discord.ui.View):
             return embed
 
         description = ""
-        for pick_num, round_num, original_team, original_emoji, current_team, current_emoji, player_selected in round_picks:
-            # Get emojis
-            original_emoji_str = self.get_emoji(original_emoji)
+        for pick_num, round_num, pick_origin, current_team, current_emoji, player_selected in round_picks:
+            # Get emoji for current team
             current_emoji_str = self.get_emoji(current_emoji)
 
-            # Build pick - just number and emoji
-            pick_desc = f"**{pick_num}.** {current_emoji_str}"
+            # Build pick - number, emoji, and origin
+            pick_desc = f"**{pick_num}.** {current_emoji_str}{pick_origin}"
 
             # Show if player selected
             if player_selected:
-                pick_desc += f"→ **{player_selected}**"
+                pick_desc += f"\n→ **{player_selected}**"
 
             description += pick_desc + "\n"
 

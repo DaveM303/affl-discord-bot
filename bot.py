@@ -82,10 +82,9 @@ async def init_db():
                 draft_name TEXT NOT NULL,
                 round_number INTEGER,
                 pick_number INTEGER,
-                original_team_id INTEGER,
+                pick_origin TEXT,
                 current_team_id INTEGER,
                 player_selected_id INTEGER,
-                FOREIGN KEY (original_team_id) REFERENCES teams(team_id),
                 FOREIGN KEY (current_team_id) REFERENCES teams(team_id),
                 FOREIGN KEY (player_selected_id) REFERENCES players(player_id)
             )

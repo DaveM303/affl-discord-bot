@@ -172,22 +172,62 @@ class SeasonCommands(commands.Cog):
                     )
                 ''')
 
-                # Drop and recreate draft_picks table with new schema (draft_name instead of season_id)
-                await db.execute('DROP TABLE IF EXISTS draft_picks')
-                await db.execute('''
-                    CREATE TABLE draft_picks (
-                        pick_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        draft_name TEXT NOT NULL,
-                        round_number INTEGER,
-                        pick_number INTEGER,
-                        original_team_id INTEGER,
-                        current_team_id INTEGER,
-                        player_selected_id INTEGER,
-                        FOREIGN KEY (original_team_id) REFERENCES teams(team_id),
-                        FOREIGN KEY (current_team_id) REFERENCES teams(team_id),
-                        FOREIGN KEY (player_selected_id) REFERENCES players(player_id)
-                    )
-                ''')
+                # Update draft_picks table schema (preserve data, migrate to pick_origin)
+                cursor = await db.execute("PRAGMA table_info(draft_picks)")
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+
+                # Check if we need to migrate from old schema
+                if 'original_team_id' in column_names and 'pick_origin' not in column_names:
+                    # Backup existing draft data
+                    cursor = await db.execute('''
+                        SELECT dp.pick_id, dp.draft_name, dp.round_number, dp.pick_number,
+                               t.team_name, dp.current_team_id, dp.player_selected_id
+                        FROM draft_picks dp
+                        LEFT JOIN teams t ON dp.original_team_id = t.team_id
+                    ''')
+                    draft_backup = await cursor.fetchall()
+
+                    # Recreate table with new schema
+                    await db.execute('DROP TABLE IF EXISTS draft_picks')
+                    await db.execute('''
+                        CREATE TABLE draft_picks (
+                            pick_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            draft_name TEXT NOT NULL,
+                            round_number INTEGER,
+                            pick_number INTEGER,
+                            pick_origin TEXT,
+                            current_team_id INTEGER,
+                            player_selected_id INTEGER,
+                            FOREIGN KEY (current_team_id) REFERENCES teams(team_id),
+                            FOREIGN KEY (player_selected_id) REFERENCES players(player_id)
+                        )
+                    ''')
+
+                    # Restore data with converted pick_origin
+                    for pick in draft_backup:
+                        pick_id, draft_name, round_num, pick_num, orig_team, curr_team, player = pick
+                        pick_origin = f"{orig_team} R{round_num}" if orig_team else f"R{round_num}"
+                        await db.execute('''
+                            INSERT INTO draft_picks (pick_id, draft_name, round_number, pick_number,
+                                                    pick_origin, current_team_id, player_selected_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ''', (pick_id, draft_name, round_num, pick_num, pick_origin, curr_team, player))
+                else:
+                    # Table already has correct schema or doesn't exist yet
+                    await db.execute('''
+                        CREATE TABLE IF NOT EXISTS draft_picks (
+                            pick_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            draft_name TEXT NOT NULL,
+                            round_number INTEGER,
+                            pick_number INTEGER,
+                            pick_origin TEXT,
+                            current_team_id INTEGER,
+                            player_selected_id INTEGER,
+                            FOREIGN KEY (current_team_id) REFERENCES teams(team_id),
+                            FOREIGN KEY (player_selected_id) REFERENCES players(player_id)
+                        )
+                    ''')
 
                 # Remove lineup_channel_id from teams if it exists (moved to settings)
                 cursor = await db.execute("PRAGMA table_info(teams)")
