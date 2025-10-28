@@ -734,17 +734,21 @@ class AdminCommands(commands.Cog):
                 teams_df['Emoji_ID'] = teams_df['Emoji_ID'].fillna('')
                 teams_df['Channel_ID'] = teams_df['Channel_ID'].fillna('')
                 
-                # Export Players (core data only, no lineup positions)
+                # Export Players (existing players only - edit but don't add new)
                 cursor = await db.execute(
-                    """SELECT p.name as Name, t.team_name as Team, p.age as Age,
-                              p.position as Pos, p.overall_rating as OVR
+                    """SELECT p.player_id as Player_ID, p.name as Name, t.team_name as Team,
+                              p.age as Age, p.position as Pos, p.overall_rating as OVR
                        FROM players p
                        LEFT JOIN teams t ON p.team_id = t.team_id
                        ORDER BY p.name"""
                 )
                 players = await cursor.fetchall()
-                players_df = pd.DataFrame(players, columns=['Name', 'Team', 'Age', 'Pos', 'OVR'])
+                players_df = pd.DataFrame(players, columns=['Player_ID', 'Name', 'Team', 'Age', 'Pos', 'OVR'])
                 players_df['Team'] = players_df['Team'].fillna('')
+
+                # Create Add_Players sheet (for bulk adding new players)
+                add_players_df = pd.DataFrame(columns=['Name', 'Team', 'Age', 'Pos', 'OVR'])
+                add_players_df = add_players_df.fillna('')
                 
                 # Export Current Lineups (editable)
                 cursor = await db.execute(
@@ -768,33 +772,32 @@ class AdminCommands(commands.Cog):
                 seasons = await cursor.fetchall()
                 seasons_df = pd.DataFrame(seasons, columns=['Season', 'Current_Round', 'Regular_Rounds', 'Total_Rounds', 'Round_Name', 'Status'])
 
-                # Export Injuries
+                # Export Injuries (removed Recovery_Rounds - redundant with Injury_Round + Return_Round)
                 cursor = await db.execute(
                     """SELECT p.name as Player_Name, t.team_name as Team,
                               i.injury_type as Injury_Type, i.injury_round as Injury_Round,
-                              i.recovery_rounds as Recovery_Rounds, i.return_round as Return_Round,
-                              i.status as Status
+                              i.return_round as Return_Round, i.status as Status
                        FROM injuries i
                        JOIN players p ON i.player_id = p.player_id
                        LEFT JOIN teams t ON p.team_id = t.team_id
                        ORDER BY i.status, i.return_round"""
                 )
                 injuries = await cursor.fetchall()
-                injuries_df = pd.DataFrame(injuries, columns=['Player_Name', 'Team', 'Injury_Type', 'Injury_Round', 'Recovery_Rounds', 'Return_Round', 'Status'])
+                injuries_df = pd.DataFrame(injuries, columns=['Player_Name', 'Team', 'Injury_Type', 'Injury_Round', 'Return_Round', 'Status'])
                 injuries_df['Team'] = injuries_df['Team'].fillna('Delisted')
 
-                # Export Suspensions
+                # Export Suspensions (removed Games_Missed - redundant with Suspension_Round + Return_Round)
                 cursor = await db.execute(
                     """SELECT p.name as Player_Name, t.team_name as Team,
-                              s.suspension_round as Suspension_Round, s.games_missed as Games_Missed,
-                              s.return_round as Return_Round, s.suspension_reason as Reason, s.status as Status
+                              s.suspension_round as Suspension_Round, s.return_round as Return_Round,
+                              s.suspension_reason as Reason, s.status as Status
                        FROM suspensions s
                        JOIN players p ON s.player_id = p.player_id
                        LEFT JOIN teams t ON p.team_id = t.team_id
                        ORDER BY s.status, s.return_round"""
                 )
                 suspensions = await cursor.fetchall()
-                suspensions_df = pd.DataFrame(suspensions, columns=['Player_Name', 'Team', 'Suspension_Round', 'Games_Missed', 'Return_Round', 'Reason', 'Status'])
+                suspensions_df = pd.DataFrame(suspensions, columns=['Player_Name', 'Team', 'Suspension_Round', 'Return_Round', 'Reason', 'Status'])
                 suspensions_df['Team'] = suspensions_df['Team'].fillna('Delisted')
 
                 # Export Trades
@@ -903,6 +906,7 @@ class AdminCommands(commands.Cog):
                 # Core data sheets (editable)
                 teams_df.to_excel(writer, sheet_name='Teams', index=False)
                 players_df.to_excel(writer, sheet_name='Players', index=False)
+                add_players_df.to_excel(writer, sheet_name='Add_Players', index=False)
                 seasons_df.to_excel(writer, sheet_name='Seasons', index=False)
                 settings_df.to_excel(writer, sheet_name='Settings', index=False)
 
@@ -933,15 +937,16 @@ class AdminCommands(commands.Cog):
                         '',
                         'CORE DATA (Editable):',
                         '  • Teams - Team info, Discord role/emoji IDs',
-                        '  • Players - Name, team, age, position, rating (NO lineup positions)',
+                        '  • Players - Edit EXISTING players only (has Player_ID column)',
+                        '  • Add_Players - Bulk add NEW players here (no Player_ID needed)',
                         '  • Seasons - Season configuration',
                         '  • Settings - Bot settings',
                         '',
                         'RELATIONSHIPS/STATE (Editable):',
                         '  • Current_Lineups - Active team lineups (Team/Position/Player)',
                         '  • Starting_Lineups - Saved lineup templates (Team/Position/Player)',
-                        '  • Injuries - Player injury status',
-                        '  • Suspensions - Player suspension status',
+                        '  • Injuries - Injury status (Recovery calculated automatically)',
+                        '  • Suspensions - Suspension status (Games missed calculated automatically)',
                         '  • Draft_Picks - Draft pick ownership',
                         '',
                         'HISTORY (Read-only - import supported):',
@@ -949,16 +954,24 @@ class AdminCommands(commands.Cog):
                         '  • Matches - Match results',
                         '  • Submitted_Lineups - Historical lineup submissions',
                         '',
-                        '--- KEY CHANGES ---',
+                        '--- KEY FEATURES ---',
                         '',
-                        '1. Players sheet NO LONGER has Lineup_Pos column',
-                        '   - Edit lineups in Current_Lineups sheet instead',
+                        '1. Players sheet includes Player_ID column',
+                        '   - Only updates EXISTING players',
+                        '   - Cannot add new players through this sheet',
                         '',
-                        '2. Current_Lineups and Starting_Lineups use same format',
-                        '   - Team_Name, Position, Player_Name',
-                        '   - Consistent and easy to edit',
+                        '2. Add_Players sheet for bulk adding',
+                        '   - Fill in Name, Team, Age, Pos, OVR',
+                        '   - Import will add all new players at once',
+                        '   - Skips duplicates automatically',
                         '',
-                        '3. All tables now exported for complete backup',
+                        '3. Simplified Injuries/Suspensions',
+                        '   - Just enter Injury_Round and Return_Round',
+                        '   - Recovery_Rounds/Games_Missed calculated on import',
+                        '',
+                        '4. Consistent lineup formats',
+                        '   - Current_Lineups and Starting_Lineups use identical format',
+                        '   - Easy to copy/paste between sheets',
                         '',
                         '--- VALID POSITIONS ---',
                         '',
@@ -1043,10 +1056,10 @@ class AdminCommands(commands.Cog):
                 except Exception as e:
                     errors.append(f"Teams sheet error: {str(e)}")
                 
-                # Import Players
+                # Import Players (UPDATE existing players only - use Add_Players sheet to add new)
                 try:
                     players_df = pd.read_excel(excel_file, sheet_name='Players')
-                    
+
                     # Get team mapping
                     cursor = await db.execute("SELECT team_id, team_name FROM teams")
                     teams = await cursor.fetchall()
@@ -1054,6 +1067,11 @@ class AdminCommands(commands.Cog):
 
                     for _, row in players_df.iterrows():
                         try:
+                            # Use Player_ID if available for more reliable matching
+                            player_id = None
+                            if 'Player_ID' in players_df.columns and pd.notna(row['Player_ID']):
+                                player_id = int(row['Player_ID'])
+
                             name = str(row['Name']).strip()
                             position = str(row['Pos']).strip()
                             rating = int(row['OVR'])
@@ -1071,31 +1089,27 @@ class AdminCommands(commands.Cog):
                                 team_name_lower = str(row['Team']).strip().lower()
                                 team_id = team_map.get(team_name_lower)
 
-                            # Check if player exists
-                            cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (name,))
-                            existing = await cursor.fetchone()
+                            # Check if player exists (by ID first, then by name)
+                            existing = None
+                            if player_id:
+                                cursor = await db.execute("SELECT player_id FROM players WHERE player_id = ?", (player_id,))
+                                existing = await cursor.fetchone()
 
-                            # Check for case-insensitive duplicates (different from exact match)
-                            cursor = await db.execute("SELECT player_id, name FROM players WHERE LOWER(name) = LOWER(?) AND name != ?", (name, name))
-                            duplicate = await cursor.fetchone()
-                            if duplicate:
-                                duplicate_warnings.append(f"'{name}' is similar to existing player '{duplicate[1]}' (ID: {duplicate[0]})")
+                            if not existing:
+                                cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (name,))
+                                existing = await cursor.fetchone()
 
+                            # Only UPDATE existing players (don't add new ones)
                             if existing:
                                 await db.execute(
                                     """UPDATE players
-                                       SET position = ?, overall_rating = ?, age = ?, team_id = ?
-                                       WHERE name = ?""",
-                                    (normalized_pos, rating, age, team_id, name)
+                                       SET name = ?, position = ?, overall_rating = ?, age = ?, team_id = ?
+                                       WHERE player_id = ?""",
+                                    (name, normalized_pos, rating, age, team_id, existing[0])
                                 )
                                 players_updated += 1
                             else:
-                                await db.execute(
-                                    """INSERT INTO players (name, position, overall_rating, age, team_id)
-                                       VALUES (?, ?, ?, ?, ?)""",
-                                    (name, normalized_pos, rating, age, team_id)
-                                )
-                                players_added += 1
+                                errors.append(f"Player '{name}' not found - use Add_Players sheet to add new players")
                                 
                         except Exception as e:
                             errors.append(f"Player '{name}': {str(e)}")
@@ -1103,6 +1117,59 @@ class AdminCommands(commands.Cog):
                     await db.commit()
                 except Exception as e:
                     errors.append(f"Players sheet error: {str(e)}")
+
+                # Import Add_Players (bulk add new players)
+                try:
+                    add_players_df = pd.read_excel(excel_file, sheet_name='Add_Players')
+
+                    # Get team mapping
+                    cursor = await db.execute("SELECT team_id, team_name FROM teams")
+                    teams = await cursor.fetchall()
+                    team_map = {name.lower(): id for id, name in teams}
+
+                    for _, row in add_players_df.iterrows():
+                        try:
+                            # Skip empty rows
+                            if not pd.notna(row['Name']) or not str(row['Name']).strip():
+                                continue
+
+                            name = str(row['Name']).strip()
+                            position = str(row['Pos']).strip()
+                            rating = int(row['OVR'])
+                            age = int(row['Age'])
+
+                            # Validate position
+                            is_valid, normalized_pos = validate_position(position)
+                            if not is_valid:
+                                errors.append(f"Add_Players - '{name}': Invalid position '{position}'")
+                                continue
+
+                            # Get team ID
+                            team_id = None
+                            if 'Team' in add_players_df.columns and pd.notna(row['Team']) and row['Team']:
+                                team_name_lower = str(row['Team']).strip().lower()
+                                team_id = team_map.get(team_name_lower)
+
+                            # Check if player already exists
+                            cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (name,))
+                            existing = await cursor.fetchone()
+
+                            if existing:
+                                duplicate_warnings.append(f"Add_Players: '{name}' already exists (ID: {existing[0]}) - skipped")
+                            else:
+                                await db.execute(
+                                    """INSERT INTO players (name, position, overall_rating, age, team_id)
+                                       VALUES (?, ?, ?, ?, ?)""",
+                                    (name, normalized_pos, rating, age, team_id)
+                                )
+                                players_added += 1
+                        except Exception as e:
+                            errors.append(f"Add_Players - '{name}': {str(e)}")
+
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Add_Players' not in str(e):
+                        errors.append(f"Add_Players sheet error: {str(e)}")
 
                 # Import Current Lineups
                 current_lineups_imported = 0
@@ -1167,7 +1234,7 @@ class AdminCommands(commands.Cog):
                     if 'Worksheet Seasons' not in str(e):
                         errors.append(f"Seasons sheet error: {str(e)}")
 
-                # Import Injuries
+                # Import Injuries (calculate recovery_rounds from injury_round and return_round)
                 injuries_imported = 0
                 try:
                     injuries_df = pd.read_excel(excel_file, sheet_name='Injuries')
@@ -1177,12 +1244,15 @@ class AdminCommands(commands.Cog):
                             cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (str(row['Player_Name']),))
                             player = await cursor.fetchone()
                             if player:
+                                injury_round = int(row['Injury_Round'])
+                                return_round = int(row['Return_Round'])
+                                recovery_rounds = return_round - injury_round
                                 await db.execute(
                                     """INSERT OR REPLACE INTO injuries
                                        (player_id, injury_type, injury_round, recovery_rounds, return_round, status)
                                        VALUES (?, ?, ?, ?, ?, ?)""",
-                                    (player[0], str(row['Injury_Type']), int(row['Injury_Round']),
-                                     int(row['Recovery_Rounds']), int(row['Return_Round']), str(row['Status']))
+                                    (player[0], str(row['Injury_Type']), injury_round,
+                                     recovery_rounds, return_round, str(row['Status']))
                                 )
                                 injuries_imported += 1
                         except Exception as e:
@@ -1192,7 +1262,7 @@ class AdminCommands(commands.Cog):
                     if 'Worksheet Injuries' not in str(e):
                         errors.append(f"Injuries sheet error: {str(e)}")
 
-                # Import Suspensions
+                # Import Suspensions (calculate games_missed from suspension_round and return_round)
                 suspensions_imported = 0
                 try:
                     suspensions_df = pd.read_excel(excel_file, sheet_name='Suspensions')
@@ -1202,12 +1272,15 @@ class AdminCommands(commands.Cog):
                             cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (str(row['Player_Name']),))
                             player = await cursor.fetchone()
                             if player:
+                                suspension_round = int(row['Suspension_Round'])
+                                return_round = int(row['Return_Round'])
+                                games_missed = return_round - suspension_round
                                 await db.execute(
                                     """INSERT OR REPLACE INTO suspensions
                                        (player_id, suspension_round, games_missed, return_round, suspension_reason, status)
                                        VALUES (?, ?, ?, ?, ?, ?)""",
-                                    (player[0], int(row['Suspension_Round']), int(row['Games_Missed']),
-                                     int(row['Return_Round']), str(row['Reason']), str(row['Status']))
+                                    (player[0], suspension_round, games_missed,
+                                     return_round, str(row['Reason']), str(row['Status']))
                                 )
                                 suspensions_imported += 1
                         except Exception as e:
