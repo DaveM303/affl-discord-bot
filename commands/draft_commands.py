@@ -500,9 +500,8 @@ class DraftOrderView(discord.ui.View):
             current_emoji_str = self.get_emoji(current_emoji)
 
             # Build pick description
-            # Format: "1. 🦅 -# Adelaide Round 1"
-            # Use current team emoji (who owns the pick), show original team in subtext
-            pick_desc = f"**{pick_num}.** {current_emoji_str}-# {original_team} Round {round_num}"
+            # Use current team emoji (who owns the pick), show original team in smaller text
+            pick_desc = f"**{pick_num}.** {current_emoji_str}*{original_team} Round {round_num}*"
 
             # Show if player selected
             if player_selected:
