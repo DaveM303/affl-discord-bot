@@ -79,13 +79,12 @@ async def init_db():
         await db.execute('''
             CREATE TABLE IF NOT EXISTS draft_picks (
                 pick_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                season_id INTEGER,
+                draft_name TEXT NOT NULL,
                 round_number INTEGER,
                 pick_number INTEGER,
                 original_team_id INTEGER,
                 current_team_id INTEGER,
                 player_selected_id INTEGER,
-                FOREIGN KEY (season_id) REFERENCES seasons(season_id),
                 FOREIGN KEY (original_team_id) REFERENCES teams(team_id),
                 FOREIGN KEY (current_team_id) REFERENCES teams(team_id),
                 FOREIGN KEY (player_selected_id) REFERENCES players(player_id)
