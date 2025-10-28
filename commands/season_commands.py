@@ -135,6 +135,20 @@ class SeasonCommands(commands.Cog):
                     )
                 ''')
 
+                # Create Ladder Positions table (for draft order)
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS ladder_positions (
+                        ladder_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        season_id INTEGER NOT NULL,
+                        team_id INTEGER NOT NULL,
+                        position INTEGER NOT NULL,
+                        FOREIGN KEY (season_id) REFERENCES seasons(season_id),
+                        FOREIGN KEY (team_id) REFERENCES teams(team_id),
+                        UNIQUE(season_id, team_id),
+                        UNIQUE(season_id, position)
+                    )
+                ''')
+
                 # Drop and recreate trades table with correct schema
                 await db.execute('DROP TABLE IF EXISTS trades')
                 await db.execute('''
@@ -176,6 +190,7 @@ class SeasonCommands(commands.Cog):
                     "• Trades table created\n"
                     "• Suspensions table created\n"
                     "• Starting Lineups table created\n"
+                    "• Ladder Positions table created\n"
                     "• Settings table created\n\n"
                     "You can now use all season, injury, suspension, and lineup submission commands.\n"
                     "Use `/setlineupschannel` to configure where lineups are posted.",

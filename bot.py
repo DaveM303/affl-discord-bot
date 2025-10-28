@@ -159,6 +159,20 @@ async def init_db():
             )
         ''')
 
+        # Create Ladder Positions table (for draft order)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS ladder_positions (
+                ladder_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                season_id INTEGER NOT NULL,
+                team_id INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                FOREIGN KEY (season_id) REFERENCES seasons(season_id),
+                FOREIGN KEY (team_id) REFERENCES teams(team_id),
+                UNIQUE(season_id, team_id),
+                UNIQUE(season_id, position)
+            )
+        ''')
+
         # Create Submitted Lineups table (for tracking lineup submissions per round)
         await db.execute('''
             CREATE TABLE IF NOT EXISTS submitted_lineups (
@@ -190,6 +204,7 @@ async def on_ready():
     await bot.load_extension('commands.injury_commands')
     await bot.load_extension('commands.suspension_commands')
     await bot.load_extension('commands.trade_commands')
+    await bot.load_extension('commands.draft_commands')
     
     try:
         if GUILD_ID:
