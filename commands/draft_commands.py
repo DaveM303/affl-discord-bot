@@ -60,13 +60,14 @@ class DraftCommands(commands.Cog):
                     await interaction.followup.send("❌ No teams found!", ephemeral=True)
                     return
 
-                # Create the ladder entry view
-                view = LadderEntryView(teams, draft_name, rounds, save_ladder_for_season)
+                # Send the modal via a button
+                view = LadderEntryStartView(teams, draft_name, rounds, save_ladder_for_season)
                 await interaction.followup.send(
                     f"📊 **Create Draft: {draft_name}**\n\n"
                     f"**Rounds:** {rounds}\n"
                     f"{'**Save ladder as:** Season ' + str(save_ladder_for_season) + ' ladder' if save_ladder_for_season else ''}\n\n"
-                    f"Use the dropdowns below to set each team's ladder position (1 = 1st place, higher = lower on ladder).\n"
+                    f"Click the button below to enter the ladder order.\n"
+                    f"You'll paste teams in order from 1st place to last place (one team per line).\n"
                     f"The draft order will be the reverse of the ladder (last place picks first).",
                     view=view,
                     ephemeral=True
@@ -304,42 +305,83 @@ class DraftCommands(commands.Cog):
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
 
-class LadderEntryView(discord.ui.View):
+class LadderEntryStartView(discord.ui.View):
     def __init__(self, teams, draft_name, rounds, save_ladder_for_season):
         super().__init__(timeout=300)
         self.teams = teams
         self.draft_name = draft_name
         self.rounds = rounds
         self.save_ladder_for_season = save_ladder_for_season
-        self.ladder_positions = {}  # team_id: position
 
-        # Create dropdowns (max 25 per select, so we might need multiple)
-        teams_per_dropdown = 25
-        for i in range(0, len(teams), teams_per_dropdown):
-            chunk = teams[i:i + teams_per_dropdown]
-            select = LadderPositionSelect(chunk, self, i // teams_per_dropdown)
-            self.add_item(select)
+    @discord.ui.button(label="📝 Enter Ladder Order", style=discord.ButtonStyle.primary)
+    async def enter_ladder_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = LadderEntryModal(self.teams, self.draft_name, self.rounds, self.save_ladder_for_season)
+        await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="Create Draft", style=discord.ButtonStyle.green, row=4)
-    async def create_draft_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+class LadderEntryModal(discord.ui.Modal):
+    def __init__(self, teams, draft_name, rounds, save_ladder_for_season):
+        super().__init__(title=f"Ladder Order: {draft_name[:30]}")
+        self.teams = teams
+        self.draft_name = draft_name
+        self.rounds = rounds
+        self.save_ladder_for_season = save_ladder_for_season
+
+        # Create a map of team names (case insensitive) to team IDs
+        self.team_map = {name.lower(): (tid, name) for tid, name in teams}
+
+        self.ladder_input = discord.ui.TextInput(
+            label="Ladder Order (1st to last, one per line)",
+            style=discord.TextStyle.paragraph,
+            placeholder="Adelaide\nBrisbane\nCarlton\nCollingwood\n...\n(Paste from spreadsheet or type)",
+            required=True,
+            max_length=2000
+        )
+        self.add_item(self.ladder_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        # Check if all teams have positions
-        if len(self.ladder_positions) != len(self.teams):
-            await interaction.followup.send(
-                f"❌ Please set positions for all {len(self.teams)} teams! "
-                f"(Currently set: {len(self.ladder_positions)})",
-                ephemeral=True
-            )
-            return
-
-        # Check for duplicate positions
-        positions = list(self.ladder_positions.values())
-        if len(positions) != len(set(positions)):
-            await interaction.followup.send("❌ Duplicate positions detected! Each team must have a unique position.", ephemeral=True)
-            return
-
         try:
+            # Parse the input
+            lines = [line.strip() for line in self.ladder_input.value.strip().split('\n') if line.strip()]
+
+            if len(lines) != len(self.teams):
+                await interaction.followup.send(
+                    f"❌ Expected {len(self.teams)} teams, but got {len(lines)}!\n"
+                    f"Please enter one team per line, from 1st place to last place.",
+                    ephemeral=True
+                )
+                return
+
+            # Match team names
+            team_order = []
+            errors = []
+            for position, team_name in enumerate(lines, 1):
+                team_lower = team_name.lower()
+                if team_lower in self.team_map:
+                    team_id, actual_name = self.team_map[team_lower]
+                    team_order.append((team_id, actual_name, position))
+                else:
+                    errors.append(f"Position {position}: '{team_name}' not found")
+
+            if errors:
+                await interaction.followup.send(
+                    f"❌ **Team name errors:**\n" + "\n".join(errors[:10]),
+                    ephemeral=True
+                )
+                return
+
+            # Check for duplicates
+            team_ids_used = [tid for tid, _, _ in team_order]
+            if len(team_ids_used) != len(set(team_ids_used)):
+                await interaction.followup.send(
+                    "❌ Duplicate teams detected! Each team should appear exactly once.",
+                    ephemeral=True
+                )
+                return
+
+            # Create the draft
             async with aiosqlite.connect(DB_PATH) as db:
                 # Save ladder for season if requested
                 if self.save_ladder_for_season is not None:
@@ -351,19 +393,16 @@ class LadderEntryView(discord.ui.View):
                         await db.execute("DELETE FROM ladder_positions WHERE season_id = ?", (season_id,))
 
                         # Insert new ladder positions
-                        for team_id, position in self.ladder_positions.items():
+                        for team_id, team_name, position in team_order:
                             await db.execute(
                                 "INSERT INTO ladder_positions (season_id, team_id, position) VALUES (?, ?, ?)",
                                 (season_id, team_id, position)
                             )
 
-                # Get teams in reverse ladder order (last place picks first)
-                teams_by_position = sorted(self.ladder_positions.items(), key=lambda x: x[1], reverse=True)
-
-                # Generate draft picks
+                # Generate draft picks in reverse order (last place picks first)
                 pick_counter = 1
                 for round_num in range(1, self.rounds + 1):
-                    for team_id, position in teams_by_position:
+                    for team_id, team_name, position in reversed(team_order):
                         await db.execute(
                             """INSERT INTO draft_picks (draft_name, round_number, pick_number, original_team_id, current_team_id)
                                VALUES (?, ?, ?, ?, ?)""",
@@ -373,89 +412,26 @@ class LadderEntryView(discord.ui.View):
 
                 await db.commit()
 
-                # Get team name for first pick
-                first_pick_team = next(name for tid, name in self.teams if tid == teams_by_position[0][0])
+                # Get first and last teams
+                first_place_team = team_order[0][1]
+                last_place_team = team_order[-1][1]
 
                 total_picks = len(self.teams) * self.rounds
                 response = f"✅ **Draft '{self.draft_name}' Created!**\n\n"
+                response += f"**Ladder:**\n"
+                response += f"  1st: {first_place_team}\n"
+                response += f"  ...\n"
+                response += f"  {len(team_order)}th: {last_place_team}\n\n"
                 response += f"**Total Picks:** {total_picks} ({len(self.teams)} teams × {self.rounds} rounds)\n"
-                response += f"**Last place picks first:** {first_pick_team} gets pick #1\n"
+                response += f"**First pick:** {last_place_team} (last place)\n"
                 if self.save_ladder_for_season:
                     response += f"**Ladder saved as:** Season {self.save_ladder_for_season} ladder\n"
-                response += f"\nUse `/draftorder \"{self.draft_name}\"` to view the draft order."
+                response += f"\nUse `/draftorder \"{self.draft_name}\"` to view the full draft order."
 
                 await interaction.followup.send(response, ephemeral=True)
 
-            # Disable all components
-            for item in self.children:
-                item.disabled = True
-            await interaction.message.edit(view=self)
-
         except Exception as e:
             await interaction.followup.send(f"❌ Error creating draft: {e}", ephemeral=True)
-
-
-class LadderPositionSelect(discord.ui.Select):
-    def __init__(self, teams, parent_view, dropdown_index):
-        self.parent_view = parent_view
-
-        options = []
-        for team_id, team_name in teams:
-            options.append(discord.SelectOption(
-                label=team_name,
-                value=str(team_id),
-                description="Click to set ladder position"
-            ))
-
-        super().__init__(
-            placeholder=f"Select team to set position ({dropdown_index + 1})",
-            options=options,
-            row=dropdown_index
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        team_id = int(self.values[0])
-        team_name = next(name for tid, name in self.parent_view.teams if tid == team_id)
-
-        # Create modal for position entry
-        modal = LadderPositionModal(team_id, team_name, self.parent_view)
-        await interaction.response.send_modal(modal)
-
-
-class LadderPositionModal(discord.ui.Modal):
-    def __init__(self, team_id, team_name, parent_view):
-        super().__init__(title=f"Set Position for {team_name}")
-        self.team_id = team_id
-        self.team_name = team_name
-        self.parent_view = parent_view
-
-        self.position_input = discord.ui.TextInput(
-            label="Ladder Position",
-            placeholder=f"Enter position (1 to {len(parent_view.teams)})",
-            required=True,
-            max_length=2
-        )
-        self.add_item(self.position_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            position = int(self.position_input.value)
-            if position < 1 or position > len(self.parent_view.teams):
-                await interaction.response.send_message(
-                    f"❌ Position must be between 1 and {len(self.parent_view.teams)}!",
-                    ephemeral=True
-                )
-                return
-
-            self.parent_view.ladder_positions[self.team_id] = position
-            await interaction.response.send_message(
-                f"✅ Set **{self.team_name}** to position **{position}**\n"
-                f"({len(self.parent_view.ladder_positions)}/{len(self.parent_view.teams)} teams positioned)",
-                ephemeral=True
-            )
-
-        except ValueError:
-            await interaction.response.send_message("❌ Please enter a valid number!", ephemeral=True)
 
 
 class DraftOrderView(discord.ui.View):
