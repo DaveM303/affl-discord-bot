@@ -172,6 +172,23 @@ class SeasonCommands(commands.Cog):
                     )
                 ''')
 
+                # Drop and recreate draft_picks table with new schema (draft_name instead of season_id)
+                await db.execute('DROP TABLE IF EXISTS draft_picks')
+                await db.execute('''
+                    CREATE TABLE draft_picks (
+                        pick_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        draft_name TEXT NOT NULL,
+                        round_number INTEGER,
+                        pick_number INTEGER,
+                        original_team_id INTEGER,
+                        current_team_id INTEGER,
+                        player_selected_id INTEGER,
+                        FOREIGN KEY (original_team_id) REFERENCES teams(team_id),
+                        FOREIGN KEY (current_team_id) REFERENCES teams(team_id),
+                        FOREIGN KEY (player_selected_id) REFERENCES players(player_id)
+                    )
+                ''')
+
                 # Remove lineup_channel_id from teams if it exists (moved to settings)
                 cursor = await db.execute("PRAGMA table_info(teams)")
                 columns = await cursor.fetchall()
@@ -187,7 +204,8 @@ class SeasonCommands(commands.Cog):
                     "✅ Database migrated successfully!\n"
                     "• Seasons table created (existing data preserved)\n"
                     "• Injuries table created\n"
-                    "• Trades table created\n"
+                    "• Trades table recreated with new schema\n"
+                    "• Draft Picks table recreated with new schema (draft_name)\n"
                     "• Suspensions table created\n"
                     "• Starting Lineups table created\n"
                     "• Ladder Positions table created\n"
