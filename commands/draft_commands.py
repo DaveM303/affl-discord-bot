@@ -77,16 +77,34 @@ class DraftCommands(commands.Cog):
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
     @app_commands.command(name="draftorder", description="View the draft order")
-    @app_commands.describe(draft_name="Name of the draft to view")
-    async def draft_order(self, interaction: discord.Interaction, draft_name: str):
+    @app_commands.describe(draft_name="Optional: Name of the draft to view (defaults to latest)")
+    async def draft_order(self, interaction: discord.Interaction, draft_name: str = None):
         await interaction.response.defer()
 
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Get draft picks
+                # If no draft name provided, get the most recent draft
+                if draft_name is None:
+                    cursor = await db.execute(
+                        """SELECT DISTINCT draft_name
+                           FROM draft_picks
+                           ORDER BY pick_id DESC
+                           LIMIT 1"""
+                    )
+                    draft_result = await cursor.fetchone()
+                    if not draft_result:
+                        await interaction.followup.send(
+                            "❌ No drafts found!\n"
+                            "Use `/createdraft` to create a draft."
+                        )
+                        return
+                    draft_name = draft_result[0]
+
+                # Get draft picks with team emojis
                 cursor = await db.execute(
                     """SELECT dp.pick_number, dp.round_number,
-                              ot.team_name as original_team, ct.team_name as current_team,
+                              ot.team_name as original_team, ot.emoji_id as original_emoji,
+                              ct.team_name as current_team, ct.emoji_id as current_emoji,
                               p.name as player_selected
                        FROM draft_picks dp
                        JOIN teams ot ON dp.original_team_id = ot.team_id
@@ -106,7 +124,7 @@ class DraftCommands(commands.Cog):
                     return
 
                 # Create paginated view
-                view = DraftOrderView(picks, draft_name)
+                view = DraftOrderView(picks, draft_name, interaction.guild)
                 embed = view.create_embed()
                 await interaction.followup.send(embed=embed, view=view)
 
@@ -435,10 +453,11 @@ class LadderEntryModal(discord.ui.Modal):
 
 
 class DraftOrderView(discord.ui.View):
-    def __init__(self, picks, draft_name):
+    def __init__(self, picks, draft_name, guild):
         super().__init__(timeout=180)
         self.picks = picks
         self.draft_name = draft_name
+        self.guild = guild
         self.current_round = 1
 
         # Group picks by round
@@ -452,9 +471,19 @@ class DraftOrderView(discord.ui.View):
         self.max_rounds = max(self.picks_by_round.keys()) if self.picks_by_round else 1
         self.update_buttons()
 
+    def get_emoji(self, emoji_id):
+        """Convert emoji_id to Discord emoji or return empty string"""
+        if not emoji_id:
+            return ""
+        try:
+            emoji = self.guild.get_emoji(int(emoji_id))
+            return str(emoji) + " " if emoji else ""
+        except:
+            return ""
+
     def create_embed(self):
         embed = discord.Embed(
-            title=f"🎯 {self.draft_name} - Round {self.current_round}",
+            title=f"{self.draft_name} - Round {self.current_round}",
             color=discord.Color.blue()
         )
 
@@ -465,17 +494,19 @@ class DraftOrderView(discord.ui.View):
             return embed
 
         description = ""
-        for pick_num, round_num, original_team, current_team, player_selected in round_picks:
-            # Build pick description
-            pick_desc = f"**Pick {pick_num}:** {original_team} Round {round_num}"
+        for pick_num, round_num, original_team, original_emoji, current_team, current_emoji, player_selected in round_picks:
+            # Get emojis
+            original_emoji_str = self.get_emoji(original_emoji)
+            current_emoji_str = self.get_emoji(current_emoji)
 
-            # Show if traded
-            if original_team != current_team:
-                pick_desc += f" *(traded to {current_team})*"
+            # Build pick description
+            # Format: "1. 🦅 -# Adelaide Round 1"
+            # Use current team emoji (who owns the pick), show original team in subtext
+            pick_desc = f"**{pick_num}.** {current_emoji_str}-# {original_team} Round {round_num}"
 
             # Show if player selected
             if player_selected:
-                pick_desc += f" → **{player_selected}**"
+                pick_desc += f"\n→ **{player_selected}**"
 
             description += pick_desc + "\n"
 
