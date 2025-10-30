@@ -866,22 +866,18 @@ class TradeOfferView(discord.ui.View):
 
         current_row = 0
 
-        # Draft picks dropdown for initiating team (PICKS AT TOP!)
-        if self.initiating_draft_picks and current_row < 4:
-            offering_picks_select = OfferingPicksSelect(self, row=current_row)
-            self.add_item(offering_picks_select)
-            current_row += 1
-
-        # Player selection dropdown for initiating team
-        if self.initiating_roster and current_row < 4:
+        # Combined picks+players dropdown for initiating team
+        if self.initiating_roster or self.initiating_draft_picks:
             offering_select = OfferingPlayerSelect(self, row=current_row)
             self.add_item(offering_select)
             current_row += 1
 
-            # Pagination button for initiating team if needed
-            if len(self.initiating_roster) > 25 and current_row < 4:
+            # Pagination button for initiating team if needed (only if roster > available slots after picks)
+            picks_count = len(self.initiating_draft_picks) if self.initiating_draft_picks else 0
+            available_slots = 25 - picks_count
+            if len(self.initiating_roster) > available_slots:
                 next_page_btn = discord.ui.Button(
-                    label=f"Page {self.initiating_page + 1}/{(len(self.initiating_roster) - 1) // 25 + 1}",
+                    label=f"Page {self.initiating_page + 1}/{(len(self.initiating_roster) - 1) // available_slots + 1}",
                     style=discord.ButtonStyle.secondary,
                     row=current_row
                 )
@@ -889,22 +885,18 @@ class TradeOfferView(discord.ui.View):
                 self.add_item(next_page_btn)
                 current_row += 1
 
-        # Draft picks dropdown for receiving team (PICKS AT TOP!)
-        if self.receiving_team_id and self.receiving_draft_picks and current_row < 4:
-            receiving_picks_select = ReceivingPicksSelect(self, row=current_row)
-            self.add_item(receiving_picks_select)
-            current_row += 1
-
-        # Player selection dropdown for receiving team
-        if self.receiving_team_id and self.receiving_roster and current_row < 4:
+        # Combined picks+players dropdown for receiving team
+        if self.receiving_team_id and (self.receiving_roster or self.receiving_draft_picks):
             receiving_select = ReceivingPlayerSelect(self, row=current_row)
             self.add_item(receiving_select)
             current_row += 1
 
-            # Pagination button for receiving team if needed
-            if len(self.receiving_roster) > 25 and current_row < 4:
+            # Pagination button for receiving team if needed (only if roster > available slots after picks)
+            picks_count = len(self.receiving_draft_picks) if self.receiving_draft_picks else 0
+            available_slots = 25 - picks_count
+            if len(self.receiving_roster) > available_slots:
                 next_page_btn = discord.ui.Button(
-                    label=f"Page {self.receiving_page + 1}/{(len(self.receiving_roster) - 1) // 25 + 1}",
+                    label=f"Page {self.receiving_page + 1}/{(len(self.receiving_roster) - 1) // available_slots + 1}",
                     style=discord.ButtonStyle.secondary,
                     row=current_row
                 )
@@ -912,17 +904,16 @@ class TradeOfferView(discord.ui.View):
                 self.add_item(next_page_btn)
                 current_row += 1
 
-        # Action buttons (last row - ensure we don't exceed row 4)
-        action_row = min(current_row, 4)
-        clear_btn = discord.ui.Button(label="Clear All", style=discord.ButtonStyle.secondary, row=action_row)
+        # Action buttons (last row)
+        clear_btn = discord.ui.Button(label="Clear All", style=discord.ButtonStyle.secondary, row=current_row)
         clear_btn.callback = self.clear_callback
         self.add_item(clear_btn)
 
-        send_btn = discord.ui.Button(label="Send Offer", style=discord.ButtonStyle.success, row=action_row)
+        send_btn = discord.ui.Button(label="Send Offer", style=discord.ButtonStyle.success, row=current_row)
         send_btn.callback = self.send_callback
         self.add_item(send_btn)
 
-        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger, row=action_row)
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger, row=current_row)
         cancel_btn.callback = self.cancel_callback
         self.add_item(cancel_btn)
 
@@ -1151,79 +1142,41 @@ class TradeOfferView(discord.ui.View):
         await interaction.response.send_message("✅ **Trade offer sent!**", ephemeral=True)
 
 
-class OfferingPicksSelect(discord.ui.Select):
-    """Select menu for choosing draft picks to offer"""
-    def __init__(self, parent_view, row=0):
-        self.parent_view = parent_view
-
-        options = [
-            discord.SelectOption(
-                label=f"Pick #{pick_number}",
-                description=f"{draft_name}" + (f" - {pick_origin}" if pick_origin else ""),
-                value=str(pick_id),
-                default=(pick_id in parent_view.initiating_picks)
-            )
-            for pick_id, draft_name, pick_number, pick_origin in parent_view.initiating_draft_picks
-        ]
-
-        super().__init__(
-            placeholder=f"{parent_view.initiating_team_name} sends (picks)...",
-            options=options,
-            min_values=0,
-            max_values=len(options),
-            row=row
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        self.parent_view.initiating_picks = [int(v) for v in self.values]
-        await self.parent_view.update_view(interaction)
-
-
-class ReceivingPicksSelect(discord.ui.Select):
-    """Select menu for choosing draft picks to receive"""
-    def __init__(self, parent_view, row=0):
-        self.parent_view = parent_view
-
-        options = [
-            discord.SelectOption(
-                label=f"Pick #{pick_number}",
-                description=f"{draft_name}" + (f" - {pick_origin}" if pick_origin else ""),
-                value=str(pick_id),
-                default=(pick_id in parent_view.receiving_picks)
-            )
-            for pick_id, draft_name, pick_number, pick_origin in parent_view.receiving_draft_picks
-        ]
-
-        super().__init__(
-            placeholder=f"{parent_view.receiving_team_name} sends (picks)...",
-            options=options,
-            min_values=0,
-            max_values=len(options),
-            row=row
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        self.parent_view.receiving_picks = [int(v) for v in self.values]
-        await self.parent_view.update_view(interaction)
-
-
 class OfferingPlayerSelect(discord.ui.Select):
-    """Select menu for choosing players to offer"""
+    """Select menu for choosing players AND picks to offer (combined)"""
     def __init__(self, parent_view, row=0):
         self.parent_view = parent_view
+
+        options = []
+
+        # Add draft picks first (at top of list)
+        for pick_id, draft_name, pick_number, pick_origin in parent_view.initiating_draft_picks:
+            options.append(
+                discord.SelectOption(
+                    label=f"Pick #{pick_number}",
+                    description=f"{draft_name}" + (f" - {pick_origin}" if pick_origin else ""),
+                    value=f"pick_{pick_id}",
+                    default=(pick_id in parent_view.initiating_picks)
+                )
+            )
+
         # Get current page of players
         start_idx = parent_view.initiating_page * 25
-        end_idx = start_idx + 25
+        # Account for picks taking up space (max 25 total items)
+        available_player_slots = 25 - len(options)
+        end_idx = start_idx + available_player_slots
         page_players = parent_view.initiating_roster[start_idx:end_idx]
 
-        options = [
-            discord.SelectOption(
-                label=f"{name} ({pos}, {age}, {ovr})",
-                value=str(player_id),
-                default=(player_id in parent_view.initiating_players)
+        # Add players
+        for player_id, name, pos, ovr, age in page_players:
+            options.append(
+                discord.SelectOption(
+                    label=f"{name} ({pos}, {age}, {ovr})",
+                    value=f"player_{player_id}",
+                    default=(player_id in parent_view.initiating_players)
+                )
             )
-            for player_id, name, pos, ovr, age in page_players
-        ]
+
         super().__init__(
             placeholder=f"{parent_view.initiating_team_name} sends...",
             options=options,
@@ -1233,27 +1186,55 @@ class OfferingPlayerSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        self.parent_view.initiating_players = [int(v) for v in self.values]
+        # Parse selections - separate picks from players
+        picks = []
+        players = []
+        for value in self.values:
+            if value.startswith("pick_"):
+                picks.append(int(value.replace("pick_", "")))
+            elif value.startswith("player_"):
+                players.append(int(value.replace("player_", "")))
+
+        self.parent_view.initiating_picks = picks
+        self.parent_view.initiating_players = players
         await self.parent_view.update_view(interaction)
 
 
 class ReceivingPlayerSelect(discord.ui.Select):
-    """Select menu for choosing players to receive"""
+    """Select menu for choosing players AND picks to receive (combined)"""
     def __init__(self, parent_view, row=1):
         self.parent_view = parent_view
+
+        options = []
+
+        # Add draft picks first (at top of list)
+        for pick_id, draft_name, pick_number, pick_origin in parent_view.receiving_draft_picks:
+            options.append(
+                discord.SelectOption(
+                    label=f"Pick #{pick_number}",
+                    description=f"{draft_name}" + (f" - {pick_origin}" if pick_origin else ""),
+                    value=f"pick_{pick_id}",
+                    default=(pick_id in parent_view.receiving_picks)
+                )
+            )
+
         # Get current page of players
         start_idx = parent_view.receiving_page * 25
-        end_idx = start_idx + 25
+        # Account for picks taking up space (max 25 total items)
+        available_player_slots = 25 - len(options)
+        end_idx = start_idx + available_player_slots
         page_players = parent_view.receiving_roster[start_idx:end_idx]
 
-        options = [
-            discord.SelectOption(
-                label=f"{name} ({pos}, {age}, {ovr})",
-                value=str(player_id),
-                default=(player_id in parent_view.receiving_players)
+        # Add players
+        for player_id, name, pos, ovr, age in page_players:
+            options.append(
+                discord.SelectOption(
+                    label=f"{name} ({pos}, {age}, {ovr})",
+                    value=f"player_{player_id}",
+                    default=(player_id in parent_view.receiving_players)
+                )
             )
-            for player_id, name, pos, ovr, age in page_players
-        ]
+
         super().__init__(
             placeholder=f"{parent_view.receiving_team_name} sends...",
             options=options,
@@ -1263,7 +1244,17 @@ class ReceivingPlayerSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        self.parent_view.receiving_players = [int(v) for v in self.values]
+        # Parse selections - separate picks from players
+        picks = []
+        players = []
+        for value in self.values:
+            if value.startswith("pick_"):
+                picks.append(int(value.replace("pick_", "")))
+            elif value.startswith("player_"):
+                players.append(int(value.replace("player_", "")))
+
+        self.parent_view.receiving_picks = picks
+        self.parent_view.receiving_players = players
         await self.parent_view.update_view(interaction)
 
 
