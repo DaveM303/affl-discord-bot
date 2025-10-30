@@ -193,6 +193,20 @@ class TradeCommands(commands.Cog):
 
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
+    @app_commands.command(name="pendingtrades", description="[ADMIN] View all trades pending moderator approval")
+    async def pending_trades(self, interaction: discord.Interaction):
+        # Check if user is admin
+        if not await self.is_admin(interaction):
+            await interaction.response.send_message("❌ Only administrators can use this command!", ephemeral=True)
+            return
+
+        # Create pending trades view
+        view = PendingTradesView(self.bot, interaction.guild)
+        embed = await view.create_page_embed()
+        await view.add_page_buttons()
+
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
 
 class TradeMenuView(discord.ui.View):
     """Central hub for viewing and managing trades"""
@@ -849,6 +863,351 @@ class TradeMenuView(discord.ui.View):
             self.current_view = "main"
 
         await self.update_view(interaction)
+
+
+class PendingTradesView(discord.ui.View):
+    """View for admins to review trades pending approval"""
+    def __init__(self, bot, guild):
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.guild = guild
+        self.current_page = 0
+        self.pending_trades = []
+
+    async def create_page_embed(self):
+        """Create embed for single pending trade (paginated)"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Get all trades pending moderator approval (status = 'accepted')
+            cursor = await db.execute(
+                """SELECT tr.trade_id
+                   FROM trades tr
+                   WHERE tr.status = 'accepted'
+                   ORDER BY tr.responded_at DESC""",
+            )
+            self.pending_trades = [row[0] for row in await cursor.fetchall()]
+
+            if not self.pending_trades:
+                embed = discord.Embed(
+                    title="⚖️ Pending Trades",
+                    description="📭 There are no trades pending moderator approval.",
+                    color=discord.Color.blue()
+                )
+                return embed
+
+            # Ensure page is within bounds
+            if self.current_page >= len(self.pending_trades):
+                self.current_page = 0
+
+            # Get current trade
+            current_trade_id = self.pending_trades[self.current_page]
+
+            cursor = await db.execute(
+                """SELECT tr.trade_id, t1.team_name, t1.emoji_id, t2.team_name, t2.emoji_id,
+                          tr.initiating_players, tr.receiving_players, tr.initiating_picks, tr.receiving_picks
+                   FROM trades tr
+                   JOIN teams t1 ON tr.initiating_team_id = t1.team_id
+                   JOIN teams t2 ON tr.receiving_team_id = t2.team_id
+                   WHERE tr.trade_id = ?""",
+                (current_trade_id,)
+            )
+            trade_data = await cursor.fetchone()
+
+            if not trade_data:
+                embed = discord.Embed(
+                    title="⚖️ Pending Trades",
+                    description="❌ Trade not found.",
+                    color=discord.Color.red()
+                )
+                return embed
+
+            trade_id, init_team_name, init_emoji_id, recv_team_name, recv_emoji_id, init_players_json, recv_players_json, init_picks_json, recv_picks_json = trade_data
+
+            # Get emojis
+            init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
+            recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
+            init_emoji_str = f"{init_emoji} " if init_emoji else ""
+            recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
+
+            embed = discord.Embed(
+                title=f"⚖️ Trade Pending Approval",
+                description=f"{init_emoji_str}**{init_team_name}** ↔️ {recv_emoji_str}**{recv_team_name}**",
+                color=discord.Color.gold()
+            )
+
+            # Build what each team receives (picks + players)
+            init_players = json.loads(init_players_json) if init_players_json else []
+            recv_players = json.loads(recv_players_json) if recv_players_json else []
+            init_picks = json.loads(init_picks_json) if init_picks_json else []
+            recv_picks = json.loads(recv_picks_json) if recv_picks_json else []
+
+            init_items = []
+            recv_items = []
+
+            # Add picks initiating team is offering
+            if init_picks:
+                placeholders = ','.join('?' * len(init_picks))
+                cursor = await db.execute(
+                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                    init_picks
+                )
+                init_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+            # Add players initiating team is offering
+            if init_players:
+                placeholders = ','.join('?' * len(init_players))
+                cursor = await db.execute(
+                    f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                    init_players
+                )
+                init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+
+            # Add picks receiving team is offering
+            if recv_picks:
+                placeholders = ','.join('?' * len(recv_picks))
+                cursor = await db.execute(
+                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                    recv_picks
+                )
+                recv_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+            # Add players receiving team is offering
+            if recv_players:
+                placeholders = ','.join('?' * len(recv_players))
+                cursor = await db.execute(
+                    f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                    recv_players
+                )
+                recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+
+            embed.add_field(
+                name=f"**{recv_emoji_str}receive:**",
+                value="\n".join(init_items) if init_items else "*Nothing*",
+                inline=True
+            )
+
+            embed.add_field(
+                name=f"**{init_emoji_str}receive:**",
+                value="\n".join(recv_items) if recv_items else "*Nothing*",
+                inline=True
+            )
+
+            embed.set_footer(text=f"Trade {self.current_page + 1} of {len(self.pending_trades)}")
+
+        return embed
+
+    async def add_page_buttons(self):
+        """Add buttons for pending trades page view"""
+        # Navigation buttons
+        if len(self.pending_trades) > 1:
+            prev_btn = discord.ui.Button(label="◀ Previous", style=discord.ButtonStyle.secondary, row=0)
+            prev_btn.callback = self.prev_callback
+            self.add_item(prev_btn)
+
+            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, row=0)
+            next_btn.callback = self.next_callback
+            self.add_item(next_btn)
+
+        # Action buttons
+        if self.pending_trades:
+            approve_btn = discord.ui.Button(label="Approve", style=discord.ButtonStyle.green, row=1)
+            approve_btn.callback = self.approve_callback
+            self.add_item(approve_btn)
+
+            veto_btn = discord.ui.Button(label="Veto", style=discord.ButtonStyle.red, row=1)
+            veto_btn.callback = self.veto_callback
+            self.add_item(veto_btn)
+
+        # Refresh button
+        refresh_btn = discord.ui.Button(label="Refresh", style=discord.ButtonStyle.secondary, row=2)
+        refresh_btn.callback = self.refresh_callback
+        self.add_item(refresh_btn)
+
+    async def update_view(self, interaction: discord.Interaction):
+        """Update the message with current view"""
+        self.clear_items()
+        embed = await self.create_page_embed()
+        await self.add_page_buttons()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def prev_callback(self, interaction: discord.Interaction):
+        self.current_page = (self.current_page - 1) % len(self.pending_trades)
+        await self.update_view(interaction)
+
+    async def next_callback(self, interaction: discord.Interaction):
+        self.current_page = (self.current_page + 1) % len(self.pending_trades)
+        await self.update_view(interaction)
+
+    async def refresh_callback(self, interaction: discord.Interaction):
+        # Reset to page 0 after refresh to avoid index issues
+        self.current_page = 0
+        await self.update_view(interaction)
+
+    async def approve_callback(self, interaction: discord.Interaction):
+        """Approve the current trade"""
+        if not self.pending_trades:
+            await interaction.response.send_message("❌ No trade to approve!", ephemeral=True)
+            return
+
+        trade_id = self.pending_trades[self.current_page]
+
+        # Use the existing ModeratorApprovalView's execute_trade logic
+        approval_view = ModeratorApprovalView(trade_id, self.bot)
+        await approval_view.execute_trade(interaction)
+
+        # Remove from list and update view
+        self.pending_trades.pop(self.current_page)
+        if self.current_page >= len(self.pending_trades) and self.current_page > 0:
+            self.current_page -= 1
+
+        # Update the view
+        self.clear_items()
+        embed = await self.create_page_embed()
+        await self.add_page_buttons()
+        await interaction.edit_original_response(embed=embed, view=self)
+
+    async def veto_callback(self, interaction: discord.Interaction):
+        """Veto the current trade"""
+        if not self.pending_trades:
+            await interaction.response.send_message("❌ No trade to veto!", ephemeral=True)
+            return
+
+        trade_id = self.pending_trades[self.current_page]
+
+        # Update trade status
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """UPDATE trades SET status = 'vetoed', approved_by_user_id = ?
+                   WHERE trade_id = ?""",
+                (str(interaction.user.id), trade_id)
+            )
+
+            # Get team info and trade details
+            cursor = await db.execute(
+                """SELECT t1.channel_id, t1.team_name, t1.emoji_id, t2.channel_id, t2.team_name, t2.emoji_id,
+                          tr.initiating_players, tr.receiving_players, tr.initiating_picks, tr.receiving_picks
+                   FROM trades tr
+                   JOIN teams t1 ON tr.initiating_team_id = t1.team_id
+                   JOIN teams t2 ON tr.receiving_team_id = t2.team_id
+                   WHERE tr.trade_id = ?""",
+                (trade_id,)
+            )
+            result = await cursor.fetchone()
+
+            if result:
+                init_channel_id, init_team_name, init_emoji_id, recv_channel_id, recv_team_name, recv_emoji_id, init_players_json, recv_players_json, init_picks_json, recv_picks_json = result
+
+                # Get picks and players
+                initiating_players = json.loads(init_players_json) if init_players_json else []
+                receiving_players = json.loads(recv_players_json) if recv_players_json else []
+                initiating_picks = json.loads(init_picks_json) if init_picks_json else []
+                receiving_picks = json.loads(recv_picks_json) if recv_picks_json else []
+
+                init_items = []
+                recv_items = []
+
+                # Get pick details for initiating team
+                if initiating_picks:
+                    placeholders = ','.join('?' * len(initiating_picks))
+                    cursor = await db.execute(
+                        f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                        initiating_picks
+                    )
+                    init_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+                # Get player details for initiating team
+                if initiating_players:
+                    placeholders = ','.join('?' * len(initiating_players))
+                    cursor = await db.execute(
+                        f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                        initiating_players
+                    )
+                    init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+
+                # Get pick details for receiving team
+                if receiving_picks:
+                    placeholders = ','.join('?' * len(receiving_picks))
+                    cursor = await db.execute(
+                        f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                        receiving_picks
+                    )
+                    recv_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+                # Get player details for receiving team
+                if receiving_players:
+                    placeholders = ','.join('?' * len(receiving_players))
+                    cursor = await db.execute(
+                        f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                        receiving_players
+                    )
+                    recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+
+            await db.commit()
+
+        if result:
+            # Get emojis
+            init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
+            recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
+            init_emoji_str = f"{init_emoji} " if init_emoji else ""
+            recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
+
+            # Notify initiating team
+            if init_channel_id:
+                channel = self.bot.get_channel(int(init_channel_id))
+                if channel:
+                    embed = discord.Embed(
+                        title=f"Your trade with **{recv_team_name}** was vetoed by the league commission.",
+                        color=discord.Color.red()
+                    )
+
+                    embed.add_field(
+                        name=f"**{recv_emoji_str}receive:**",
+                        value="\n".join(init_items) if init_items else "*Nothing*",
+                        inline=True
+                    )
+
+                    embed.add_field(
+                        name=f"**{init_emoji_str}receive:**",
+                        value="\n".join(recv_items) if recv_items else "*Nothing*",
+                        inline=True
+                    )
+
+                    await channel.send(embed=embed)
+
+            # Notify receiving team
+            if recv_channel_id:
+                channel = self.bot.get_channel(int(recv_channel_id))
+                if channel:
+                    embed = discord.Embed(
+                        title=f"Your trade with **{init_team_name}** was vetoed by the league commission.",
+                        color=discord.Color.red()
+                    )
+
+                    embed.add_field(
+                        name=f"**{recv_emoji_str}receive:**",
+                        value="\n".join(init_items) if init_items else "*Nothing*",
+                        inline=True
+                    )
+
+                    embed.add_field(
+                        name=f"**{init_emoji_str}receive:**",
+                        value="\n".join(recv_items) if recv_items else "*Nothing*",
+                        inline=True
+                    )
+
+                    await channel.send(embed=embed)
+
+        await interaction.response.send_message("✅ Trade vetoed and teams notified.", ephemeral=True)
+
+        # Remove from list and update view
+        self.pending_trades.pop(self.current_page)
+        if self.current_page >= len(self.pending_trades) and self.current_page > 0:
+            self.current_page -= 1
+
+        # Update the view
+        self.clear_items()
+        embed = await self.create_page_embed()
+        await self.add_page_buttons()
+        await interaction.edit_original_response(embed=embed, view=self)
 
 
 class TradeOfferView(discord.ui.View):
