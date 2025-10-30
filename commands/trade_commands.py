@@ -741,8 +741,7 @@ class TradeMenuView(discord.ui.View):
                 recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
 
                 embed = discord.Embed(
-                    title="❌ Trade Offer Declined",
-                    description=f"**{self.team_name}** has declined your trade offer.",
+                    title=f"❌ {recv_emoji_str}**{self.team_name}** have declined your trade offer!",
                     color=discord.Color.red()
                 )
 
