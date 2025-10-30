@@ -867,19 +867,19 @@ class TradeOfferView(discord.ui.View):
         current_row = 0
 
         # Draft picks dropdown for initiating team (PICKS AT TOP!)
-        if self.initiating_draft_picks:
+        if self.initiating_draft_picks and current_row < 4:
             offering_picks_select = OfferingPicksSelect(self, row=current_row)
             self.add_item(offering_picks_select)
             current_row += 1
 
         # Player selection dropdown for initiating team
-        if self.initiating_roster:
+        if self.initiating_roster and current_row < 4:
             offering_select = OfferingPlayerSelect(self, row=current_row)
             self.add_item(offering_select)
             current_row += 1
 
             # Pagination button for initiating team if needed
-            if len(self.initiating_roster) > 25:
+            if len(self.initiating_roster) > 25 and current_row < 4:
                 next_page_btn = discord.ui.Button(
                     label=f"Page {self.initiating_page + 1}/{(len(self.initiating_roster) - 1) // 25 + 1}",
                     style=discord.ButtonStyle.secondary,
@@ -890,19 +890,19 @@ class TradeOfferView(discord.ui.View):
                 current_row += 1
 
         # Draft picks dropdown for receiving team (PICKS AT TOP!)
-        if self.receiving_team_id and self.receiving_draft_picks:
+        if self.receiving_team_id and self.receiving_draft_picks and current_row < 4:
             receiving_picks_select = ReceivingPicksSelect(self, row=current_row)
             self.add_item(receiving_picks_select)
             current_row += 1
 
         # Player selection dropdown for receiving team
-        if self.receiving_team_id and self.receiving_roster:
+        if self.receiving_team_id and self.receiving_roster and current_row < 4:
             receiving_select = ReceivingPlayerSelect(self, row=current_row)
             self.add_item(receiving_select)
             current_row += 1
 
             # Pagination button for receiving team if needed
-            if len(self.receiving_roster) > 25:
+            if len(self.receiving_roster) > 25 and current_row < 4:
                 next_page_btn = discord.ui.Button(
                     label=f"Page {self.receiving_page + 1}/{(len(self.receiving_roster) - 1) // 25 + 1}",
                     style=discord.ButtonStyle.secondary,
@@ -912,16 +912,17 @@ class TradeOfferView(discord.ui.View):
                 self.add_item(next_page_btn)
                 current_row += 1
 
-        # Action buttons (last row)
-        clear_btn = discord.ui.Button(label="Clear All", style=discord.ButtonStyle.secondary, row=current_row)
+        # Action buttons (last row - ensure we don't exceed row 4)
+        action_row = min(current_row, 4)
+        clear_btn = discord.ui.Button(label="Clear All", style=discord.ButtonStyle.secondary, row=action_row)
         clear_btn.callback = self.clear_callback
         self.add_item(clear_btn)
 
-        send_btn = discord.ui.Button(label="Send Offer", style=discord.ButtonStyle.success, row=current_row)
+        send_btn = discord.ui.Button(label="Send Offer", style=discord.ButtonStyle.success, row=action_row)
         send_btn.callback = self.send_callback
         self.add_item(send_btn)
 
-        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger, row=current_row)
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger, row=action_row)
         cancel_btn.callback = self.cancel_callback
         self.add_item(cancel_btn)
 
