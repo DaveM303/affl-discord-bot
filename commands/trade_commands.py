@@ -929,8 +929,7 @@ class PendingTradesView(discord.ui.View):
             recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
 
             embed = discord.Embed(
-                title=f"⚖️ Trade Pending Approval",
-                description=f"{init_emoji_str}**{init_team_name}** ↔️ {recv_emoji_str}**{recv_team_name}**",
+                title=f"⚖️ {init_emoji_str}**{init_team_name}** ↔️ {recv_emoji_str}**{recv_team_name}**",
                 color=discord.Color.gold()
             )
 
@@ -1792,7 +1791,7 @@ class TradeResponseView(discord.ui.View):
             if not trade_result:
                 return
 
-            _, _, initiating_players_json, receiving_players_json, initiating_picks_json, receiving_picks_json, _, init_emoji_id, _, recv_emoji_id = trade_result
+            _, _, initiating_players_json, receiving_players_json, initiating_picks_json, receiving_picks_json, init_team_name, init_emoji_id, recv_team_name, recv_emoji_id = trade_result
 
             # Get emojis
             init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
@@ -1852,7 +1851,7 @@ class TradeResponseView(discord.ui.View):
         channel = self.bot.get_channel(approval_channel_id)
         if channel:
             embed = discord.Embed(
-                title="⚖️ Trade Pending Moderator Approval",
+                title=f"⚖️ {init_emoji_str}**{init_team_name}** ↔️ {recv_emoji_str}**{recv_team_name}**",
                 color=discord.Color.orange()
             )
 
@@ -1868,8 +1867,45 @@ class TradeResponseView(discord.ui.View):
                 inline=True
             )
 
-            view = ModeratorApprovalView(self.trade_id, self.bot)
+            view = RespondToTradeView(self.trade_id, self.bot)
             await channel.send(embed=embed, view=view)
+
+
+class RespondToTradeView(discord.ui.View):
+    """Simple view with just a 'Respond to Trade' button"""
+    def __init__(self, trade_id, bot):
+        super().__init__(timeout=None)
+        self.trade_id = trade_id
+        self.bot = bot
+
+    @discord.ui.button(label="Respond to Trade", style=discord.ButtonStyle.blurple, custom_id="respond_to_trade")
+    async def respond_to_trade(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Create pending trades view and navigate to this specific trade
+        view = PendingTradesView(self.bot, interaction.guild)
+
+        # Load all pending trades
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """SELECT tr.trade_id
+                   FROM trades tr
+                   WHERE tr.status = 'accepted'
+                   ORDER BY tr.responded_at DESC""",
+            )
+            view.pending_trades = [row[0] for row in await cursor.fetchall()]
+
+        # Find the index of this trade
+        if self.trade_id in view.pending_trades:
+            view.current_page = view.pending_trades.index(self.trade_id)
+        else:
+            # Trade no longer pending
+            await interaction.response.send_message("❌ This trade is no longer pending approval.", ephemeral=True)
+            return
+
+        # Create the embed and buttons
+        embed = await view.create_page_embed()
+        await view.add_page_buttons()
+
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 class ModeratorApprovalView(discord.ui.View):
