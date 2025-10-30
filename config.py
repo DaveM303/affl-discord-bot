@@ -12,4 +12,4 @@ GUILD_ID = int(os.getenv("GUILD_ID", 0)) if os.getenv("GUILD_ID") else None
 ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID")) if os.getenv("ADMIN_ROLE_ID") else None
 
 # Database Configuration
-DB_PATH = os.getenv("DB_PATH", "afl_fantasy.db")
+DB_PATH = os.getenv("DB_PATH", "affl_bot.db")
