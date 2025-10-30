@@ -109,13 +109,23 @@ async def init_db():
         await db.execute('''
             CREATE TABLE IF NOT EXISTS trades (
                 trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                proposing_team_id INTEGER,
-                receiving_team_id INTEGER,
-                status TEXT DEFAULT 'proposed',
-                proposed_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                details TEXT,
-                FOREIGN KEY (proposing_team_id) REFERENCES teams(team_id),
-                FOREIGN KEY (receiving_team_id) REFERENCES teams(team_id)
+                initiating_team_id INTEGER NOT NULL,
+                receiving_team_id INTEGER NOT NULL,
+                initiating_players TEXT,
+                receiving_players TEXT,
+                initiating_picks TEXT,
+                receiving_picks TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                responded_at TIMESTAMP,
+                approved_at TIMESTAMP,
+                created_by_user_id TEXT,
+                responded_by_user_id TEXT,
+                approved_by_user_id TEXT,
+                original_trade_id INTEGER,
+                FOREIGN KEY (initiating_team_id) REFERENCES teams(team_id),
+                FOREIGN KEY (receiving_team_id) REFERENCES teams(team_id),
+                FOREIGN KEY (original_trade_id) REFERENCES trades(trade_id)
             )
         ''')
 

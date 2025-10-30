@@ -158,6 +158,8 @@ class SeasonCommands(commands.Cog):
                         receiving_team_id INTEGER NOT NULL,
                         initiating_players TEXT,
                         receiving_players TEXT,
+                        initiating_picks TEXT,
+                        receiving_picks TEXT,
                         status TEXT DEFAULT 'pending',
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         responded_at TIMESTAMP,

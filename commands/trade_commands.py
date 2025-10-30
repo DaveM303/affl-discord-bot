@@ -335,7 +335,8 @@ class TradeMenuView(discord.ui.View):
             current_trade_id = self.incoming_trades[self.incoming_page]
 
             cursor = await db.execute(
-                """SELECT tr.trade_id, t1.team_name, t1.emoji_id, t2.emoji_id, tr.initiating_players, tr.receiving_players
+                """SELECT tr.trade_id, t1.team_name, t1.emoji_id, t2.emoji_id, tr.initiating_players, tr.receiving_players,
+                          tr.initiating_picks, tr.receiving_picks
                    FROM trades tr
                    JOIN teams t1 ON tr.initiating_team_id = t1.team_id
                    JOIN teams t2 ON tr.receiving_team_id = t2.team_id
@@ -352,7 +353,7 @@ class TradeMenuView(discord.ui.View):
                 )
                 return embed
 
-            trade_id, team_name, team_emoji_id, your_emoji_id, init_players_json, recv_players_json = trade_data
+            trade_id, team_name, team_emoji_id, your_emoji_id, init_players_json, recv_players_json, init_picks_json, recv_picks_json = trade_data
 
             # Get emojis
             team_emoji = self.bot.get_emoji(int(team_emoji_id)) if team_emoji_id else None
@@ -365,38 +366,60 @@ class TradeMenuView(discord.ui.View):
                 color=discord.Color.gold()
             )
 
-            # Get player names
+            # Build what each team receives (picks + players)
             init_players = json.loads(init_players_json) if init_players_json else []
             recv_players = json.loads(recv_players_json) if recv_players_json else []
+            init_picks = json.loads(init_picks_json) if init_picks_json else []
+            recv_picks = json.loads(recv_picks_json) if recv_picks_json else []
 
-            init_names = []
-            recv_names = []
+            init_items = []
+            recv_items = []
 
+            # Add picks they're offering
+            if init_picks:
+                placeholders = ','.join('?' * len(init_picks))
+                cursor = await db.execute(
+                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                    init_picks
+                )
+                init_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+            # Add players they're offering
             if init_players:
                 placeholders = ','.join('?' * len(init_players))
                 cursor = await db.execute(
                     f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                     init_players
                 )
-                init_names = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
+                init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
+            # Add picks you're offering
+            if recv_picks:
+                placeholders = ','.join('?' * len(recv_picks))
+                cursor = await db.execute(
+                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                    recv_picks
+                )
+                recv_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+            # Add players you're offering
             if recv_players:
                 placeholders = ','.join('?' * len(recv_players))
                 cursor = await db.execute(
                     f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                     recv_players
                 )
-                recv_names = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
+                recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             embed.add_field(
                 name=f"**{your_emoji_str}receive:**",
-                value="\n".join(init_names) if init_names else "*Nothing*",
+                value="\n".join(init_items) if init_items else "*Nothing*",
                 inline=True
             )
 
             embed.add_field(
                 name=f"**{team_emoji_str}receive:**",
-                value="\n".join(recv_names) if recv_names else "*Nothing*",
+                value="\n".join(recv_items) if recv_items else "*Nothing*",
                 inline=True
             )
 
@@ -433,7 +456,8 @@ class TradeMenuView(discord.ui.View):
             current_trade_id = self.outgoing_trades[self.outgoing_page]
 
             cursor = await db.execute(
-                """SELECT tr.trade_id, t1.emoji_id, t2.team_name, t2.emoji_id, tr.initiating_players, tr.receiving_players
+                """SELECT tr.trade_id, t1.emoji_id, t2.team_name, t2.emoji_id, tr.initiating_players, tr.receiving_players,
+                          tr.initiating_picks, tr.receiving_picks
                    FROM trades tr
                    JOIN teams t1 ON tr.initiating_team_id = t1.team_id
                    JOIN teams t2 ON tr.receiving_team_id = t2.team_id
@@ -450,7 +474,7 @@ class TradeMenuView(discord.ui.View):
                 )
                 return embed
 
-            _, your_emoji_id, team_name, team_emoji_id, init_players_json, recv_players_json = trade_data
+            _, your_emoji_id, team_name, team_emoji_id, init_players_json, recv_players_json, init_picks_json, recv_picks_json = trade_data
 
             # Get emojis
             team_emoji = self.bot.get_emoji(int(team_emoji_id)) if team_emoji_id else None
@@ -463,38 +487,60 @@ class TradeMenuView(discord.ui.View):
                 color=discord.Color.orange()
             )
 
-            # Get player names
+            # Build what each team receives (picks + players)
             init_players = json.loads(init_players_json) if init_players_json else []
             recv_players = json.loads(recv_players_json) if recv_players_json else []
+            init_picks = json.loads(init_picks_json) if init_picks_json else []
+            recv_picks = json.loads(recv_picks_json) if recv_picks_json else []
 
-            init_names = []
-            recv_names = []
+            init_items = []
+            recv_items = []
 
+            # Add picks you're offering
+            if init_picks:
+                placeholders = ','.join('?' * len(init_picks))
+                cursor = await db.execute(
+                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                    init_picks
+                )
+                init_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+            # Add players you're offering
             if init_players:
                 placeholders = ','.join('?' * len(init_players))
                 cursor = await db.execute(
                     f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                     init_players
                 )
-                init_names = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
+                init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
+            # Add picks they're offering
+            if recv_picks:
+                placeholders = ','.join('?' * len(recv_picks))
+                cursor = await db.execute(
+                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                    recv_picks
+                )
+                recv_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+            # Add players they're offering
             if recv_players:
                 placeholders = ','.join('?' * len(recv_players))
                 cursor = await db.execute(
                     f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                     recv_players
                 )
-                recv_names = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
+                recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             embed.add_field(
                 name=f"**{team_emoji_str}receive:**",
-                value="\n".join(init_names) if init_names else "*Nothing*",
+                value="\n".join(init_items) if init_items else "*Nothing*",
                 inline=True
             )
 
             embed.add_field(
                 name=f"**{your_emoji_str}receive:**",
-                value="\n".join(recv_names) if recv_names else "*Nothing*",
+                value="\n".join(recv_items) if recv_items else "*Nothing*",
                 inline=True
             )
 
@@ -727,8 +773,12 @@ class TradeOfferView(discord.ui.View):
         self.receiving_emoji_obj = None
         self.initiating_players = []  # List of player IDs
         self.receiving_players = []   # List of player IDs
+        self.initiating_picks = []    # List of pick IDs
+        self.receiving_picks = []     # List of pick IDs
         self.initiating_roster = []
         self.receiving_roster = []
+        self.initiating_draft_picks = []  # List of available draft picks
+        self.receiving_draft_picks = []   # List of available draft picks
         self.initiating_page = 0  # Current page for initiating team roster
         self.receiving_page = 0   # Current page for receiving team roster
 
@@ -769,6 +819,16 @@ class TradeOfferView(discord.ui.View):
             )
             self.initiating_roster = await cursor.fetchall()
 
+            # Get initiating team's draft picks (only available picks - no player selected)
+            cursor = await db.execute(
+                """SELECT pick_id, draft_name, pick_number, pick_origin
+                   FROM draft_picks
+                   WHERE current_team_id = ? AND player_selected_id IS NULL
+                   ORDER BY pick_number ASC""",
+                (self.initiating_team_id,)
+            )
+            self.initiating_draft_picks = await cursor.fetchall()
+
             # If receiving team is set, get their roster and name
             if self.receiving_team_id:
                 cursor = await db.execute(
@@ -787,6 +847,16 @@ class TradeOfferView(discord.ui.View):
                 )
                 self.receiving_roster = await cursor.fetchall()
 
+                # Get receiving team's draft picks (only available picks - no player selected)
+                cursor = await db.execute(
+                    """SELECT pick_id, draft_name, pick_number, pick_origin
+                       FROM draft_picks
+                       WHERE current_team_id = ? AND player_selected_id IS NULL
+                       ORDER BY pick_number ASC""",
+                    (self.receiving_team_id,)
+                )
+                self.receiving_draft_picks = await cursor.fetchall()
+
         # Add components
         self.add_components()
 
@@ -796,13 +866,19 @@ class TradeOfferView(discord.ui.View):
 
         current_row = 0
 
-        # Player selection dropdown for initiating team (row 0)
+        # Draft picks dropdown for initiating team (PICKS AT TOP!)
+        if self.initiating_draft_picks:
+            offering_picks_select = OfferingPicksSelect(self, row=current_row)
+            self.add_item(offering_picks_select)
+            current_row += 1
+
+        # Player selection dropdown for initiating team
         if self.initiating_roster:
             offering_select = OfferingPlayerSelect(self, row=current_row)
             self.add_item(offering_select)
             current_row += 1
 
-            # Pagination button for initiating team if needed (row 1)
+            # Pagination button for initiating team if needed
             if len(self.initiating_roster) > 25:
                 next_page_btn = discord.ui.Button(
                     label=f"Page {self.initiating_page + 1}/{(len(self.initiating_roster) - 1) // 25 + 1}",
@@ -813,13 +889,19 @@ class TradeOfferView(discord.ui.View):
                 self.add_item(next_page_btn)
                 current_row += 1
 
-        # Player selection dropdown for receiving team (row 2 or 1)
+        # Draft picks dropdown for receiving team (PICKS AT TOP!)
+        if self.receiving_team_id and self.receiving_draft_picks:
+            receiving_picks_select = ReceivingPicksSelect(self, row=current_row)
+            self.add_item(receiving_picks_select)
+            current_row += 1
+
+        # Player selection dropdown for receiving team
         if self.receiving_team_id and self.receiving_roster:
             receiving_select = ReceivingPlayerSelect(self, row=current_row)
             self.add_item(receiving_select)
             current_row += 1
 
-            # Pagination button for receiving team if needed (row 3 or 2)
+            # Pagination button for receiving team if needed
             if len(self.receiving_roster) > 25:
                 next_page_btn = discord.ui.Button(
                     label=f"Page {self.receiving_page + 1}/{(len(self.receiving_roster) - 1) // 25 + 1}",
@@ -850,23 +932,41 @@ class TradeOfferView(discord.ui.View):
             color=discord.Color.blue()
         )
 
-        # Get player names
-        offering_names = []
-        receiving_names = []
+        # Build what each team is offering
+        offering_items = []
+        receiving_items = []
 
+        # Add draft picks first (at top)
+        if self.initiating_picks:
+            for pick_id in self.initiating_picks:
+                pick = next((p for p in self.initiating_draft_picks if p[0] == pick_id), None)
+                if pick:
+                    _, draft_name, pick_number, pick_origin = pick
+                    offering_items.append(f"**Pick #{pick_number}**")
+
+        # Add players
         if self.initiating_players:
             for player_id in self.initiating_players:
                 player = next((p for p in self.initiating_roster if p[0] == player_id), None)
                 if player:
                     _, name, pos, ovr, age = player
-                    offering_names.append(f"**{name}** ({pos}, {age}, {ovr})")
+                    offering_items.append(f"**{name}** ({pos}, {age}, {ovr})")
 
+        # Add receiving draft picks first (at top)
+        if self.receiving_picks:
+            for pick_id in self.receiving_picks:
+                pick = next((p for p in self.receiving_draft_picks if p[0] == pick_id), None)
+                if pick:
+                    _, draft_name, pick_number, pick_origin = pick
+                    receiving_items.append(f"**Pick #{pick_number}**")
+
+        # Add receiving players
         if self.receiving_players:
             for player_id in self.receiving_players:
                 player = next((p for p in self.receiving_roster if p[0] == player_id), None)
                 if player:
                     _, name, pos, ovr, age = player
-                    receiving_names.append(f"**{name}** ({pos}, {age}, {ovr})")
+                    receiving_items.append(f"**{name}** ({pos}, {age}, {ovr})")
 
         # Show what each team receives (emoji only, or "Select team" if not selected)
         receiving_field_name = self.receiving_emoji if self.receiving_emoji else "Select team"
@@ -874,13 +974,13 @@ class TradeOfferView(discord.ui.View):
 
         embed.add_field(
             name=f"**{receiving_field_name} receive:**",
-            value="\n".join(offering_names) if offering_names else "*No players selected*",
+            value="\n".join(offering_items) if offering_items else "*Nothing selected*",
             inline=True
         )
 
         embed.add_field(
             name=f"**{initiating_field_name} receive:**",
-            value="\n".join(receiving_names) if receiving_names else "*No players selected*",
+            value="\n".join(receiving_items) if receiving_items else "*Nothing selected*",
             inline=True
         )
 
@@ -917,6 +1017,8 @@ class TradeOfferView(discord.ui.View):
         """Clear all selections"""
         self.initiating_players = []
         self.receiving_players = []
+        self.initiating_picks = []
+        self.receiving_picks = []
         await self.update_view(interaction)
 
     async def cancel_callback(self, interaction: discord.Interaction):
@@ -930,21 +1032,23 @@ class TradeOfferView(discord.ui.View):
             await interaction.response.send_message("❌ Please select a team to trade with!", ephemeral=True)
             return
 
-        if not self.initiating_players and not self.receiving_players:
-            await interaction.response.send_message("❌ Please add at least one player to the trade!", ephemeral=True)
+        if not self.initiating_players and not self.receiving_players and not self.initiating_picks and not self.receiving_picks:
+            await interaction.response.send_message("❌ Please add at least one player or pick to the trade!", ephemeral=True)
             return
 
         # Store trade in database
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
                 """INSERT INTO trades (initiating_team_id, receiving_team_id, initiating_players,
-                                      receiving_players, status, created_by_user_id, original_trade_id)
-                   VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+                                      receiving_players, initiating_picks, receiving_picks, status, created_by_user_id, original_trade_id)
+                   VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
                 (
                     self.initiating_team_id,
                     self.receiving_team_id,
                     json.dumps(self.initiating_players),
                     json.dumps(self.receiving_players),
+                    json.dumps(self.initiating_picks),
+                    json.dumps(self.receiving_picks),
                     str(self.user_id),
                     self.original_trade_id
                 )
@@ -977,35 +1081,53 @@ class TradeOfferView(discord.ui.View):
                     color=discord.Color.gold()
                 )
 
-                # Get player names for embed
-                offering_names = []
-                receiving_names = []
+                # Build what each team receives (picks + players)
+                offering_items = []
+                receiving_items = []
 
+                # Add initiating picks
+                if self.initiating_picks:
+                    for pick_id in self.initiating_picks:
+                        pick = next((p for p in self.initiating_draft_picks if p[0] == pick_id), None)
+                        if pick:
+                            _, draft_name, pick_number, pick_origin = pick
+                            offering_items.append(f"**Pick #{pick_number}**")
+
+                # Add initiating players
                 if self.initiating_players:
                     for player_id in self.initiating_players:
                         player = next((p for p in self.initiating_roster if p[0] == player_id), None)
                         if player:
                             _, name, pos, ovr, age = player
-                            offering_names.append(f"**{name}** ({pos}, {age}, {ovr})")
+                            offering_items.append(f"**{name}** ({pos}, {age}, {ovr})")
 
+                # Add receiving picks
+                if self.receiving_picks:
+                    for pick_id in self.receiving_picks:
+                        pick = next((p for p in self.receiving_draft_picks if p[0] == pick_id), None)
+                        if pick:
+                            _, draft_name, pick_number, pick_origin = pick
+                            receiving_items.append(f"**Pick #{pick_number}**")
+
+                # Add receiving players
                 if self.receiving_players:
                     for player_id in self.receiving_players:
                         player = next((p for p in self.receiving_roster if p[0] == player_id), None)
                         if player:
                             _, name, pos, ovr, age = player
-                            receiving_names.append(f"**{name}** ({pos}, {age}, {ovr})")
+                            receiving_items.append(f"**{name}** ({pos}, {age}, {ovr})")
 
                 receiving_emoji_str = f"{self.receiving_emoji} " if self.receiving_emoji else ""
 
                 embed.add_field(
                     name=f"**{receiving_emoji_str}receive:**",
-                    value="\n".join(offering_names) if offering_names else "*Nothing*",
+                    value="\n".join(offering_items) if offering_items else "*Nothing*",
                     inline=True
                 )
 
                 embed.add_field(
                     name=f"**{initiating_emoji_str}receive:**",
-                    value="\n".join(receiving_names) if receiving_names else "*Nothing*",
+                    value="\n".join(receiving_items) if receiving_items else "*Nothing*",
                     inline=True
                 )
 
@@ -1026,6 +1148,62 @@ class TradeOfferView(discord.ui.View):
                 await db.commit()
 
         await interaction.response.send_message("✅ **Trade offer sent!**", ephemeral=True)
+
+
+class OfferingPicksSelect(discord.ui.Select):
+    """Select menu for choosing draft picks to offer"""
+    def __init__(self, parent_view, row=0):
+        self.parent_view = parent_view
+
+        options = [
+            discord.SelectOption(
+                label=f"Pick #{pick_number}",
+                description=f"{draft_name}" + (f" - {pick_origin}" if pick_origin else ""),
+                value=str(pick_id),
+                default=(pick_id in parent_view.initiating_picks)
+            )
+            for pick_id, draft_name, pick_number, pick_origin in parent_view.initiating_draft_picks
+        ]
+
+        super().__init__(
+            placeholder=f"{parent_view.initiating_team_name} sends (picks)...",
+            options=options,
+            min_values=0,
+            max_values=len(options),
+            row=row
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.initiating_picks = [int(v) for v in self.values]
+        await self.parent_view.update_view(interaction)
+
+
+class ReceivingPicksSelect(discord.ui.Select):
+    """Select menu for choosing draft picks to receive"""
+    def __init__(self, parent_view, row=0):
+        self.parent_view = parent_view
+
+        options = [
+            discord.SelectOption(
+                label=f"Pick #{pick_number}",
+                description=f"{draft_name}" + (f" - {pick_origin}" if pick_origin else ""),
+                value=str(pick_id),
+                default=(pick_id in parent_view.receiving_picks)
+            )
+            for pick_id, draft_name, pick_number, pick_origin in parent_view.receiving_draft_picks
+        ]
+
+        super().__init__(
+            placeholder=f"{parent_view.receiving_team_name} sends (picks)...",
+            options=options,
+            min_values=0,
+            max_values=len(options),
+            row=row
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.receiving_picks = [int(v) for v in self.values]
+        await self.parent_view.update_view(interaction)
 
 
 class OfferingPlayerSelect(discord.ui.Select):
@@ -1153,6 +1331,7 @@ class TradeResponseView(discord.ui.View):
             # Get trade details
             cursor = await db.execute(
                 """SELECT t.initiating_team_id, t.receiving_team_id, t.initiating_players, t.receiving_players,
+                          t.initiating_picks, t.receiving_picks,
                           t1.team_name, t1.emoji_id, t2.team_name, t2.emoji_id
                    FROM trades t
                    JOIN teams t1 ON t.initiating_team_id = t1.team_id
@@ -1165,7 +1344,7 @@ class TradeResponseView(discord.ui.View):
             if not trade_result:
                 return
 
-            _, _, initiating_players_json, receiving_players_json, _, init_emoji_id, _, recv_emoji_id = trade_result
+            _, _, initiating_players_json, receiving_players_json, initiating_picks_json, receiving_picks_json, _, init_emoji_id, _, recv_emoji_id = trade_result
 
             # Get emojis
             init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
@@ -1173,10 +1352,22 @@ class TradeResponseView(discord.ui.View):
             init_emoji_str = f"{init_emoji} " if init_emoji else ""
             recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
 
-            # Get player names
-            initiating_player_names = []
-            receiving_player_names = []
+            # Build what each team receives (picks + players)
+            initiating_items = []
+            receiving_items = []
 
+            # Get picks in initiating offer
+            if initiating_picks_json:
+                initiating_picks = json.loads(initiating_picks_json)
+                if initiating_picks:
+                    placeholders = ','.join('?' * len(initiating_picks))
+                    cursor = await db.execute(
+                        f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                        initiating_picks
+                    )
+                    initiating_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+            # Get players in initiating offer
             if initiating_players_json:
                 initiating_players = json.loads(initiating_players_json)
                 if initiating_players:
@@ -1185,8 +1376,20 @@ class TradeResponseView(discord.ui.View):
                         f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                         initiating_players
                     )
-                    initiating_player_names = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
+                    initiating_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
+            # Get picks in receiving offer
+            if receiving_picks_json:
+                receiving_picks = json.loads(receiving_picks_json)
+                if receiving_picks:
+                    placeholders = ','.join('?' * len(receiving_picks))
+                    cursor = await db.execute(
+                        f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                        receiving_picks
+                    )
+                    receiving_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+            # Get players in receiving offer
             if receiving_players_json:
                 receiving_players = json.loads(receiving_players_json)
                 if receiving_players:
@@ -1195,7 +1398,7 @@ class TradeResponseView(discord.ui.View):
                         f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                         receiving_players
                     )
-                    receiving_player_names = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
+                    receiving_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
         # Send to approval channel
         channel = self.bot.get_channel(approval_channel_id)
@@ -1207,13 +1410,13 @@ class TradeResponseView(discord.ui.View):
 
             embed.add_field(
                 name=f"**{recv_emoji_str}receive:**",
-                value="\n".join(initiating_player_names) if initiating_player_names else "*Nothing*",
+                value="\n".join(initiating_items) if initiating_items else "*Nothing*",
                 inline=True
             )
 
             embed.add_field(
                 name=f"**{init_emoji_str}receive:**",
-                value="\n".join(receiving_player_names) if receiving_player_names else "*Nothing*",
+                value="\n".join(receiving_items) if receiving_items else "*Nothing*",
                 inline=True
             )
 
@@ -1378,7 +1581,8 @@ class ModeratorApprovalView(discord.ui.View):
         async with aiosqlite.connect(DB_PATH) as db:
             # Get trade details
             cursor = await db.execute(
-                """SELECT initiating_team_id, receiving_team_id, initiating_players, receiving_players
+                """SELECT initiating_team_id, receiving_team_id, initiating_players, receiving_players,
+                          initiating_picks, receiving_picks
                    FROM trades WHERE trade_id = ?""",
                 (self.trade_id,)
             )
@@ -1388,11 +1592,13 @@ class ModeratorApprovalView(discord.ui.View):
                 await interaction.response.send_message("❌ Trade not found!", ephemeral=True)
                 return
 
-            init_team_id, recv_team_id, init_players_json, recv_players_json = result
+            init_team_id, recv_team_id, init_players_json, recv_players_json, init_picks_json, recv_picks_json = result
 
-            # Parse player lists
+            # Parse player and pick lists
             init_players = json.loads(init_players_json) if init_players_json else []
             recv_players = json.loads(recv_players_json) if recv_players_json else []
+            init_picks = json.loads(init_picks_json) if init_picks_json else []
+            recv_picks = json.loads(recv_picks_json) if recv_picks_json else []
 
             # Validate that all players are on the correct teams before executing trade
             if init_players:
@@ -1423,6 +1629,35 @@ class ModeratorApprovalView(discord.ui.View):
                     )
                     return
 
+            # Validate that picks haven't been used already
+            if init_picks:
+                placeholders = ','.join('?' * len(init_picks))
+                cursor = await db.execute(
+                    f"SELECT pick_id FROM draft_picks WHERE pick_id IN ({placeholders}) AND current_team_id = ? AND player_selected_id IS NULL",
+                    init_picks + [init_team_id]
+                )
+                valid_init_picks = [row[0] for row in await cursor.fetchall()]
+                if len(valid_init_picks) != len(init_picks):
+                    await interaction.response.send_message(
+                        "❌ Trade cannot be executed: Some picks from the initiating team have been used or are no longer owned by them!",
+                        ephemeral=True
+                    )
+                    return
+
+            if recv_picks:
+                placeholders = ','.join('?' * len(recv_picks))
+                cursor = await db.execute(
+                    f"SELECT pick_id FROM draft_picks WHERE pick_id IN ({placeholders}) AND current_team_id = ? AND player_selected_id IS NULL",
+                    recv_picks + [recv_team_id]
+                )
+                valid_recv_picks = [row[0] for row in await cursor.fetchall()]
+                if len(valid_recv_picks) != len(recv_picks):
+                    await interaction.response.send_message(
+                        "❌ Trade cannot be executed: Some picks from the receiving team have been used or are no longer owned by them!",
+                        ephemeral=True
+                    )
+                    return
+
             # Transfer players
             if init_players:
                 placeholders = ','.join('?' * len(init_players))
@@ -1436,6 +1671,21 @@ class ModeratorApprovalView(discord.ui.View):
                 await db.execute(
                     f"UPDATE players SET team_id = ? WHERE player_id IN ({placeholders})",
                     [init_team_id] + recv_players
+                )
+
+            # Transfer draft picks
+            if init_picks:
+                placeholders = ','.join('?' * len(init_picks))
+                await db.execute(
+                    f"UPDATE draft_picks SET current_team_id = ? WHERE pick_id IN ({placeholders})",
+                    [recv_team_id] + init_picks
+                )
+
+            if recv_picks:
+                placeholders = ','.join('?' * len(recv_picks))
+                await db.execute(
+                    f"UPDATE draft_picks SET current_team_id = ? WHERE pick_id IN ({placeholders})",
+                    [init_team_id] + recv_picks
                 )
 
             # Update trade status
@@ -1455,25 +1705,45 @@ class ModeratorApprovalView(discord.ui.View):
             )
             team_info = await cursor.fetchone()
 
-            # Get player names
-            init_player_names = []
-            recv_player_names = []
+            # Build what each team receives (picks + players)
+            init_receiving = []
+            recv_receiving = []
 
-            if init_players:
-                placeholders = ','.join('?' * len(init_players))
+            # Get picks that initiating team receives
+            if recv_picks:
+                placeholders = ','.join('?' * len(recv_picks))
                 cursor = await db.execute(
-                    f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
-                    init_players
+                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                    recv_picks
                 )
-                init_player_names = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
+                init_receiving.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
 
+            # Get players that initiating team receives
             if recv_players:
                 placeholders = ','.join('?' * len(recv_players))
                 cursor = await db.execute(
                     f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                     recv_players
                 )
-                recv_player_names = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
+                init_receiving.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+
+            # Get picks that receiving team receives
+            if init_picks:
+                placeholders = ','.join('?' * len(init_picks))
+                cursor = await db.execute(
+                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                    init_picks
+                )
+                recv_receiving.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+            # Get players that receiving team receives
+            if init_players:
+                placeholders = ','.join('?' * len(init_players))
+                cursor = await db.execute(
+                    f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                    init_players
+                )
+                recv_receiving.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             # Get trade log channel
             cursor = await db.execute(
@@ -1503,13 +1773,13 @@ class ModeratorApprovalView(discord.ui.View):
 
         embed.add_field(
             name=f"**{init_emoji_str}receive:**",
-            value="\n".join(recv_player_names) if recv_player_names else "*Nothing*",
+            value="\n".join(init_receiving) if init_receiving else "*Nothing*",
             inline=True
         )
 
         embed.add_field(
             name=f"**{recv_emoji_str}receive:**",
-            value="\n".join(init_player_names) if init_player_names else "*Nothing*",
+            value="\n".join(recv_receiving) if recv_receiving else "*Nothing*",
             inline=True
         )
 
