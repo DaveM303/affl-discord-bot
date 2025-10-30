@@ -626,7 +626,7 @@ class TradeMenuView(discord.ui.View):
 
         trade_id = self.incoming_trades[self.incoming_page]
 
-        # Use the existing accept logic from TradeResponseView
+        # Update trade status
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 """UPDATE trades SET status = 'accepted', responded_at = CURRENT_TIMESTAMP,
@@ -636,6 +636,10 @@ class TradeMenuView(discord.ui.View):
             await db.commit()
 
         await interaction.response.send_message("✅ Trade accepted! Sent to moderators for approval.", ephemeral=True)
+
+        # Send to moderators for approval
+        response_view = TradeResponseView(trade_id, self.bot)
+        await response_view.send_to_moderators(interaction)
 
         # Refresh view (will show next trade or go back to main)
         self.incoming_trades.pop(self.incoming_page)
@@ -655,7 +659,19 @@ class TradeMenuView(discord.ui.View):
 
         trade_id = self.incoming_trades[self.incoming_page]
 
+        # Get trade and team info for notification
         async with aiosqlite.connect(DB_PATH) as db:
+            # Get trade details
+            cursor = await db.execute(
+                """SELECT t.initiating_team_id, t1.team_name, t1.channel_id
+                   FROM trades t
+                   JOIN teams t1 ON t.initiating_team_id = t1.team_id
+                   WHERE t.trade_id = ?""",
+                (trade_id,)
+            )
+            trade_info = await cursor.fetchone()
+
+            # Update status
             await db.execute(
                 """UPDATE trades SET status = 'declined', responded_at = CURRENT_TIMESTAMP,
                    responded_by_user_id = ? WHERE trade_id = ?""",
@@ -664,6 +680,18 @@ class TradeMenuView(discord.ui.View):
             await db.commit()
 
         await interaction.response.send_message("✅ Trade declined.", ephemeral=True)
+
+        # Notify the team that proposed the trade
+        if trade_info and trade_info[2]:
+            initiating_team_id, initiating_team_name, channel_id = trade_info
+            channel = self.bot.get_channel(int(channel_id))
+            if channel:
+                embed = discord.Embed(
+                    title="❌ Trade Offer Declined",
+                    description=f"**{self.team_name}** has declined your trade offer.",
+                    color=discord.Color.red()
+                )
+                await channel.send(embed=embed)
 
         # Refresh view
         self.incoming_trades.pop(self.incoming_page)
@@ -686,7 +714,8 @@ class TradeMenuView(discord.ui.View):
         # Get trade details and open counter offer view
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
-                """SELECT receiving_team_id, initiating_team_id, initiating_players, receiving_players
+                """SELECT receiving_team_id, initiating_team_id, initiating_players, receiving_players,
+                          initiating_picks, receiving_picks
                    FROM trades WHERE trade_id = ?""",
                 (trade_id,)
             )
@@ -696,7 +725,7 @@ class TradeMenuView(discord.ui.View):
                 await interaction.response.send_message("❌ Trade not found!", ephemeral=True)
                 return
 
-            receiving_team_id, initiating_team_id, init_players_json, recv_players_json = result
+            receiving_team_id, initiating_team_id, init_players_json, recv_players_json, init_picks_json, recv_picks_json = result
 
             cursor = await db.execute(
                 "SELECT team_name FROM teams WHERE team_id = ?",
@@ -704,7 +733,7 @@ class TradeMenuView(discord.ui.View):
             )
             team_result = await cursor.fetchone()
 
-        # Open trade offer view as counter offer
+        # Open trade offer view as counter offer (original trade will be cancelled when counter is sent)
         from commands.trade_commands import TradeOfferView
         view = TradeOfferView(
             receiving_team_id,
@@ -717,9 +746,11 @@ class TradeMenuView(discord.ui.View):
             receiving_team_id=initiating_team_id
         )
 
-        # Swap the players
+        # Swap the players and picks
         view.initiating_players = json.loads(recv_players_json) if recv_players_json else []
         view.receiving_players = json.loads(init_players_json) if init_players_json else []
+        view.initiating_picks = json.loads(recv_picks_json) if recv_picks_json else []
+        view.receiving_picks = json.loads(init_picks_json) if init_picks_json else []
 
         await view.initialize()
         embed = view.create_embed()
