@@ -216,11 +216,13 @@ class TradeMenuView(discord.ui.View):
         self.team_name = team_name
         self.bot = bot
         self.guild = guild
-        self.current_view = "main"  # Track current view: "main", "incoming", "outgoing"
+        self.current_view = "main"  # Track current view: "main", "incoming", "outgoing", "approval"
         self.incoming_page = 0  # Current page for incoming offers
         self.outgoing_page = 0  # Current page for outgoing offers
+        self.approval_page = 0  # Current page for approval trades
         self.incoming_trades = []  # List of incoming trade IDs
         self.outgoing_trades = []  # List of outgoing trade IDs
+        self.approval_trades = []  # List of approval trade IDs
         self.specific_trade_id = specific_trade_id  # If opening to a specific trade
 
         # If opening to specific trade, set up the view
@@ -240,18 +242,25 @@ class TradeMenuView(discord.ui.View):
         elif self.current_view == "outgoing":
             embed = await self.create_outgoing_page_embed()
             await self.add_outgoing_page_buttons()
+        elif self.current_view == "approval":
+            embed = await self.create_approval_page_embed()
+            await self.add_approval_page_buttons()
 
         await interaction.response.edit_message(embed=embed, view=self)
 
     def add_main_buttons(self):
         """Add buttons for main view"""
-        view_incoming = discord.ui.Button(label="View Incoming Offers", style=discord.ButtonStyle.primary, row=0)
+        view_incoming = discord.ui.Button(label="Incoming Offers", style=discord.ButtonStyle.primary, row=0)
         view_incoming.callback = self.view_incoming_callback
         self.add_item(view_incoming)
 
-        view_outgoing = discord.ui.Button(label="View Outgoing Offers", style=discord.ButtonStyle.primary, row=0)
+        view_outgoing = discord.ui.Button(label="Outgoing Offers", style=discord.ButtonStyle.primary, row=0)
         view_outgoing.callback = self.view_outgoing_callback
         self.add_item(view_outgoing)
+
+        view_approval = discord.ui.Button(label="Pending Mod Approval", style=discord.ButtonStyle.green, row=1)
+        view_approval.callback = self.view_approval_callback
+        self.add_item(view_approval)
 
         refresh = discord.ui.Button(label="Refresh", style=discord.ButtonStyle.secondary, row=1)
         refresh.callback = self.refresh_callback
@@ -264,6 +273,10 @@ class TradeMenuView(discord.ui.View):
 
     async def view_outgoing_callback(self, interaction: discord.Interaction):
         self.current_view = "outgoing"
+        await self.update_view(interaction)
+
+    async def view_approval_callback(self, interaction: discord.Interaction):
+        self.current_view = "approval"
         await self.update_view(interaction)
 
     async def back_callback(self, interaction: discord.Interaction):
@@ -562,6 +575,128 @@ class TradeMenuView(discord.ui.View):
 
         return embed
 
+    async def create_approval_page_embed(self):
+        """Create embed for single approval trade (paginated)"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Get all trades awaiting approval (accepted by both teams)
+            cursor = await db.execute(
+                """SELECT tr.trade_id
+                   FROM trades tr
+                   WHERE (tr.initiating_team_id = ? OR tr.receiving_team_id = ?) AND tr.status = 'accepted'
+                   ORDER BY tr.responded_at DESC""",
+                (self.team_id, self.team_id)
+            )
+            self.approval_trades = [row[0] for row in await cursor.fetchall()]
+
+            if not self.approval_trades:
+                embed = discord.Embed(
+                    title="⚖️ Pending Mod Approval",
+                    description="📭 You have no trades pending moderator approval.",
+                    color=discord.Color.blue()
+                )
+                return embed
+
+            # Ensure page is within bounds
+            if self.approval_page >= len(self.approval_trades):
+                self.approval_page = 0
+
+            # Get current trade
+            current_trade_id = self.approval_trades[self.approval_page]
+
+            cursor = await db.execute(
+                """SELECT tr.trade_id, t1.team_name, t1.emoji_id, t2.team_name, t2.emoji_id,
+                          tr.initiating_players, tr.receiving_players, tr.initiating_picks, tr.receiving_picks
+                   FROM trades tr
+                   JOIN teams t1 ON tr.initiating_team_id = t1.team_id
+                   JOIN teams t2 ON tr.receiving_team_id = t2.team_id
+                   WHERE tr.trade_id = ?""",
+                (current_trade_id,)
+            )
+            trade_data = await cursor.fetchone()
+
+            if not trade_data:
+                embed = discord.Embed(
+                    title="⚖️ Pending Mod Approval",
+                    description="❌ Trade not found.",
+                    color=discord.Color.red()
+                )
+                return embed
+
+            trade_id, init_team_name, init_emoji_id, recv_team_name, recv_emoji_id, init_players_json, recv_players_json, init_picks_json, recv_picks_json = trade_data
+
+            # Get emojis
+            init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
+            recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
+            init_emoji_str = f"{init_emoji} " if init_emoji else ""
+            recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
+
+            embed = discord.Embed(
+                title="⚖️ Trade Pending Mod Approval",
+                description=f"{init_emoji_str}**{init_team_name}** ↔️ {recv_emoji_str}**{recv_team_name}**",
+                color=discord.Color.gold()
+            )
+
+            # Build what each team receives (picks + players)
+            init_players = json.loads(init_players_json) if init_players_json else []
+            recv_players = json.loads(recv_players_json) if recv_players_json else []
+            init_picks = json.loads(init_picks_json) if init_picks_json else []
+            recv_picks = json.loads(recv_picks_json) if recv_picks_json else []
+
+            init_items = []
+            recv_items = []
+
+            # Add picks initiating team is offering
+            if init_picks:
+                placeholders = ','.join('?' * len(init_picks))
+                cursor = await db.execute(
+                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                    init_picks
+                )
+                init_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+            # Add players initiating team is offering
+            if init_players:
+                placeholders = ','.join('?' * len(init_players))
+                cursor = await db.execute(
+                    f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                    init_players
+                )
+                init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+
+            # Add picks receiving team is offering
+            if recv_picks:
+                placeholders = ','.join('?' * len(recv_picks))
+                cursor = await db.execute(
+                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                    recv_picks
+                )
+                recv_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+            # Add players receiving team is offering
+            if recv_players:
+                placeholders = ','.join('?' * len(recv_players))
+                cursor = await db.execute(
+                    f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                    recv_players
+                )
+                recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+
+            embed.add_field(
+                name=f"**{recv_emoji_str}receive:**",
+                value="\n".join(init_items) if init_items else "*Nothing*",
+                inline=True
+            )
+
+            embed.add_field(
+                name=f"**{init_emoji_str}receive:**",
+                value="\n".join(recv_items) if recv_items else "*Nothing*",
+                inline=True
+            )
+
+            embed.set_footer(text=f"Trade {self.approval_page + 1} of {len(self.approval_trades)}")
+
+        return embed
+
     async def add_incoming_page_buttons(self):
         """Add buttons for incoming offers page view"""
         # Navigation buttons
@@ -616,6 +751,23 @@ class TradeMenuView(discord.ui.View):
         back_btn.callback = self.back_callback
         self.add_item(back_btn)
 
+    async def add_approval_page_buttons(self):
+        """Add buttons for approval page view"""
+        # Navigation buttons
+        if len(self.approval_trades) > 1:
+            prev_btn = discord.ui.Button(label="◀ Previous", style=discord.ButtonStyle.secondary, row=0)
+            prev_btn.callback = self.prev_approval_callback
+            self.add_item(prev_btn)
+
+            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, row=0)
+            next_btn.callback = self.next_approval_callback
+            self.add_item(next_btn)
+
+        # Back button
+        back_btn = discord.ui.Button(label="← Back to Main Menu", style=discord.ButtonStyle.secondary, row=1)
+        back_btn.callback = self.back_callback
+        self.add_item(back_btn)
+
     async def prev_incoming_callback(self, interaction: discord.Interaction):
         self.incoming_page = (self.incoming_page - 1) % len(self.incoming_trades)
         await self.update_view(interaction)
@@ -630,6 +782,14 @@ class TradeMenuView(discord.ui.View):
 
     async def next_outgoing_callback(self, interaction: discord.Interaction):
         self.outgoing_page = (self.outgoing_page + 1) % len(self.outgoing_trades)
+        await self.update_view(interaction)
+
+    async def prev_approval_callback(self, interaction: discord.Interaction):
+        self.approval_page = (self.approval_page - 1) % len(self.approval_trades)
+        await self.update_view(interaction)
+
+    async def next_approval_callback(self, interaction: discord.Interaction):
+        self.approval_page = (self.approval_page + 1) % len(self.approval_trades)
         await self.update_view(interaction)
 
     async def accept_incoming_callback(self, interaction: discord.Interaction):
@@ -846,11 +1006,100 @@ class TradeMenuView(discord.ui.View):
         trade_id = self.outgoing_trades[self.outgoing_page]
 
         async with aiosqlite.connect(DB_PATH) as db:
+            # Get trade details for notification
+            cursor = await db.execute(
+                """SELECT t.initiating_team_id, t1.team_name, t2.channel_id, t1.emoji_id, t2.emoji_id,
+                          t.initiating_players, t.receiving_players, t.initiating_picks, t.receiving_picks
+                   FROM trades t
+                   JOIN teams t1 ON t.initiating_team_id = t1.team_id
+                   JOIN teams t2 ON t.receiving_team_id = t2.team_id
+                   WHERE t.trade_id = ?""",
+                (trade_id,)
+            )
+            trade_info = await cursor.fetchone()
+
             await db.execute(
                 "UPDATE trades SET status = 'withdrawn' WHERE trade_id = ?",
                 (trade_id,)
             )
             await db.commit()
+
+        # Notify the receiving team
+        if trade_info:
+            initiating_team_id, init_team_name, recv_channel_id, init_emoji_id, recv_emoji_id, init_players_json, recv_players_json, init_picks_json, recv_picks_json = trade_info
+
+            if recv_channel_id:
+                channel = self.bot.get_channel(int(recv_channel_id))
+                if channel:
+                    # Get emojis
+                    init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
+                    recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
+                    init_emoji_str = f"{init_emoji} " if init_emoji else ""
+                    recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
+
+                    # Build trade details
+                    init_items = []
+                    recv_items = []
+
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        # Get picks
+                        init_picks = json.loads(init_picks_json) if init_picks_json else []
+                        recv_picks = json.loads(recv_picks_json) if recv_picks_json else []
+
+                        if init_picks:
+                            placeholders = ','.join('?' * len(init_picks))
+                            cursor = await db.execute(
+                                f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                                init_picks
+                            )
+                            init_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+                        if recv_picks:
+                            placeholders = ','.join('?' * len(recv_picks))
+                            cursor = await db.execute(
+                                f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                                recv_picks
+                            )
+                            recv_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+                        # Get players
+                        init_players = json.loads(init_players_json) if init_players_json else []
+                        recv_players = json.loads(recv_players_json) if recv_players_json else []
+
+                        if init_players:
+                            placeholders = ','.join('?' * len(init_players))
+                            cursor = await db.execute(
+                                f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                                init_players
+                            )
+                            init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+
+                        if recv_players:
+                            placeholders = ','.join('?' * len(recv_players))
+                            cursor = await db.execute(
+                                f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                                recv_players
+                            )
+                            recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+
+                    embed = discord.Embed(
+                        title=f"↩️ {init_emoji_str}**{init_team_name}** have withdrawn their trade offer!",
+                        color=discord.Color.dark_gray()
+                    )
+
+                    embed.add_field(
+                        name=f"**{recv_emoji_str}receive:**",
+                        value="\n".join(init_items) if init_items else "*Nothing*",
+                        inline=True
+                    )
+
+                    embed.add_field(
+                        name=f"**{init_emoji_str}receive:**",
+                        value="\n".join(recv_items) if recv_items else "*Nothing*",
+                        inline=True
+                    )
+
+                    await channel.send(embed=embed)
 
         await interaction.response.send_message("✅ Trade offer withdrawn.", ephemeral=True)
 
@@ -929,7 +1178,8 @@ class PendingTradesView(discord.ui.View):
             recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
 
             embed = discord.Embed(
-                title=f"⚖️ {init_emoji_str}**{init_team_name}** ↔️ {recv_emoji_str}**{recv_team_name}**",
+                title="⚖️ Trade Pending Mod Approval",
+                description=f"{init_emoji_str}**{init_team_name}** ↔️ {recv_emoji_str}**{recv_team_name}**",
                 color=discord.Color.gold()
             )
 
@@ -1196,17 +1446,6 @@ class PendingTradesView(discord.ui.View):
                     await channel.send(embed=embed)
 
         await interaction.response.send_message("✅ Trade vetoed and teams notified.", ephemeral=True)
-
-        # Remove from list and update view
-        self.pending_trades.pop(self.current_page)
-        if self.current_page >= len(self.pending_trades) and self.current_page > 0:
-            self.current_page -= 1
-
-        # Update the view
-        self.clear_items()
-        embed = await self.create_page_embed()
-        await self.add_page_buttons()
-        await interaction.edit_original_response(embed=embed, view=self)
 
 
 class TradeOfferView(discord.ui.View):
@@ -1851,7 +2090,8 @@ class TradeResponseView(discord.ui.View):
         channel = self.bot.get_channel(approval_channel_id)
         if channel:
             embed = discord.Embed(
-                title=f"⚖️ {init_emoji_str}**{init_team_name}** ↔️ {recv_emoji_str}**{recv_team_name}**",
+                title="⚖️ Trade Pending Mod Approval",
+                description=f"{init_emoji_str}**{init_team_name}** ↔️ {recv_emoji_str}**{recv_team_name}**",
                 color=discord.Color.orange()
             )
 

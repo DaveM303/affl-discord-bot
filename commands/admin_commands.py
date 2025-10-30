@@ -715,7 +715,7 @@ class AdminCommands(commands.Cog):
             if duplicate_warning:
                 response += duplicate_warning
 
-            await interaction.response.send_message(response)
+            await interaction.response.send_message(response, ephemeral=True)
 
     @app_commands.command(name="exportdata", description="[ADMIN] Export all teams and players to Excel")
     async def export_data(self, interaction: discord.Interaction):

@@ -446,8 +446,8 @@ class PlayerCommands(commands.Cog):
             # Create paginated view
             view = SearchPlayersView(players, filter_text, self)
             embed = view.create_embed()
-            
-            await interaction.response.send_message(embed=embed, view=view)
+
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 class SearchPlayersView(discord.ui.View):
