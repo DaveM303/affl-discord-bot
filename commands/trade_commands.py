@@ -322,7 +322,7 @@ class TradeMenuView(discord.ui.View):
         # Add summary
         summary = f"**Incoming Offers:** {incoming_pending} 🟡"
         summary += f"\n**Outgoing Offers:** {outgoing_pending} 🟡"
-        summary += f"\n**Awaiting Mod Approval:** {awaiting_approval} 🟢"
+        summary += f"\n**Pending Mod Approval:** {awaiting_approval} 🟢"
 
         embed.add_field(name="Overview", value=summary, inline=False)
 
