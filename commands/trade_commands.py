@@ -1568,7 +1568,7 @@ class ModeratorApprovalView(discord.ui.View):
             # Get team info and trade details
             cursor = await db.execute(
                 """SELECT t1.channel_id, t1.team_name, t1.emoji_id, t2.channel_id, t2.team_name, t2.emoji_id,
-                          tr.initiating_players, tr.receiving_players
+                          tr.initiating_players, tr.receiving_players, tr.initiating_picks, tr.receiving_picks
                    FROM trades tr
                    JOIN teams t1 ON tr.initiating_team_id = t1.team_id
                    JOIN teams t2 ON tr.receiving_team_id = t2.team_id
@@ -1578,30 +1578,52 @@ class ModeratorApprovalView(discord.ui.View):
             result = await cursor.fetchone()
 
             if result:
-                init_channel_id, init_team_name, init_emoji_id, recv_channel_id, recv_team_name, recv_emoji_id, init_players_json, recv_players_json = result
+                init_channel_id, init_team_name, init_emoji_id, recv_channel_id, recv_team_name, recv_emoji_id, init_players_json, recv_players_json, init_picks_json, recv_picks_json = result
 
-                # Get player details
+                # Get picks and players
                 initiating_players = json.loads(init_players_json) if init_players_json else []
                 receiving_players = json.loads(recv_players_json) if recv_players_json else []
+                initiating_picks = json.loads(init_picks_json) if init_picks_json else []
+                receiving_picks = json.loads(recv_picks_json) if recv_picks_json else []
 
-                init_player_details = []
-                recv_player_details = []
+                init_items = []
+                recv_items = []
 
+                # Get pick details for initiating team
+                if initiating_picks:
+                    placeholders = ','.join('?' * len(initiating_picks))
+                    cursor = await db.execute(
+                        f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                        initiating_picks
+                    )
+                    init_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+                # Get player details for initiating team
                 if initiating_players:
                     placeholders = ','.join('?' * len(initiating_players))
                     cursor = await db.execute(
                         f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                         initiating_players
                     )
-                    init_player_details = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
+                    init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
+                # Get pick details for receiving team
+                if receiving_picks:
+                    placeholders = ','.join('?' * len(receiving_picks))
+                    cursor = await db.execute(
+                        f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
+                        receiving_picks
+                    )
+                    recv_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+
+                # Get player details for receiving team
                 if receiving_players:
                     placeholders = ','.join('?' * len(receiving_players))
                     cursor = await db.execute(
                         f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                         receiving_players
                     )
-                    recv_player_details = [f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
+                    recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             await db.commit()
 
@@ -1623,13 +1645,13 @@ class ModeratorApprovalView(discord.ui.View):
 
                     embed.add_field(
                         name=f"**{recv_emoji_str}receive:**",
-                        value="\n".join(init_player_details) if init_player_details else "*Nothing*",
+                        value="\n".join(init_items) if init_items else "*Nothing*",
                         inline=True
                     )
 
                     embed.add_field(
                         name=f"**{init_emoji_str}receive:**",
-                        value="\n".join(recv_player_details) if recv_player_details else "*Nothing*",
+                        value="\n".join(recv_items) if recv_items else "*Nothing*",
                         inline=True
                     )
 
@@ -1646,13 +1668,13 @@ class ModeratorApprovalView(discord.ui.View):
 
                     embed.add_field(
                         name=f"**{recv_emoji_str}receive:**",
-                        value="\n".join(init_player_details) if init_player_details else "*Nothing*",
+                        value="\n".join(init_items) if init_items else "*Nothing*",
                         inline=True
                     )
 
                     embed.add_field(
                         name=f"**{init_emoji_str}receive:**",
-                        value="\n".join(recv_player_details) if recv_player_details else "*Nothing*",
+                        value="\n".join(recv_items) if recv_items else "*Nothing*",
                         inline=True
                     )
 
