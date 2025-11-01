@@ -52,13 +52,14 @@ class DraftCommands(commands.Cog):
         except:
             return []
 
-    @app_commands.command(name="createdraft", description="[ADMIN] Create a draft by setting ladder order")
+    @app_commands.command(name="createdraft", description="[ADMIN] Create a draft (season-linked or manual)")
     @app_commands.describe(
-        draft_name="Name for this draft (e.g. 'Season 9 Draft', 'Mid-Season Draft')",
+        season_number="Season number to link this draft to (leave blank for manual draft)",
+        draft_name="Custom draft name (only for manual drafts, leave blank for season-linked)",
         rounds="Number of rounds (default: 4)",
         save_ladder_for_season="Optional: Season number to save this ladder for (for historical records)"
     )
-    async def create_draft(self, interaction: discord.Interaction, draft_name: str, rounds: int = 4, save_ladder_for_season: int = None):
+    async def create_draft(self, interaction: discord.Interaction, season_number: int = None, draft_name: str = None, rounds: int = 4, save_ladder_for_season: int = None):
         await interaction.response.defer(ephemeral=True)
 
         # Check if user has admin role
@@ -66,35 +67,70 @@ class DraftCommands(commands.Cog):
             await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
             return
 
+        # Validate parameters
+        if season_number is None and draft_name is None:
+            await interaction.followup.send(
+                "❌ You must provide either `season_number` (for season-linked draft) OR `draft_name` (for manual draft)!",
+                ephemeral=True
+            )
+            return
+
+        if season_number is not None and draft_name is not None:
+            await interaction.followup.send(
+                "❌ Provide only ONE: either `season_number` OR `draft_name`, not both!",
+                ephemeral=True
+            )
+            return
+
         if rounds < 1 or rounds > 10:
             await interaction.followup.send("❌ Number of rounds must be between 1 and 10!", ephemeral=True)
             return
 
-        # Validate save_ladder_for_season if provided
-        if save_ladder_for_season is not None:
-            try:
-                async with aiosqlite.connect(DB_PATH) as db:
-                    cursor = await db.execute("SELECT season_id FROM seasons WHERE season_number = ?", (save_ladder_for_season,))
-                    season_data = await cursor.fetchone()
-                    if not season_data:
-                        await interaction.followup.send(f"❌ Season {save_ladder_for_season} does not exist!", ephemeral=True)
-                        return
-            except Exception as e:
-                await interaction.followup.send(f"❌ Error validating season: {e}", ephemeral=True)
-                return
-
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Check if draft name already exists
-                cursor = await db.execute("SELECT COUNT(*) FROM draft_picks WHERE draft_name = ?", (draft_name,))
-                existing_count = (await cursor.fetchone())[0]
-                if existing_count > 0:
+                # Determine draft name and season linkage
+                if season_number is not None:
+                    # Season-linked draft: auto-generate name
+                    final_draft_name = f"Season {season_number - 1} National Draft"
+                    linked_season = season_number
+
+                    # Verify season exists
+                    cursor = await db.execute(
+                        "SELECT season_id FROM seasons WHERE season_number = ?",
+                        (season_number,)
+                    )
+                    if not await cursor.fetchone():
+                        await interaction.followup.send(
+                            f"❌ Season {season_number} doesn't exist!",
+                            ephemeral=True
+                        )
+                        return
+                else:
+                    # Manual draft: use provided name
+                    final_draft_name = draft_name
+                    linked_season = None
+
+                # Check if draft already exists
+                cursor = await db.execute("SELECT draft_id FROM drafts WHERE draft_name = ?", (final_draft_name,))
+                if await cursor.fetchone():
                     await interaction.followup.send(
-                        f"❌ A draft named '{draft_name}' already exists!\n"
-                        f"Please choose a different name.",
+                        f"❌ A draft named '{final_draft_name}' already exists!",
                         ephemeral=True
                     )
                     return
+
+                # Validate save_ladder_for_season if provided
+                if save_ladder_for_season is not None:
+                    cursor = await db.execute(
+                        "SELECT season_id FROM seasons WHERE season_number = ?",
+                        (save_ladder_for_season,)
+                    )
+                    if not await cursor.fetchone():
+                        await interaction.followup.send(
+                            f"❌ Season {save_ladder_for_season} does not exist!",
+                            ephemeral=True
+                        )
+                        return
 
                 # Get all teams
                 cursor = await db.execute("SELECT team_id, team_name FROM teams ORDER BY team_name")
@@ -104,18 +140,23 @@ class DraftCommands(commands.Cog):
                     await interaction.followup.send("❌ No teams found!", ephemeral=True)
                     return
 
-                # Send the modal via a button
-                view = LadderEntryStartView(teams, draft_name, rounds, save_ladder_for_season)
-                await interaction.followup.send(
-                    f"📊 **Create Draft: {draft_name}**\n\n"
-                    f"**Rounds:** {rounds}\n"
-                    f"{'**Save ladder as:** Season ' + str(save_ladder_for_season) + ' ladder' if save_ladder_for_season else ''}\n\n"
-                    f"Click the button below to enter the ladder order.\n"
-                    f"You'll paste teams in order from 1st place to last place (one team per line).\n"
-                    f"The draft order will be the reverse of the ladder (last place picks first).",
-                    view=view,
-                    ephemeral=True
-                )
+                # Send the view with Enter Ladder or Skip buttons
+                view = LadderEntryStartView(teams, final_draft_name, rounds, save_ladder_for_season, linked_season)
+
+                draft_type = "Season-Linked" if linked_season else "Manual"
+                message = f"📊 **Create Draft: {final_draft_name}**\n\n"
+                message += f"**Type:** {draft_type}\n"
+                if linked_season:
+                    message += f"**Linked to:** Season {linked_season}\n"
+                message += f"**Rounds:** {rounds}\n"
+                if save_ladder_for_season:
+                    message += f"**Save ladder as:** Season {save_ladder_for_season} ladder\n"
+                message += f"\n**Choose an option:**\n"
+                message += f"• **Enter Ladder Order** - Set pick order now (draft status: 'current')\n"
+                message += f"• **Skip - Future Draft** - Create without ladder order (draft status: 'future')\n\n"
+                message += f"*For future drafts, you can set the ladder order later using `/setdraftladder`*"
+
+                await interaction.followup.send(message, view=view, ephemeral=True)
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
@@ -440,26 +481,69 @@ class DraftCommands(commands.Cog):
 
 
 class LadderEntryStartView(discord.ui.View):
-    def __init__(self, teams, draft_name, rounds, save_ladder_for_season):
+    def __init__(self, teams, draft_name, rounds, save_ladder_for_season, linked_season=None):
         super().__init__(timeout=300)
         self.teams = teams
         self.draft_name = draft_name
         self.rounds = rounds
         self.save_ladder_for_season = save_ladder_for_season
+        self.linked_season = linked_season
 
-    @discord.ui.button(label="📝 Enter Ladder Order", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="📝 Enter Ladder Order", style=discord.ButtonStyle.primary, row=0)
     async def enter_ladder_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        modal = LadderEntryModal(self.teams, self.draft_name, self.rounds, self.save_ladder_for_season)
+        modal = LadderEntryModal(self.teams, self.draft_name, self.rounds, self.save_ladder_for_season, self.linked_season)
         await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="⏭️ Skip - Future Draft", style=discord.ButtonStyle.secondary, row=0)
+    async def skip_ladder_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Create draft in drafts table with status 'future'
+                cursor = await db.execute(
+                    """INSERT INTO drafts (draft_name, season_number, status, rounds)
+                       VALUES (?, ?, 'future', ?)""",
+                    (self.draft_name, self.linked_season, self.rounds)
+                )
+                draft_id = cursor.lastrowid
+
+                # Generate picks for all teams (pick_number = NULL for future drafts)
+                for team_id, team_name in self.teams:
+                    for round_num in range(1, self.rounds + 1):
+                        pick_origin = f"{team_name} R{round_num}"
+                        await db.execute(
+                            """INSERT INTO draft_picks (draft_id, draft_name, season_number, round_number,
+                                                        pick_number, pick_origin, original_team_id, current_team_id)
+                               VALUES (?, ?, ?, ?, NULL, ?, ?, ?)""",
+                            (draft_id, self.draft_name, self.linked_season, round_num, pick_origin, team_id, team_id)
+                        )
+
+                await db.commit()
+
+                message = f"✅ **Future draft created: {self.draft_name}**\n\n"
+                message += f"**Status:** Future (no ladder order set)\n"
+                message += f"**Rounds:** {self.rounds}\n"
+                if self.linked_season:
+                    message += f"**Linked to:** Season {self.linked_season}\n"
+                message += f"**Picks generated:** {len(self.teams) * self.rounds} picks\n\n"
+                message += f"📌 These picks are now tradeable!\n"
+                message += f"Use `/setdraftladder` to set the ladder order later."
+
+                await interaction.followup.send(message, ephemeral=True)
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error creating future draft: {e}", ephemeral=True)
 
 
 class LadderEntryModal(discord.ui.Modal):
-    def __init__(self, teams, draft_name, rounds, save_ladder_for_season):
+    def __init__(self, teams, draft_name, rounds, save_ladder_for_season, linked_season=None):
         super().__init__(title=f"Ladder Order: {draft_name[:30]}")
         self.teams = teams
         self.draft_name = draft_name
         self.rounds = rounds
         self.save_ladder_for_season = save_ladder_for_season
+        self.linked_season = linked_season
 
         # Create a map of team names (case insensitive) to team IDs
         self.team_map = {name.lower(): (tid, name) for tid, name in teams}
@@ -533,15 +617,24 @@ class LadderEntryModal(discord.ui.Modal):
                                 (season_id, team_id, position)
                             )
 
+                # Create draft in drafts table with status 'current' (ladder is set)
+                cursor = await db.execute(
+                    """INSERT INTO drafts (draft_name, season_number, status, rounds, ladder_set_at)
+                       VALUES (?, ?, 'current', ?, CURRENT_TIMESTAMP)""",
+                    (self.draft_name, self.linked_season, self.rounds)
+                )
+                draft_id = cursor.lastrowid
+
                 # Generate draft picks in reverse order (last place picks first)
                 pick_counter = 1
                 for round_num in range(1, self.rounds + 1):
                     for team_id, team_name, position in reversed(team_order):
                         pick_origin = f"{team_name} R{round_num}"
                         await db.execute(
-                            """INSERT INTO draft_picks (draft_name, round_number, pick_number, pick_origin, current_team_id)
-                               VALUES (?, ?, ?, ?, ?)""",
-                            (self.draft_name, round_num, pick_counter, pick_origin, team_id)
+                            """INSERT INTO draft_picks (draft_id, draft_name, season_number, round_number, pick_number,
+                                                        pick_origin, original_team_id, current_team_id)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (draft_id, self.draft_name, self.linked_season, round_num, pick_counter, pick_origin, team_id, team_id)
                         )
                         pick_counter += 1
 
