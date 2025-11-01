@@ -161,6 +161,69 @@ class DraftCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
+    @app_commands.command(name="setdraftladder", description="[ADMIN] Set ladder order for a future draft")
+    @app_commands.describe(draft_name="Name of the future draft to set ladder for")
+    @app_commands.autocomplete(draft_name=draft_name_autocomplete)
+    async def set_draft_ladder(self, interaction: discord.Interaction, draft_name: str):
+        await interaction.response.defer(ephemeral=True)
+
+        # Check if user has admin role
+        if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
+            await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get draft by name
+                cursor = await db.execute(
+                    "SELECT draft_id, status, rounds, season_number FROM drafts WHERE draft_name = ?",
+                    (draft_name,)
+                )
+                draft_info = await cursor.fetchone()
+
+                if not draft_info:
+                    await interaction.followup.send(
+                        f"❌ Draft '{draft_name}' not found!",
+                        ephemeral=True
+                    )
+                    return
+
+                draft_id, status, rounds, season_number = draft_info
+
+                # Check if draft is 'future' status
+                if status != 'future':
+                    await interaction.followup.send(
+                        f"❌ Draft '{draft_name}' already has ladder order set (status: {status})!\n"
+                        f"You can only set ladder order for drafts with 'future' status.",
+                        ephemeral=True
+                    )
+                    return
+
+                # Get all teams
+                cursor = await db.execute("SELECT team_id, team_name FROM teams ORDER BY team_name")
+                teams = await cursor.fetchall()
+
+                if not teams:
+                    await interaction.followup.send("❌ No teams found!", ephemeral=True)
+                    return
+
+                # Send the ladder entry modal
+                view = SetLadderView(teams, draft_id, draft_name, rounds, season_number)
+
+                message = f"📊 **Set Ladder Order: {draft_name}**\n\n"
+                message += f"**Current Status:** {status}\n"
+                message += f"**Rounds:** {rounds}\n"
+                if season_number:
+                    message += f"**Linked to:** Season {season_number}\n"
+                message += f"\nClick the button below to enter the ladder order.\n"
+                message += f"You'll paste teams in order from 1st place to last place (one team per line).\n"
+                message += f"The draft order will be the reverse of the ladder (last place picks first)."
+
+                await interaction.followup.send(message, view=view, ephemeral=True)
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
     @app_commands.command(name="draftorder", description="View the draft order")
     @app_commands.describe(draft_name="Optional: Name of the draft to view (defaults to latest)")
     @app_commands.autocomplete(draft_name=draft_name_autocomplete)
@@ -660,6 +723,134 @@ class LadderEntryModal(discord.ui.Modal):
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error creating draft: {e}", ephemeral=True)
+
+
+class SetLadderView(discord.ui.View):
+    """View for setting ladder order on existing future draft"""
+    def __init__(self, teams, draft_id, draft_name, rounds, season_number):
+        super().__init__(timeout=300)
+        self.teams = teams
+        self.draft_id = draft_id
+        self.draft_name = draft_name
+        self.rounds = rounds
+        self.season_number = season_number
+
+    @discord.ui.button(label="📝 Enter Ladder Order", style=discord.ButtonStyle.primary)
+    async def enter_ladder_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = SetLadderModal(self.teams, self.draft_id, self.draft_name, self.rounds, self.season_number)
+        await interaction.response.send_modal(modal)
+
+
+class SetLadderModal(discord.ui.Modal):
+    """Modal for setting ladder order on existing future draft"""
+    def __init__(self, teams, draft_id, draft_name, rounds, season_number):
+        super().__init__(title=f"Set Ladder: {draft_name[:30]}")
+        self.teams = teams
+        self.draft_id = draft_id
+        self.draft_name = draft_name
+        self.rounds = rounds
+        self.season_number = season_number
+
+        # Create a map of team names (case insensitive) to team IDs
+        self.team_map = {name.lower(): (tid, name) for tid, name in teams}
+
+        self.ladder_input = discord.ui.TextInput(
+            label="Ladder Order (1st to last, one per line)",
+            style=discord.TextStyle.paragraph,
+            placeholder="Adelaide\nBrisbane\nCarlton\nCollingwood\n...\n(Paste from spreadsheet or type)",
+            required=True,
+            max_length=2000
+        )
+        self.add_item(self.ladder_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            # Parse the input
+            lines = [line.strip() for line in self.ladder_input.value.strip().split('\n') if line.strip()]
+
+            if len(lines) != len(self.teams):
+                await interaction.followup.send(
+                    f"❌ Expected {len(self.teams)} teams, but got {len(lines)}!\n"
+                    f"Please enter one team per line, from 1st place to last place.",
+                    ephemeral=True
+                )
+                return
+
+            # Match team names
+            team_order = []
+            errors = []
+            for position, team_name in enumerate(lines, 1):
+                team_lower = team_name.lower()
+                if team_lower in self.team_map:
+                    team_id, actual_name = self.team_map[team_lower]
+                    team_order.append((team_id, actual_name, position))
+                else:
+                    errors.append(f"Position {position}: '{team_name}' not found")
+
+            if errors:
+                await interaction.followup.send(
+                    f"❌ **Team name errors:**\n" + "\n".join(errors[:10]),
+                    ephemeral=True
+                )
+                return
+
+            # Check for duplicates
+            team_ids_used = [tid for tid, _, _ in team_order]
+            if len(team_ids_used) != len(set(team_ids_used)):
+                await interaction.followup.send(
+                    "❌ Duplicate teams detected! Each team should appear exactly once.",
+                    ephemeral=True
+                )
+                return
+
+            # Update the draft
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Update draft status to 'current' and set ladder_set_at timestamp
+                await db.execute(
+                    """UPDATE drafts SET status = 'current', ladder_set_at = CURRENT_TIMESTAMP
+                       WHERE draft_id = ?""",
+                    (self.draft_id,)
+                )
+
+                # Delete all existing picks for this draft
+                await db.execute("DELETE FROM draft_picks WHERE draft_id = ?", (self.draft_id,))
+
+                # Generate new picks with pick_number set, in reverse order (last place picks first)
+                pick_counter = 1
+                for round_num in range(1, self.rounds + 1):
+                    for team_id, team_name, position in reversed(team_order):
+                        pick_origin = f"{team_name} R{round_num}"
+                        await db.execute(
+                            """INSERT INTO draft_picks (draft_id, draft_name, season_number, round_number, pick_number,
+                                                        pick_origin, original_team_id, current_team_id)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (self.draft_id, self.draft_name, self.season_number, round_num, pick_counter, pick_origin, team_id, team_id)
+                        )
+                        pick_counter += 1
+
+                await db.commit()
+
+                # Get first and last teams
+                first_place_team = team_order[0][1]
+                last_place_team = team_order[-1][1]
+
+                total_picks = len(self.teams) * self.rounds
+                response = f"✅ **Ladder Order Set for '{self.draft_name}'!**\n\n"
+                response += f"**Status:** Future → Current\n"
+                response += f"**Ladder:**\n"
+                response += f"  1st: {first_place_team}\n"
+                response += f"  ...\n"
+                response += f"  {len(team_order)}th: {last_place_team}\n\n"
+                response += f"**Total Picks:** {total_picks} ({len(self.teams)} teams × {self.rounds} rounds)\n"
+                response += f"**First pick:** {last_place_team} (last place)\n"
+                response += f"\nUse `/draftorder \"{self.draft_name}\"` to view the full draft order."
+
+                await interaction.followup.send(response, ephemeral=True)
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error setting ladder: {e}", ephemeral=True)
 
 
 class DraftOrderView(discord.ui.View):

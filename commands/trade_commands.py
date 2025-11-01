@@ -35,6 +35,73 @@ class TradeCommands(commands.Cog):
 
         return False
 
+    def format_pick_display(self, pick_number, season_number, round_number, emoji_id, current_season):
+        """
+        Format pick display based on whether it's a current or future pick.
+
+        Args:
+            pick_number: The pick number (NULL for future picks)
+            season_number: The season this pick belongs to
+            round_number: The round number (1-4)
+            emoji_id: The emoji ID for the original team
+            current_season: The current active season number
+
+        Returns:
+            Formatted string like "Pick #5" or "S10 1st (🦅)"
+        """
+        if pick_number is not None:
+            # Current draft with ladder set - use pick number
+            return f"Pick #{pick_number}"
+        else:
+            # Future draft - use season, round, and emoji
+            round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
+            emoji = f"<:{emoji_id}>" if emoji_id else ""
+            return f"S{season_number} {round_suffix} {emoji}".strip()
+
+    async def format_picks_for_display(self, db, pick_ids_json):
+        """
+        Fetch pick details from database and format them for display in embeds.
+
+        Args:
+            db: Database connection
+            pick_ids_json: JSON string of pick IDs
+
+        Returns:
+            List of formatted pick display strings
+        """
+        if not pick_ids_json:
+            return []
+
+        pick_ids = json.loads(pick_ids_json)
+        if not pick_ids:
+            return []
+
+        # Get current active season
+        cursor = await db.execute(
+            "SELECT season_number FROM seasons WHERE status = 'active' LIMIT 1"
+        )
+        result = await cursor.fetchone()
+        current_season = result[0] if result else 999
+
+        formatted_picks = []
+        for pick_id in pick_ids:
+            cursor = await db.execute(
+                """SELECT dp.pick_number, dp.season_number, dp.round_number, t.emoji_id
+                   FROM draft_picks dp
+                   JOIN teams t ON dp.original_team_id = t.team_id
+                   WHERE dp.pick_id = ?""",
+                (pick_id,)
+            )
+            result = await cursor.fetchone()
+            if result:
+                pick_number, season_number, round_number, emoji_id = result
+                pick_display = self.format_pick_display(
+                    pick_number, season_number, round_number, emoji_id, current_season
+                )
+                formatted_picks.append(f"**{pick_display}**")
+
+        return formatted_picks
+
     async def get_user_team(self, user_id, guild):
         """Get the team associated with a user based on their role"""
         async with aiosqlite.connect(DB_PATH) as db:
@@ -168,6 +235,7 @@ class TradeCommands(commands.Cog):
             interaction.user.id,
             self.bot,
             interaction.guild,
+            self,  # parent_cog
             receiving_team_id=receiving_team_id
         )
         await view.initialize()
@@ -187,7 +255,7 @@ class TradeCommands(commands.Cog):
             return
 
         # Create trade menu
-        view = TradeMenuView(team_id, team_name, self.bot, interaction.guild)
+        view = TradeMenuView(team_id, team_name, self.bot, interaction.guild, self)
         embed = await view.create_main_embed()
         view.add_main_buttons()
 
@@ -210,12 +278,13 @@ class TradeCommands(commands.Cog):
 
 class TradeMenuView(discord.ui.View):
     """Central hub for viewing and managing trades"""
-    def __init__(self, team_id, team_name, bot, guild, specific_trade_id=None):
+    def __init__(self, team_id, team_name, bot, guild, parent_cog, specific_trade_id=None):
         super().__init__(timeout=600)
         self.team_id = team_id
         self.team_name = team_name
         self.bot = bot
         self.guild = guild
+        self.parent_cog = parent_cog  # Reference to TradeCommands cog
         self.current_view = "main"  # Track current view: "main", "incoming", "outgoing", "approval"
         self.incoming_page = 0  # Current page for incoming offers
         self.outgoing_page = 0  # Current page for outgoing offers
@@ -403,13 +472,9 @@ class TradeMenuView(discord.ui.View):
             recv_items = []
 
             # Add picks they're offering
-            if init_picks:
-                placeholders = ','.join('?' * len(init_picks))
-                cursor = await db.execute(
-                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                    init_picks
-                )
-                init_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+            if init_picks_json:
+                formatted_picks = await self.parent_cog.format_picks_for_display(db, init_picks_json)
+                init_items.extend(formatted_picks)
 
             # Add players they're offering
             if init_players:
@@ -421,13 +486,9 @@ class TradeMenuView(discord.ui.View):
                 init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             # Add picks you're offering
-            if recv_picks:
-                placeholders = ','.join('?' * len(recv_picks))
-                cursor = await db.execute(
-                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                    recv_picks
-                )
-                recv_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+            if recv_picks_json:
+                formatted_picks = await self.parent_cog.format_picks_for_display(db, recv_picks_json)
+                recv_items.extend(formatted_picks)
 
             # Add players you're offering
             if recv_players:
@@ -524,13 +585,9 @@ class TradeMenuView(discord.ui.View):
             recv_items = []
 
             # Add picks you're offering
-            if init_picks:
-                placeholders = ','.join('?' * len(init_picks))
-                cursor = await db.execute(
-                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                    init_picks
-                )
-                init_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+            if init_picks_json:
+                formatted_picks = await self.parent_cog.format_picks_for_display(db, init_picks_json)
+                init_items.extend(formatted_picks)
 
             # Add players you're offering
             if init_players:
@@ -542,13 +599,9 @@ class TradeMenuView(discord.ui.View):
                 init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             # Add picks they're offering
-            if recv_picks:
-                placeholders = ','.join('?' * len(recv_picks))
-                cursor = await db.execute(
-                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                    recv_picks
-                )
-                recv_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+            if recv_picks_json:
+                formatted_picks = await self.parent_cog.format_picks_for_display(db, recv_picks_json)
+                recv_items.extend(formatted_picks)
 
             # Add players they're offering
             if recv_players:
@@ -646,13 +699,9 @@ class TradeMenuView(discord.ui.View):
             recv_items = []
 
             # Add picks initiating team is offering
-            if init_picks:
-                placeholders = ','.join('?' * len(init_picks))
-                cursor = await db.execute(
-                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                    init_picks
-                )
-                init_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+            if init_picks_json:
+                formatted_picks = await self.parent_cog.format_picks_for_display(db, init_picks_json)
+                init_items.extend(formatted_picks)
 
             # Add players initiating team is offering
             if init_players:
@@ -664,13 +713,9 @@ class TradeMenuView(discord.ui.View):
                 init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             # Add picks receiving team is offering
-            if recv_picks:
-                placeholders = ','.join('?' * len(recv_picks))
-                cursor = await db.execute(
-                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                    recv_picks
-                )
-                recv_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+            if recv_picks_json:
+                formatted_picks = await self.parent_cog.format_picks_for_display(db, recv_picks_json)
+                recv_items.extend(formatted_picks)
 
             # Add players receiving team is offering
             if recv_players:
@@ -855,24 +900,13 @@ class TradeMenuView(discord.ui.View):
                 recv_items = []
 
                 # Get picks
-                init_picks = json.loads(init_picks_json) if init_picks_json else []
-                recv_picks = json.loads(recv_picks_json) if recv_picks_json else []
+                if init_picks_json:
+                    formatted_picks = await self.parent_cog.format_picks_for_display(db, init_picks_json)
+                    init_items.extend(formatted_picks)
 
-                if init_picks:
-                    placeholders = ','.join('?' * len(init_picks))
-                    cursor = await db.execute(
-                        f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                        init_picks
-                    )
-                    init_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
-
-                if recv_picks:
-                    placeholders = ','.join('?' * len(recv_picks))
-                    cursor = await db.execute(
-                        f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                        recv_picks
-                    )
-                    recv_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+                if recv_picks_json:
+                    formatted_picks = await self.parent_cog.format_picks_for_display(db, recv_picks_json)
+                    recv_items.extend(formatted_picks)
 
                 # Get players
                 init_players = json.loads(init_players_json) if init_players_json else []
@@ -981,6 +1015,7 @@ class TradeMenuView(discord.ui.View):
             interaction.user.id,
             self.bot,
             self.guild,
+            self.parent_cog,  # Pass parent_cog from TradeMenuView
             is_counter_offer=True,
             original_trade_id=trade_id,
             receiving_team_id=initiating_team_id
@@ -1043,24 +1078,13 @@ class TradeMenuView(discord.ui.View):
 
                     async with aiosqlite.connect(DB_PATH) as db:
                         # Get picks
-                        init_picks = json.loads(init_picks_json) if init_picks_json else []
-                        recv_picks = json.loads(recv_picks_json) if recv_picks_json else []
+                        if init_picks_json:
+                            formatted_picks = await self.parent_cog.format_picks_for_display(db, init_picks_json)
+                            init_items.extend(formatted_picks)
 
-                        if init_picks:
-                            placeholders = ','.join('?' * len(init_picks))
-                            cursor = await db.execute(
-                                f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                                init_picks
-                            )
-                            init_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
-
-                        if recv_picks:
-                            placeholders = ','.join('?' * len(recv_picks))
-                            cursor = await db.execute(
-                                f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                                recv_picks
-                            )
-                            recv_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+                        if recv_picks_json:
+                            formatted_picks = await self.parent_cog.format_picks_for_display(db, recv_picks_json)
+                            recv_items.extend(formatted_picks)
 
                         # Get players
                         init_players = json.loads(init_players_json) if init_players_json else []
@@ -1193,13 +1217,9 @@ class PendingTradesView(discord.ui.View):
             recv_items = []
 
             # Add picks initiating team is offering
-            if init_picks:
-                placeholders = ','.join('?' * len(init_picks))
-                cursor = await db.execute(
-                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                    init_picks
-                )
-                init_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+            if init_picks_json:
+                formatted_picks = await self.parent_cog.format_picks_for_display(db, init_picks_json)
+                init_items.extend(formatted_picks)
 
             # Add players initiating team is offering
             if init_players:
@@ -1211,13 +1231,9 @@ class PendingTradesView(discord.ui.View):
                 init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             # Add picks receiving team is offering
-            if recv_picks:
-                placeholders = ','.join('?' * len(recv_picks))
-                cursor = await db.execute(
-                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                    recv_picks
-                )
-                recv_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+            if recv_picks_json:
+                formatted_picks = await self.parent_cog.format_picks_for_display(db, recv_picks_json)
+                recv_items.extend(formatted_picks)
 
             # Add players receiving team is offering
             if recv_players:
@@ -1322,6 +1338,9 @@ class PendingTradesView(discord.ui.View):
 
         trade_id = self.pending_trades[self.current_page]
 
+        # Get parent_cog for helper methods
+        parent_cog = self.bot.get_cog('TradeCommands')
+
         # Update trade status
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
@@ -1348,20 +1367,14 @@ class PendingTradesView(discord.ui.View):
                 # Get picks and players
                 initiating_players = json.loads(init_players_json) if init_players_json else []
                 receiving_players = json.loads(recv_players_json) if recv_players_json else []
-                initiating_picks = json.loads(init_picks_json) if init_picks_json else []
-                receiving_picks = json.loads(recv_picks_json) if recv_picks_json else []
 
                 init_items = []
                 recv_items = []
 
                 # Get pick details for initiating team
-                if initiating_picks:
-                    placeholders = ','.join('?' * len(initiating_picks))
-                    cursor = await db.execute(
-                        f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                        initiating_picks
-                    )
-                    init_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+                if init_picks_json:
+                    formatted_picks = await parent_cog.format_picks_for_display(db, init_picks_json)
+                    init_items.extend(formatted_picks)
 
                 # Get player details for initiating team
                 if initiating_players:
@@ -1373,13 +1386,9 @@ class PendingTradesView(discord.ui.View):
                     init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
                 # Get pick details for receiving team
-                if receiving_picks:
-                    placeholders = ','.join('?' * len(receiving_picks))
-                    cursor = await db.execute(
-                        f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                        receiving_picks
-                    )
-                    recv_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+                if recv_picks_json:
+                    formatted_picks = await parent_cog.format_picks_for_display(db, recv_picks_json)
+                    recv_items.extend(formatted_picks)
 
                 # Get player details for receiving team
                 if receiving_players:
@@ -1450,13 +1459,14 @@ class PendingTradesView(discord.ui.View):
 
 class TradeOfferView(discord.ui.View):
     """Streamlined trade offer interface - everything updates in one message"""
-    def __init__(self, initiating_team_id, initiating_team_name, user_id, bot, guild, is_counter_offer=False, original_trade_id=None, receiving_team_id=None):
+    def __init__(self, initiating_team_id, initiating_team_name, user_id, bot, guild, parent_cog, is_counter_offer=False, original_trade_id=None, receiving_team_id=None):
         super().__init__(timeout=600)
         self.initiating_team_id = initiating_team_id
         self.initiating_team_name = initiating_team_name
         self.user_id = user_id
         self.bot = bot
         self.guild = guild
+        self.parent_cog = parent_cog  # Reference to TradeCommands cog for helper methods
         self.is_counter_offer = is_counter_offer
         self.original_trade_id = original_trade_id
         self.receiving_team_id = receiving_team_id
@@ -1475,6 +1485,7 @@ class TradeOfferView(discord.ui.View):
         self.receiving_draft_picks = []   # List of available draft picks
         self.initiating_page = 0  # Current page for initiating team roster
         self.receiving_page = 0   # Current page for receiving team roster
+        self.current_season = None  # Will be set in initialize()
 
     def get_emoji(self, emoji_id, as_string=False):
         """Get emoji from ID
@@ -1513,13 +1524,29 @@ class TradeOfferView(discord.ui.View):
             )
             self.initiating_roster = await cursor.fetchall()
 
-            # Get initiating team's draft picks (only available picks - no player selected)
+            # Get current active season number
             cursor = await db.execute(
-                """SELECT pick_id, draft_name, pick_number, pick_origin
-                   FROM draft_picks
-                   WHERE current_team_id = ? AND player_selected_id IS NULL
-                   ORDER BY pick_number ASC""",
-                (self.initiating_team_id,)
+                "SELECT season_number FROM seasons WHERE status = 'active' LIMIT 1"
+            )
+            active_season_result = await cursor.fetchone()
+            self.current_season = active_season_result[0] if active_season_result else 999
+
+            # Get initiating team's draft picks (only available picks - no player selected)
+            # Include season_number, round_number, and team emoji for display
+            # Filter to current season + 2 years max
+            cursor = await db.execute(
+                """SELECT dp.pick_id, dp.draft_name, dp.pick_number, dp.pick_origin,
+                          dp.season_number, dp.round_number, t.emoji_id
+                   FROM draft_picks dp
+                   JOIN teams t ON dp.original_team_id = t.team_id
+                   LEFT JOIN seasons s ON dp.season_number = s.season_number
+                   WHERE dp.current_team_id = ?
+                     AND dp.player_selected_id IS NULL
+                     AND (dp.season_number IS NULL OR dp.season_number <= ?)
+                   ORDER BY dp.season_number ASC NULLS FIRST,
+                            dp.pick_number ASC NULLS LAST,
+                            dp.round_number ASC""",
+                (self.initiating_team_id, self.current_season + 2)
             )
             self.initiating_draft_picks = await cursor.fetchall()
 
@@ -1543,11 +1570,18 @@ class TradeOfferView(discord.ui.View):
 
                 # Get receiving team's draft picks (only available picks - no player selected)
                 cursor = await db.execute(
-                    """SELECT pick_id, draft_name, pick_number, pick_origin
-                       FROM draft_picks
-                       WHERE current_team_id = ? AND player_selected_id IS NULL
-                       ORDER BY pick_number ASC""",
-                    (self.receiving_team_id,)
+                    """SELECT dp.pick_id, dp.draft_name, dp.pick_number, dp.pick_origin,
+                              dp.season_number, dp.round_number, t.emoji_id
+                       FROM draft_picks dp
+                       JOIN teams t ON dp.original_team_id = t.team_id
+                       LEFT JOIN seasons s ON dp.season_number = s.season_number
+                       WHERE dp.current_team_id = ?
+                         AND dp.player_selected_id IS NULL
+                         AND (dp.season_number IS NULL OR dp.season_number <= ?)
+                       ORDER BY dp.season_number ASC NULLS FIRST,
+                                dp.pick_number ASC NULLS LAST,
+                                dp.round_number ASC""",
+                    (self.receiving_team_id, self.current_season + 2)
                 )
                 self.receiving_draft_picks = await cursor.fetchall()
 
@@ -1627,8 +1661,11 @@ class TradeOfferView(discord.ui.View):
             for pick_id in self.initiating_picks:
                 pick = next((p for p in self.initiating_draft_picks if p[0] == pick_id), None)
                 if pick:
-                    _, draft_name, pick_number, pick_origin = pick
-                    offering_items.append(f"**Pick #{pick_number}**")
+                    _, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id = pick
+                    pick_display = self.parent_cog.format_pick_display(
+                        pick_number, season_number, round_number, emoji_id, self.current_season
+                    )
+                    offering_items.append(f"**{pick_display}**")
 
         # Add players
         if self.initiating_players:
@@ -1643,8 +1680,11 @@ class TradeOfferView(discord.ui.View):
             for pick_id in self.receiving_picks:
                 pick = next((p for p in self.receiving_draft_picks if p[0] == pick_id), None)
                 if pick:
-                    _, draft_name, pick_number, pick_origin = pick
-                    receiving_items.append(f"**Pick #{pick_number}**")
+                    _, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id = pick
+                    pick_display = self.parent_cog.format_pick_display(
+                        pick_number, season_number, round_number, emoji_id, self.current_season
+                    )
+                    receiving_items.append(f"**{pick_display}**")
 
         # Add receiving players
         if self.receiving_players:
@@ -1776,8 +1816,11 @@ class TradeOfferView(discord.ui.View):
                     for pick_id in self.initiating_picks:
                         pick = next((p for p in self.initiating_draft_picks if p[0] == pick_id), None)
                         if pick:
-                            _, draft_name, pick_number, pick_origin = pick
-                            offering_items.append(f"**Pick #{pick_number}**")
+                            _, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id = pick
+                            pick_display = self.parent_cog.format_pick_display(
+                                pick_number, season_number, round_number, emoji_id, self.current_season
+                            )
+                            offering_items.append(f"**{pick_display}**")
 
                 # Add initiating players
                 if self.initiating_players:
@@ -1792,8 +1835,11 @@ class TradeOfferView(discord.ui.View):
                     for pick_id in self.receiving_picks:
                         pick = next((p for p in self.receiving_draft_picks if p[0] == pick_id), None)
                         if pick:
-                            _, draft_name, pick_number, pick_origin = pick
-                            receiving_items.append(f"**Pick #{pick_number}**")
+                            _, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id = pick
+                            pick_display = self.parent_cog.format_pick_display(
+                                pick_number, season_number, round_number, emoji_id, self.current_season
+                            )
+                            receiving_items.append(f"**{pick_display}**")
 
                 # Add receiving players
                 if self.receiving_players:
@@ -1844,10 +1890,14 @@ class OfferingPlayerSelect(discord.ui.Select):
         options = []
 
         # Add draft picks first (at top of list)
-        for pick_id, draft_name, pick_number, pick_origin in parent_view.initiating_draft_picks:
+        for pick_id, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id in parent_view.initiating_draft_picks:
+            # Format pick display based on whether it has pick_number or not
+            pick_label = parent_view.parent_cog.format_pick_display(
+                pick_number, season_number, round_number, emoji_id, parent_view.current_season
+            )
             options.append(
                 discord.SelectOption(
-                    label=f"Pick #{pick_number}",
+                    label=pick_label,
                     description=f"{draft_name}" + (f" - {pick_origin}" if pick_origin else ""),
                     value=f"pick_{pick_id}",
                     default=(pick_id in parent_view.initiating_picks)
@@ -1902,10 +1952,14 @@ class ReceivingPlayerSelect(discord.ui.Select):
         options = []
 
         # Add draft picks first (at top of list)
-        for pick_id, draft_name, pick_number, pick_origin in parent_view.receiving_draft_picks:
+        for pick_id, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id in parent_view.receiving_draft_picks:
+            # Format pick display based on whether it has pick_number or not
+            pick_label = parent_view.parent_cog.format_pick_display(
+                pick_number, season_number, round_number, emoji_id, parent_view.current_season
+            )
             options.append(
                 discord.SelectOption(
-                    label=f"Pick #{pick_number}",
+                    label=pick_label,
                     description=f"{draft_name}" + (f" - {pick_origin}" if pick_origin else ""),
                     value=f"pick_{pick_id}",
                     default=(pick_id in parent_view.receiving_picks)
@@ -1994,7 +2048,9 @@ class TradeResponseView(discord.ui.View):
                 return
 
         # Open trade menu to this specific offer
-        view = TradeMenuView(receiving_team_id, role_result[1], self.bot, interaction.guild, specific_trade_id=self.trade_id)
+        # Get parent_cog from bot
+        parent_cog = self.bot.get_cog('TradeCommands')
+        view = TradeMenuView(receiving_team_id, role_result[1], self.bot, interaction.guild, parent_cog, specific_trade_id=self.trade_id)
         embed = await view.create_incoming_page_embed()
         await view.add_incoming_page_buttons()
 
@@ -2002,6 +2058,9 @@ class TradeResponseView(discord.ui.View):
 
     async def send_to_moderators(self, interaction: discord.Interaction):
         """Send accepted trade to moderators for approval"""
+        # Get parent_cog for helper methods
+        parent_cog = self.bot.get_cog('TradeCommands')
+
         async with aiosqlite.connect(DB_PATH) as db:
             # Get trade approval channel
             cursor = await db.execute(
@@ -2044,14 +2103,8 @@ class TradeResponseView(discord.ui.View):
 
             # Get picks in initiating offer
             if initiating_picks_json:
-                initiating_picks = json.loads(initiating_picks_json)
-                if initiating_picks:
-                    placeholders = ','.join('?' * len(initiating_picks))
-                    cursor = await db.execute(
-                        f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                        initiating_picks
-                    )
-                    initiating_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+                formatted_picks = await parent_cog.format_picks_for_display(db, initiating_picks_json)
+                initiating_items.extend(formatted_picks)
 
             # Get players in initiating offer
             if initiating_players_json:
@@ -2066,14 +2119,8 @@ class TradeResponseView(discord.ui.View):
 
             # Get picks in receiving offer
             if receiving_picks_json:
-                receiving_picks = json.loads(receiving_picks_json)
-                if receiving_picks:
-                    placeholders = ','.join('?' * len(receiving_picks))
-                    cursor = await db.execute(
-                        f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                        receiving_picks
-                    )
-                    receiving_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+                formatted_picks = await parent_cog.format_picks_for_display(db, receiving_picks_json)
+                receiving_items.extend(formatted_picks)
 
             # Get players in receiving offer
             if receiving_players_json:
@@ -2218,20 +2265,14 @@ class ModeratorApprovalView(discord.ui.View):
                 # Get picks and players
                 initiating_players = json.loads(init_players_json) if init_players_json else []
                 receiving_players = json.loads(recv_players_json) if recv_players_json else []
-                initiating_picks = json.loads(init_picks_json) if init_picks_json else []
-                receiving_picks = json.loads(recv_picks_json) if recv_picks_json else []
 
                 init_items = []
                 recv_items = []
 
                 # Get pick details for initiating team
-                if initiating_picks:
-                    placeholders = ','.join('?' * len(initiating_picks))
-                    cursor = await db.execute(
-                        f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                        initiating_picks
-                    )
-                    init_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+                if init_picks_json:
+                    formatted_picks = await parent_cog.format_picks_for_display(db, init_picks_json)
+                    init_items.extend(formatted_picks)
 
                 # Get player details for initiating team
                 if initiating_players:
@@ -2243,13 +2284,9 @@ class ModeratorApprovalView(discord.ui.View):
                     init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
                 # Get pick details for receiving team
-                if receiving_picks:
-                    placeholders = ','.join('?' * len(receiving_picks))
-                    cursor = await db.execute(
-                        f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                        receiving_picks
-                    )
-                    recv_items.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+                if recv_picks_json:
+                    formatted_picks = await parent_cog.format_picks_for_display(db, recv_picks_json)
+                    recv_items.extend(formatted_picks)
 
                 # Get player details for receiving team
                 if receiving_players:
@@ -2324,6 +2361,9 @@ class ModeratorApprovalView(discord.ui.View):
 
     async def execute_trade(self, interaction: discord.Interaction):
         """Execute the approved trade"""
+        # Get parent_cog for helper methods
+        parent_cog = self.bot.get_cog('TradeCommands')
+
         async with aiosqlite.connect(DB_PATH) as db:
             # Get trade details
             cursor = await db.execute(
@@ -2456,13 +2496,9 @@ class ModeratorApprovalView(discord.ui.View):
             recv_receiving = []
 
             # Get picks that initiating team receives
-            if recv_picks:
-                placeholders = ','.join('?' * len(recv_picks))
-                cursor = await db.execute(
-                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                    recv_picks
-                )
-                init_receiving.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+            if recv_picks_json:
+                formatted_picks = await parent_cog.format_picks_for_display(db, recv_picks_json)
+                init_receiving.extend(formatted_picks)
 
             # Get players that initiating team receives
             if recv_players:
@@ -2474,13 +2510,9 @@ class ModeratorApprovalView(discord.ui.View):
                 init_receiving.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             # Get picks that receiving team receives
-            if init_picks:
-                placeholders = ','.join('?' * len(init_picks))
-                cursor = await db.execute(
-                    f"SELECT pick_number FROM draft_picks WHERE pick_id IN ({placeholders}) ORDER BY pick_number",
-                    init_picks
-                )
-                recv_receiving.extend([f"**Pick #{pick_num}**" for (pick_num,) in await cursor.fetchall()])
+            if init_picks_json:
+                formatted_picks = await parent_cog.format_picks_for_display(db, init_picks_json)
+                recv_receiving.extend(formatted_picks)
 
             # Get players that receiving team receives
             if init_players:
