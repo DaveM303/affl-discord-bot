@@ -75,16 +75,36 @@ async def init_db():
             )
         ''')
         
+        # Create Drafts table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS drafts (
+                draft_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                draft_name TEXT UNIQUE NOT NULL,
+                season_number INTEGER NOT NULL,
+                status TEXT DEFAULT 'future',
+                rounds INTEGER DEFAULT 4,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                ladder_set_at TIMESTAMP NULL,
+                FOREIGN KEY (season_number) REFERENCES seasons(season_number)
+            )
+        ''')
+
         # Create Draft Picks table
         await db.execute('''
             CREATE TABLE IF NOT EXISTS draft_picks (
                 pick_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                draft_id INTEGER NOT NULL,
                 draft_name TEXT NOT NULL,
+                season_number INTEGER NOT NULL,
                 round_number INTEGER,
                 pick_number INTEGER,
                 pick_origin TEXT,
+                original_team_id INTEGER,
                 current_team_id INTEGER,
                 player_selected_id INTEGER,
+                FOREIGN KEY (draft_id) REFERENCES drafts(draft_id),
+                FOREIGN KEY (season_number) REFERENCES seasons(season_number),
+                FOREIGN KEY (original_team_id) REFERENCES teams(team_id),
                 FOREIGN KEY (current_team_id) REFERENCES teams(team_id),
                 FOREIGN KEY (player_selected_id) REFERENCES players(player_id)
             )

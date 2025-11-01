@@ -25,6 +25,80 @@ def get_round_name(round_num, regular_season_rounds):
         else:
             return f"Round {round_num}"
 
+async def ensure_future_seasons_exist(db, current_season_number, num_future=2, default_rounds=4):
+    """
+    Ensure the next N future seasons exist with their drafts and picks.
+
+    Args:
+        db: Database connection
+        current_season_number: The current/latest season number
+        num_future: How many future seasons to ensure exist (default 2)
+        default_rounds: Number of draft rounds (default 4)
+
+    Returns:
+        List of season numbers that were created
+    """
+    created_seasons = []
+
+    # Get all teams for pick generation
+    cursor = await db.execute("SELECT team_id, team_name FROM teams ORDER BY team_name")
+    teams = await cursor.fetchall()
+
+    if not teams:
+        return created_seasons
+
+    for offset in range(1, num_future + 1):
+        future_season_num = current_season_number + offset
+
+        # Check if season exists
+        cursor = await db.execute(
+            "SELECT season_id FROM seasons WHERE season_number = ?",
+            (future_season_num,)
+        )
+        season_exists = await cursor.fetchone()
+
+        if not season_exists:
+            # Create future season
+            await db.execute(
+                """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
+                   VALUES (?, 0, 24, 29, 'Future', 'future')""",
+                (future_season_num,)
+            )
+            created_seasons.append(future_season_num)
+
+            # Draft is named after previous season (e.g., Season 10 uses "Season 9 National Draft")
+            draft_name = f"Season {future_season_num - 1} National Draft"
+
+            # Check if draft already exists
+            cursor = await db.execute(
+                "SELECT draft_id FROM drafts WHERE draft_name = ?",
+                (draft_name,)
+            )
+            draft_exists = await cursor.fetchone()
+
+            if not draft_exists:
+                # Create draft for this season
+                cursor = await db.execute(
+                    """INSERT INTO drafts (draft_name, season_number, status, rounds)
+                       VALUES (?, ?, 'future', ?)""",
+                    (draft_name, future_season_num, default_rounds)
+                )
+                draft_id = cursor.lastrowid
+
+                # Auto-generate picks for all teams (pick_number is NULL for future drafts)
+                for team_id, team_name in teams:
+                    for round_num in range(1, default_rounds + 1):
+                        pick_origin = f"{team_name} R{round_num}"
+                        await db.execute(
+                            """INSERT INTO draft_picks (draft_id, draft_name, season_number, round_number,
+                                                        pick_number, pick_origin, original_team_id, current_team_id)
+                               VALUES (?, ?, ?, ?, NULL, ?, ?, ?)""",
+                            (draft_id, draft_name, future_season_num, round_num, pick_origin, team_id, team_id)
+                        )
+
+    await db.commit()
+    return created_seasons
+
 class SeasonCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -174,58 +248,67 @@ class SeasonCommands(commands.Cog):
                     )
                 ''')
 
-                # Update draft_picks table schema (preserve data, migrate to pick_origin)
+                # Create drafts table
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS drafts (
+                        draft_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        draft_name TEXT UNIQUE NOT NULL,
+                        season_number INTEGER NOT NULL,
+                        status TEXT DEFAULT 'future',
+                        rounds INTEGER DEFAULT 4,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        ladder_set_at TIMESTAMP NULL,
+                        FOREIGN KEY (season_number) REFERENCES seasons(season_number)
+                    )
+                ''')
+
+                # Update draft_picks table schema (preserve data, migrate to new schema with drafts table)
                 cursor = await db.execute("PRAGMA table_info(draft_picks)")
                 columns = await cursor.fetchall()
                 column_names = [col[1] for col in columns]
 
-                # Check if we need to migrate from old schema
-                if 'original_team_id' in column_names and 'pick_origin' not in column_names:
-                    # Backup existing draft data
-                    cursor = await db.execute('''
-                        SELECT dp.pick_id, dp.draft_name, dp.round_number, dp.pick_number,
-                               t.team_name, dp.current_team_id, dp.player_selected_id
-                        FROM draft_picks dp
-                        LEFT JOIN teams t ON dp.original_team_id = t.team_id
-                    ''')
-                    draft_backup = await cursor.fetchall()
+                # Check if we need to migrate from old schema (either original_team_id or missing draft_id)
+                needs_migration = ('original_team_id' in column_names and 'pick_origin' not in column_names) or 'draft_id' not in column_names
 
-                    # Recreate table with new schema
+                if needs_migration:
+                    # Drop and recreate with new schema (since you said starting fresh is fine)
                     await db.execute('DROP TABLE IF EXISTS draft_picks')
                     await db.execute('''
                         CREATE TABLE draft_picks (
                             pick_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            draft_id INTEGER NOT NULL,
                             draft_name TEXT NOT NULL,
+                            season_number INTEGER NOT NULL,
                             round_number INTEGER,
                             pick_number INTEGER,
                             pick_origin TEXT,
+                            original_team_id INTEGER,
                             current_team_id INTEGER,
                             player_selected_id INTEGER,
+                            FOREIGN KEY (draft_id) REFERENCES drafts(draft_id),
+                            FOREIGN KEY (season_number) REFERENCES seasons(season_number),
+                            FOREIGN KEY (original_team_id) REFERENCES teams(team_id),
                             FOREIGN KEY (current_team_id) REFERENCES teams(team_id),
                             FOREIGN KEY (player_selected_id) REFERENCES players(player_id)
                         )
                     ''')
-
-                    # Restore data with converted pick_origin
-                    for pick in draft_backup:
-                        pick_id, draft_name, round_num, pick_num, orig_team, curr_team, player = pick
-                        pick_origin = f"{orig_team} R{round_num}" if orig_team else f"R{round_num}"
-                        await db.execute('''
-                            INSERT INTO draft_picks (pick_id, draft_name, round_number, pick_number,
-                                                    pick_origin, current_team_id, player_selected_id)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ''', (pick_id, draft_name, round_num, pick_num, pick_origin, curr_team, player))
                 else:
                     # Table already has correct schema or doesn't exist yet
                     await db.execute('''
                         CREATE TABLE IF NOT EXISTS draft_picks (
                             pick_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            draft_id INTEGER NOT NULL,
                             draft_name TEXT NOT NULL,
+                            season_number INTEGER NOT NULL,
                             round_number INTEGER,
                             pick_number INTEGER,
                             pick_origin TEXT,
+                            original_team_id INTEGER,
                             current_team_id INTEGER,
                             player_selected_id INTEGER,
+                            FOREIGN KEY (draft_id) REFERENCES drafts(draft_id),
+                            FOREIGN KEY (season_number) REFERENCES seasons(season_number),
+                            FOREIGN KEY (original_team_id) REFERENCES teams(team_id),
                             FOREIGN KEY (current_team_id) REFERENCES teams(team_id),
                             FOREIGN KEY (player_selected_id) REFERENCES players(player_id)
                         )
@@ -265,14 +348,18 @@ class SeasonCommands(commands.Cog):
     @app_commands.command(name="createseason", description="[ADMIN] Create a new season")
     @app_commands.describe(
         season_number="Season number (e.g., 1, 2, 3)",
-        regular_rounds="Number of regular season rounds (default: 24, finals added automatically)"
+        regular_rounds="Number of regular season rounds (default: 24, finals added automatically)",
+        auto_create_futures="Also create next 2 future seasons with drafts (default: True)"
     )
     async def create_season(
         self,
         interaction: discord.Interaction,
         season_number: int,
-        regular_rounds: int = 24
+        regular_rounds: int = 24,
+        auto_create_futures: bool = True
     ):
+        await interaction.response.defer(ephemeral=True)
+
         async with aiosqlite.connect(DB_PATH) as db:
             # Check if season already exists
             cursor = await db.execute(
@@ -282,7 +369,7 @@ class SeasonCommands(commands.Cog):
             existing = await cursor.fetchone()
 
             if existing:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"❌ Season {season_number} already exists!",
                     ephemeral=True
                 )
@@ -299,10 +386,20 @@ class SeasonCommands(commands.Cog):
             )
             await db.commit()
 
-            await interaction.response.send_message(
-                f"✅ Created **Season {season_number}** with {regular_rounds} rounds\n"
-                f"Use `/startseason` to begin the season."
-            )
+            message = f"✅ Created **Season {season_number}** with {regular_rounds} rounds"
+
+            # Auto-create future seasons if requested
+            if auto_create_futures:
+                created_seasons = await ensure_future_seasons_exist(db, season_number, num_future=2)
+                if created_seasons:
+                    message += f"\n\n🔮 **Auto-created future seasons:**"
+                    for future_season in created_seasons:
+                        draft_name = f"Season {future_season - 1} National Draft"
+                        message += f"\n• Season {future_season} with **{draft_name}**"
+
+            message += f"\n\nUse `/startseason` to begin the season."
+
+            await interaction.followup.send(message, ephemeral=True)
 
     @app_commands.command(name="startseason", description="[ADMIN] Start the current offseason")
     @app_commands.describe(offseason_weeks="Number of weeks in offseason (default: 23)")
@@ -423,7 +520,16 @@ class SeasonCommands(commands.Cog):
             )
             await db.commit()
 
+            # Ensure next 2 future seasons exist for draft pick trading
+            created_seasons = await ensure_future_seasons_exist(db, season_number, num_future=2)
+
             message = f"✅ **Season {season_number}** has started!\nCurrent: {round_name}"
+
+            if created_seasons:
+                message += f"\n\n🔮 **Auto-created future seasons for trading:**"
+                for future_season in created_seasons:
+                    draft_name = f"Season {future_season - 1} National Draft"
+                    message += f"\n• Season {future_season} with **{draft_name}**"
 
             if carried_over > 0 or healed_during_offseason > 0:
                 message += f"\n\n**Injury Updates:**"
@@ -674,34 +780,49 @@ class SeasonCommands(commands.Cog):
             # Check if next season already exists
             next_season_num = season_number + 1
             cursor = await db.execute(
-                "SELECT season_id FROM seasons WHERE season_number = ?",
+                "SELECT season_id, status FROM seasons WHERE season_number = ?",
                 (next_season_num,)
             )
             existing = await cursor.fetchone()
 
-            if existing:
-                await db.commit()
-                await interaction.response.send_message(
-                    f"✅ **Season {season_number}** has ended!\n"
-                    f"⚠️ Season {next_season_num} already exists. Use `/startseason` when ready.",
-                    ephemeral=True
-                )
-                return
+            message = f"✅ **Season {season_number}** has ended!"
 
-            # Create next season in offseason status
-            total_rounds = next_season_rounds + len(FINALS_ROUNDS)
-            await db.execute(
-                """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
-                   VALUES (?, 0, ?, ?, 'Offseason', 'offseason')""",
-                (next_season_num, next_season_rounds, total_rounds)
-            )
+            if existing:
+                existing_id, existing_status = existing
+                # If next season exists and is 'future', promote it to 'offseason'
+                if existing_status == 'future':
+                    await db.execute(
+                        """UPDATE seasons SET status = 'offseason', round_name = 'Offseason'
+                           WHERE season_id = ?""",
+                        (existing_id,)
+                    )
+                    message += f"\n✅ **Season {next_season_num}** promoted to offseason"
+                else:
+                    message += f"\n⚠️ Season {next_season_num} already exists ({existing_status})"
+            else:
+                # Create next season in offseason status
+                total_rounds = next_season_rounds + len(FINALS_ROUNDS)
+                await db.execute(
+                    """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
+                       VALUES (?, 0, ?, ?, 'Offseason', 'offseason')""",
+                    (next_season_num, next_season_rounds, total_rounds)
+                )
+                message += f"\n✅ **Season {next_season_num}** created in offseason ({next_season_rounds} rounds)"
+
             await db.commit()
 
-            await interaction.response.send_message(
-                f"✅ **Season {season_number}** has ended!\n"
-                f"✅ **Season {next_season_num}** created in offseason ({next_season_rounds} rounds)\n\n"
-                f"Use `/startseason` when ready to begin Season {next_season_num}."
-            )
+            # Ensure 2 more future seasons exist beyond the next season
+            created_seasons = await ensure_future_seasons_exist(db, next_season_num, num_future=2)
+
+            if created_seasons:
+                message += f"\n\n🔮 **Auto-created future seasons:**"
+                for future_season in created_seasons:
+                    draft_name = f"Season {future_season - 1} National Draft"
+                    message += f"\n• Season {future_season} with **{draft_name}**"
+
+            message += f"\n\nUse `/startseason` when ready to begin Season {next_season_num}."
+
+            await interaction.response.send_message(message, ephemeral=True)
 
     @app_commands.command(name="currentseason", description="View the current season status")
     async def current_season(self, interaction: discord.Interaction):
