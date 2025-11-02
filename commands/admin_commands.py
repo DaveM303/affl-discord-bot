@@ -1456,13 +1456,50 @@ class AdminCommands(commands.Cog):
                             pick_number = int(row['Pick']) if pd.notna(row['Pick']) else None
                             draft_name = str(row['Draft_Name']) if pd.notna(row['Draft_Name']) else ''
 
-                            if current_team and pick_id:
+                            # Get original_team_id (same as current for imports, can be updated via trades)
+                            original_team_id = current_team[0] if current_team else None
+
+                            # Get season_number from draft_name if possible (format: "Season X National Draft")
+                            season_number = None
+                            if 'Season' in draft_name:
+                                try:
+                                    # Extract season number from draft name (e.g., "Season 9 National Draft")
+                                    season_str = draft_name.split('Season')[1].split()[0]
+                                    # Draft is for season_number + 1 (Season 9 Draft is for Season 10)
+                                    season_number = int(season_str) + 1
+                                except:
+                                    pass
+
+                            # Get or create draft_id
+                            draft_id = None
+                            if draft_name:
+                                cursor = await db.execute(
+                                    "SELECT draft_id FROM drafts WHERE draft_name = ?",
+                                    (draft_name,)
+                                )
+                                draft_result = await cursor.fetchone()
+
+                                if draft_result:
+                                    draft_id = draft_result[0]
+                                else:
+                                    # Create draft if it doesn't exist
+                                    # Determine status based on whether pick_number is set
+                                    draft_status = 'current' if pick_number is not None else 'future'
+                                    cursor = await db.execute(
+                                        """INSERT INTO drafts (draft_name, season_number, status, rounds)
+                                           VALUES (?, ?, ?, 4)""",
+                                        (draft_name, season_number, draft_status)
+                                    )
+                                    draft_id = cursor.lastrowid
+
+                            if current_team and pick_id and draft_id:
                                 await db.execute(
                                     """INSERT OR REPLACE INTO draft_picks
-                                       (pick_id, draft_name, round_number, pick_number, pick_origin, current_team_id, player_selected_id)
-                                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                                    (pick_id, draft_name, round_number, pick_number,
-                                     pick_origin, current_team[0], player_id)
+                                       (pick_id, draft_id, draft_name, season_number, round_number, pick_number,
+                                        pick_origin, original_team_id, current_team_id, player_selected_id)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                    (pick_id, draft_id, draft_name, season_number, round_number, pick_number,
+                                     pick_origin, original_team_id, current_team[0], player_id)
                                 )
                                 draft_picks_imported += 1
                         except Exception as e:
