@@ -278,7 +278,7 @@ class TradeCommands(commands.Cog):
             return
 
         # Create pending trades view
-        view = PendingTradesView(self.bot, interaction.guild)
+        view = PendingTradesView(self.bot, interaction.guild, self)
         embed = await view.create_page_embed()
         await view.add_page_buttons()
 
@@ -1149,10 +1149,11 @@ class TradeMenuView(discord.ui.View):
 
 class PendingTradesView(discord.ui.View):
     """View for admins to review trades pending approval"""
-    def __init__(self, bot, guild):
+    def __init__(self, bot, guild, parent_cog):
         super().__init__(timeout=600)
         self.bot = bot
         self.guild = guild
+        self.parent_cog = parent_cog
         self.current_page = 0
         self.pending_trades = []
 
@@ -2255,7 +2256,8 @@ class RespondToTradeView(discord.ui.View):
     @discord.ui.button(label="Respond to Trade", style=discord.ButtonStyle.blurple, custom_id="respond_to_trade")
     async def respond_to_trade(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Create pending trades view and navigate to this specific trade
-        view = PendingTradesView(self.bot, interaction.guild)
+        parent_cog = self.bot.get_cog('TradeCommands')
+        view = PendingTradesView(self.bot, interaction.guild, parent_cog)
 
         # Load all pending trades
         async with aiosqlite.connect(DB_PATH) as db:
