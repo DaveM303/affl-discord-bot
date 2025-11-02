@@ -55,8 +55,12 @@ class TradeCommands(commands.Cog):
         else:
             # Future draft - use season, round, and emoji
             round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
-            emoji = f"<:{emoji_id}>" if emoji_id else ""
-            return f"S{season_number} {round_suffix} {emoji}".strip()
+            emoji_str = ""
+            if emoji_id:
+                emoji = self.bot.get_emoji(int(emoji_id))
+                if emoji:
+                    emoji_str = f" {emoji}"
+            return f"S{season_number} {round_suffix}{emoji_str}"
 
     async def format_picks_for_display(self, db, pick_ids_json):
         """
