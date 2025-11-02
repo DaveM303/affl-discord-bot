@@ -1450,12 +1450,18 @@ class AdminCommands(commands.Cog):
                             # Get pick_origin (handle empty/NaN values)
                             pick_origin = str(row['Pick_Origin']) if pd.notna(row['Pick_Origin']) and row['Pick_Origin'] else ''
 
-                            if current_team:
+                            # Handle NaN values for numeric fields
+                            pick_id = int(row['Pick_ID']) if pd.notna(row['Pick_ID']) else None
+                            round_number = int(row['Round']) if pd.notna(row['Round']) else None
+                            pick_number = int(row['Pick']) if pd.notna(row['Pick']) else None
+                            draft_name = str(row['Draft_Name']) if pd.notna(row['Draft_Name']) else ''
+
+                            if current_team and pick_id:
                                 await db.execute(
                                     """INSERT OR REPLACE INTO draft_picks
                                        (pick_id, draft_name, round_number, pick_number, pick_origin, current_team_id, player_selected_id)
                                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                                    (int(row['Pick_ID']), str(row['Draft_Name']), int(row['Round']), int(row['Pick']),
+                                    (pick_id, draft_name, round_number, pick_number,
                                      pick_origin, current_team[0], player_id)
                                 )
                                 draft_picks_imported += 1
