@@ -540,19 +540,19 @@ class DraftCommands(commands.Cog):
             # Build embed
             team_emoji_str = f"{team_emoji} " if team_emoji else ""
             embed = discord.Embed(
-                title=f"{team_emoji_str}{target_team_name}'s Draft Hand",
+                title=f"{team_emoji_str}{target_team_name} Draft Hand",
                 color=discord.Color.blue()
             )
 
-            # Add picks for each season
+            # Collect all picks in one list
+            all_pick_lines = []
             for season_num in sorted(picks_by_season.keys(), key=lambda x: (x is None, x)):
                 picks = picks_by_season[season_num]
-                pick_lines = []
 
                 for pick_num, round_num, pick_origin, orig_emoji_id, draft_name in picks:
                     if pick_num is not None:
                         # Current pick with number
-                        pick_lines.append(f"Pick #{pick_num}")
+                        all_pick_lines.append(f"Pick #{pick_num}")
                     else:
                         # Future pick - format as "Future 1st ([emoji] S10)"
                         round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_num, f"{round_num}th")
@@ -561,19 +561,10 @@ class DraftCommands(commands.Cog):
                             orig_emoji = self.bot.get_emoji(int(orig_emoji_id))
                         emoji_str = f"{orig_emoji} " if orig_emoji else ""
                         # Use season_num - 1 for display (draft naming convention)
-                        pick_lines.append(f"Future {round_suffix} ({emoji_str}S{season_num - 1})")
+                        all_pick_lines.append(f"Future {round_suffix} ({emoji_str}S{season_num - 1})")
 
-                # Create field for this season
-                if season_num is None:
-                    season_header = "Unknown Season"
-                else:
-                    season_header = f"Season {season_num}"
-
-                embed.add_field(
-                    name=season_header,
-                    value="\n".join(pick_lines) if pick_lines else "*No picks*",
-                    inline=False
-                )
+            # Display all picks in embed description
+            embed.description = "\n".join(all_pick_lines) if all_pick_lines else "*No picks*"
 
             await interaction.followup.send(embed=embed, ephemeral=True)
 
