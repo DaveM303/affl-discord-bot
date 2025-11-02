@@ -438,6 +438,145 @@ class DraftCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
+    @app_commands.command(name="drafthand", description="View a team's draft picks")
+    @app_commands.describe(team="Team to view (defaults to your team)")
+    @app_commands.autocomplete(team=team_autocomplete)
+    async def draft_hand(self, interaction: discord.Interaction, team: str = None):
+        await interaction.response.defer(ephemeral=True)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Get team ID - default to user's team if not specified
+            if team is None:
+                # Get user's team from their role
+                cursor = await db.execute(
+                    "SELECT team_id, team_name FROM teams ORDER BY team_name"
+                )
+                teams = await cursor.fetchall()
+
+                user_team_id = None
+                user_team_name = None
+                for team_id, team_name in teams:
+                    cursor = await db.execute(
+                        "SELECT role_id FROM teams WHERE team_id = ?",
+                        (team_id,)
+                    )
+                    role_result = await cursor.fetchone()
+                    if role_result and role_result[0]:
+                        role = interaction.guild.get_role(int(role_result[0]))
+                        if role and role in interaction.user.roles:
+                            user_team_id = team_id
+                            user_team_name = team_name
+                            break
+
+                if not user_team_id:
+                    await interaction.followup.send(
+                        "❌ You don't have a team role! Please specify a team.",
+                        ephemeral=True
+                    )
+                    return
+
+                target_team_id = user_team_id
+                target_team_name = user_team_name
+            else:
+                # Look up specified team
+                cursor = await db.execute(
+                    "SELECT team_id, team_name FROM teams WHERE LOWER(team_name) = LOWER(?)",
+                    (team,)
+                )
+                team_result = await cursor.fetchone()
+                if not team_result:
+                    await interaction.followup.send(f"❌ Team '{team}' not found!", ephemeral=True)
+                    return
+
+                target_team_id, target_team_name = team_result
+
+            # Get team emoji
+            cursor = await db.execute(
+                "SELECT emoji_id FROM teams WHERE team_id = ?",
+                (target_team_id,)
+            )
+            emoji_result = await cursor.fetchone()
+            team_emoji = None
+            if emoji_result and emoji_result[0]:
+                team_emoji = self.bot.get_emoji(int(emoji_result[0]))
+
+            # Get current active season
+            cursor = await db.execute(
+                "SELECT season_number FROM seasons WHERE status = 'active' LIMIT 1"
+            )
+            active_season_result = await cursor.fetchone()
+            current_season = active_season_result[0] if active_season_result else 999
+
+            # Get all picks for this team, grouped by season
+            cursor = await db.execute(
+                """SELECT dp.season_number, dp.pick_number, dp.round_number,
+                          dp.pick_origin, t.emoji_id, d.draft_name
+                   FROM draft_picks dp
+                   JOIN teams t ON dp.original_team_id = t.team_id
+                   LEFT JOIN drafts d ON dp.draft_id = d.draft_id
+                   WHERE dp.current_team_id = ?
+                     AND dp.player_selected_id IS NULL
+                   ORDER BY dp.season_number ASC NULLS FIRST,
+                            dp.pick_number ASC NULLS LAST,
+                            dp.round_number ASC""",
+                (target_team_id,)
+            )
+            all_picks = await cursor.fetchall()
+
+            if not all_picks:
+                await interaction.followup.send(
+                    f"❌ {target_team_name} has no draft picks!",
+                    ephemeral=True
+                )
+                return
+
+            # Group picks by season
+            picks_by_season = {}
+            for season_num, pick_num, round_num, pick_origin, orig_emoji_id, draft_name in all_picks:
+                if season_num not in picks_by_season:
+                    picks_by_season[season_num] = []
+                picks_by_season[season_num].append((pick_num, round_num, pick_origin, orig_emoji_id, draft_name))
+
+            # Build embed
+            team_emoji_str = f"{team_emoji} " if team_emoji else ""
+            embed = discord.Embed(
+                title=f"{team_emoji_str}{target_team_name}'s Draft Hand",
+                color=discord.Color.blue()
+            )
+
+            # Add picks for each season
+            for season_num in sorted(picks_by_season.keys(), key=lambda x: (x is None, x)):
+                picks = picks_by_season[season_num]
+                pick_lines = []
+
+                for pick_num, round_num, pick_origin, orig_emoji_id, draft_name in picks:
+                    if pick_num is not None:
+                        # Current pick with number
+                        pick_lines.append(f"Pick #{pick_num}")
+                    else:
+                        # Future pick - format as "Future 1st ([emoji] S10)"
+                        round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_num, f"{round_num}th")
+                        orig_emoji = None
+                        if orig_emoji_id:
+                            orig_emoji = self.bot.get_emoji(int(orig_emoji_id))
+                        emoji_str = f"{orig_emoji} " if orig_emoji else ""
+                        # Use season_num - 1 for display (draft naming convention)
+                        pick_lines.append(f"Future {round_suffix} ({emoji_str}S{season_num - 1})")
+
+                # Create field for this season
+                if season_num is None:
+                    season_header = "Unknown Season"
+                else:
+                    season_header = f"Season {season_num}"
+
+                embed.add_field(
+                    name=season_header,
+                    value="\n".join(pick_lines) if pick_lines else "*No picks*",
+                    inline=False
+                )
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
     @app_commands.command(name="addpick", description="[ADMIN] Insert a pick into the draft order")
     @app_commands.describe(
         draft_name="Name of the draft",
