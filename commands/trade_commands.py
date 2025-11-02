@@ -53,7 +53,8 @@ class TradeCommands(commands.Cog):
             # Current draft with ladder set - use pick number
             return f"Pick #{pick_number}"
         else:
-            # Future draft - format as "Future 1st ([emoji] S11)"
+            # Future draft - format as "Future 1st ([emoji] S10)"
+            # Draft for Season N is named "Season N-1 National Draft", so use season_number - 1
             round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
             emoji_str = ""
             if emoji_id:
@@ -64,7 +65,7 @@ class TradeCommands(commands.Cog):
                 except (ValueError, AttributeError):
                     # If emoji_id can't be converted or bot isn't available, skip emoji
                     pass
-            return f"Future {round_suffix} ({emoji_str}S{season_number})"
+            return f"Future {round_suffix} ({emoji_str}S{season_number - 1})"
 
     async def format_picks_for_display(self, db, pick_ids_json):
         """
@@ -1608,12 +1609,17 @@ class TradeOfferView(discord.ui.View):
             self.add_item(offering_select)
             current_row += 1
 
-            # Pagination button for initiating team if needed (only if roster > available slots after picks)
+            # Pagination button for initiating team if needed
             picks_count = len(self.initiating_draft_picks) if self.initiating_draft_picks else 0
-            available_slots = 25 - picks_count
-            if len(self.initiating_roster) > available_slots:
+            page_0_player_count = 25 - picks_count
+            if len(self.initiating_roster) > page_0_player_count:
+                # Calculate total pages
+                remaining_players = len(self.initiating_roster) - page_0_player_count
+                additional_pages = (remaining_players - 1) // 25 + 1
+                total_pages = 1 + additional_pages  # page 0 + additional pages
+
                 next_page_btn = discord.ui.Button(
-                    label=f"Page {self.initiating_page + 1}/{(len(self.initiating_roster) - 1) // available_slots + 1}",
+                    label=f"Page {self.initiating_page + 1}/{total_pages}",
                     style=discord.ButtonStyle.secondary,
                     row=current_row
                 )
@@ -1627,12 +1633,17 @@ class TradeOfferView(discord.ui.View):
             self.add_item(receiving_select)
             current_row += 1
 
-            # Pagination button for receiving team if needed (only if roster > available slots after picks)
+            # Pagination button for receiving team if needed
             picks_count = len(self.receiving_draft_picks) if self.receiving_draft_picks else 0
-            available_slots = 25 - picks_count
-            if len(self.receiving_roster) > available_slots:
+            page_0_player_count = 25 - picks_count
+            if len(self.receiving_roster) > page_0_player_count:
+                # Calculate total pages
+                remaining_players = len(self.receiving_roster) - page_0_player_count
+                additional_pages = (remaining_players - 1) // 25 + 1
+                total_pages = 1 + additional_pages  # page 0 + additional pages
+
                 next_page_btn = discord.ui.Button(
-                    label=f"Page {self.receiving_page + 1}/{(len(self.receiving_roster) - 1) // available_slots + 1}",
+                    label=f"Page {self.receiving_page + 1}/{total_pages}",
                     style=discord.ButtonStyle.secondary,
                     row=current_row
                 )
@@ -1737,13 +1748,29 @@ class TradeOfferView(discord.ui.View):
 
     async def next_initiating_page(self, interaction: discord.Interaction):
         """Go to next page of initiating team roster"""
-        max_page = (len(self.initiating_roster) - 1) // 25
+        # Calculate max pages accounting for picks on page 0
+        picks_count = len(self.initiating_draft_picks)
+        page_0_player_count = 25 - picks_count
+        remaining_players = len(self.initiating_roster) - page_0_player_count
+        if remaining_players > 0:
+            additional_pages = (remaining_players - 1) // 25 + 1
+            max_page = additional_pages  # page 0 + additional pages
+        else:
+            max_page = 0
         self.initiating_page = (self.initiating_page + 1) % (max_page + 1)
         await self.update_view(interaction)
 
     async def next_receiving_page(self, interaction: discord.Interaction):
         """Go to next page of receiving team roster"""
-        max_page = (len(self.receiving_roster) - 1) // 25
+        # Calculate max pages accounting for picks on page 0
+        picks_count = len(self.receiving_draft_picks)
+        page_0_player_count = 25 - picks_count
+        remaining_players = len(self.receiving_roster) - page_0_player_count
+        if remaining_players > 0:
+            additional_pages = (remaining_players - 1) // 25 + 1
+            max_page = additional_pages  # page 0 + additional pages
+        else:
+            max_page = 0
         self.receiving_page = (self.receiving_page + 1) % (max_page + 1)
         await self.update_view(interaction)
 
@@ -1897,40 +1924,51 @@ class OfferingPlayerSelect(discord.ui.Select):
 
         options = []
 
-        # Add draft picks first (at top of list)
-        for pick_id, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id in parent_view.initiating_draft_picks:
-            # Format pick display and get emoji for SelectOption
-            if pick_number is not None:
-                # Current draft with ladder set
-                pick_label = f"Pick #{pick_number}"
-                pick_emoji = None
-                pick_description = f"{draft_name}" + (f" - {pick_origin}" if pick_origin else "")
-            else:
-                # Future draft - format as "Future 1st (S11)", emoji goes in separate field
-                round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
-                pick_label = f"Future {round_suffix} (S{season_number})"
-                pick_description = None  # No description for future picks
-                pick_emoji = None
-                if emoji_id:
-                    try:
-                        pick_emoji = parent_view.bot.get_emoji(int(emoji_id))
-                    except (ValueError, AttributeError):
-                        pass
+        # Add draft picks only on page 0 (first page)
+        if parent_view.initiating_page == 0:
+            for pick_id, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id in parent_view.initiating_draft_picks:
+                # Format pick display and get emoji for SelectOption
+                if pick_number is not None:
+                    # Current draft with ladder set
+                    pick_label = f"Pick #{pick_number}"
+                    pick_emoji = None
+                    pick_description = None  # No description for picks
+                else:
+                    # Future draft - format as "Future 1st (S10)" using previous season number
+                    # Draft for Season N is named "Season N-1 National Draft", so use season_number - 1
+                    round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
+                    pick_label = f"Future {round_suffix} (S{season_number - 1})"
+                    pick_description = None  # No description for picks
+                    pick_emoji = None
+                    if emoji_id:
+                        try:
+                            pick_emoji = parent_view.bot.get_emoji(int(emoji_id))
+                        except (ValueError, AttributeError):
+                            pass
 
-            options.append(
-                discord.SelectOption(
-                    label=pick_label,
-                    description=pick_description,
-                    value=f"pick_{pick_id}",
-                    emoji=pick_emoji,
-                    default=(pick_id in parent_view.initiating_picks)
+                options.append(
+                    discord.SelectOption(
+                        label=pick_label,
+                        description=pick_description,
+                        value=f"pick_{pick_id}",
+                        emoji=pick_emoji,
+                        default=(pick_id in parent_view.initiating_picks)
+                    )
                 )
-            )
 
-        # Get current page of players
-        start_idx = parent_view.initiating_page * 25
-        # Account for picks taking up space (max 25 total items)
-        available_player_slots = 25 - len(options)
+        # Calculate player pagination
+        # On page 0, account for picks taking up space
+        if parent_view.initiating_page == 0:
+            available_player_slots = 25 - len(options)
+            start_idx = 0
+        else:
+            # On subsequent pages, we can show full 25 players
+            # But need to account for players already shown on page 0
+            picks_count = len(parent_view.initiating_draft_picks)
+            page_0_player_count = 25 - picks_count
+            available_player_slots = 25
+            start_idx = page_0_player_count + ((parent_view.initiating_page - 1) * 25)
+
         end_idx = start_idx + available_player_slots
         page_players = parent_view.initiating_roster[start_idx:end_idx]
 
@@ -1974,40 +2012,51 @@ class ReceivingPlayerSelect(discord.ui.Select):
 
         options = []
 
-        # Add draft picks first (at top of list)
-        for pick_id, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id in parent_view.receiving_draft_picks:
-            # Format pick display and get emoji for SelectOption
-            if pick_number is not None:
-                # Current draft with ladder set
-                pick_label = f"Pick #{pick_number}"
-                pick_emoji = None
-                pick_description = f"{draft_name}" + (f" - {pick_origin}" if pick_origin else "")
-            else:
-                # Future draft - format as "Future 1st (S11)", emoji goes in separate field
-                round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
-                pick_label = f"Future {round_suffix} (S{season_number})"
-                pick_description = None  # No description for future picks
-                pick_emoji = None
-                if emoji_id:
-                    try:
-                        pick_emoji = parent_view.bot.get_emoji(int(emoji_id))
-                    except (ValueError, AttributeError):
-                        pass
+        # Add draft picks only on page 0 (first page)
+        if parent_view.receiving_page == 0:
+            for pick_id, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id in parent_view.receiving_draft_picks:
+                # Format pick display and get emoji for SelectOption
+                if pick_number is not None:
+                    # Current draft with ladder set
+                    pick_label = f"Pick #{pick_number}"
+                    pick_emoji = None
+                    pick_description = None  # No description for picks
+                else:
+                    # Future draft - format as "Future 1st (S10)" using previous season number
+                    # Draft for Season N is named "Season N-1 National Draft", so use season_number - 1
+                    round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
+                    pick_label = f"Future {round_suffix} (S{season_number - 1})"
+                    pick_description = None  # No description for picks
+                    pick_emoji = None
+                    if emoji_id:
+                        try:
+                            pick_emoji = parent_view.bot.get_emoji(int(emoji_id))
+                        except (ValueError, AttributeError):
+                            pass
 
-            options.append(
-                discord.SelectOption(
-                    label=pick_label,
-                    description=pick_description,
-                    value=f"pick_{pick_id}",
-                    emoji=pick_emoji,
-                    default=(pick_id in parent_view.receiving_picks)
+                options.append(
+                    discord.SelectOption(
+                        label=pick_label,
+                        description=pick_description,
+                        value=f"pick_{pick_id}",
+                        emoji=pick_emoji,
+                        default=(pick_id in parent_view.receiving_picks)
+                    )
                 )
-            )
 
-        # Get current page of players
-        start_idx = parent_view.receiving_page * 25
-        # Account for picks taking up space (max 25 total items)
-        available_player_slots = 25 - len(options)
+        # Calculate player pagination
+        # On page 0, account for picks taking up space
+        if parent_view.receiving_page == 0:
+            available_player_slots = 25 - len(options)
+            start_idx = 0
+        else:
+            # On subsequent pages, we can show full 25 players
+            # But need to account for players already shown on page 0
+            picks_count = len(parent_view.receiving_draft_picks)
+            page_0_player_count = 25 - picks_count
+            available_player_slots = 25
+            start_idx = page_0_player_count + ((parent_view.receiving_page - 1) * 25)
+
         end_idx = start_idx + available_player_slots
         page_players = parent_view.receiving_roster[start_idx:end_idx]
 
