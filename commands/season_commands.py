@@ -824,49 +824,6 @@ class SeasonCommands(commands.Cog):
 
             await interaction.response.send_message(message, ephemeral=True)
 
-    @app_commands.command(name="generatefutureseasons", description="[ADMIN] Generate future seasons for an existing season")
-    @app_commands.describe(
-        current_season="The current/latest season number you have",
-        num_future="Number of future seasons to create (default: 2)"
-    )
-    async def generate_future_seasons(
-        self,
-        interaction: discord.Interaction,
-        current_season: int,
-        num_future: int = 2
-    ):
-        await interaction.response.defer(ephemeral=True)
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Verify the current season exists
-            cursor = await db.execute(
-                "SELECT season_id FROM seasons WHERE season_number = ?",
-                (current_season,)
-            )
-            if not await cursor.fetchone():
-                await interaction.followup.send(
-                    f"❌ Season {current_season} doesn't exist!",
-                    ephemeral=True
-                )
-                return
-
-            # Generate future seasons
-            created_seasons = await ensure_future_seasons_exist(db, current_season, num_future=num_future)
-
-            if created_seasons:
-                message = f"✅ Generated future seasons for Season {current_season}:\n\n"
-                for future_season in created_seasons:
-                    draft_name = f"Season {future_season - 1} National Draft"
-                    message += f"• **Season {future_season}** (status: future)\n"
-                    message += f"  └─ **{draft_name}** (status: future, no ladder set)\n"
-                    message += f"  └─ All picks auto-generated for all teams\n\n"
-
-                message += "These seasons and drafts are now ready for pick trading!"
-            else:
-                message = f"✅ Future seasons already exist for Season {current_season}!"
-
-            await interaction.followup.send(message, ephemeral=True)
-
     @app_commands.command(name="currentseason", description="View the current season status")
     async def current_season(self, interaction: discord.Interaction):
         async with aiosqlite.connect(DB_PATH) as db:

@@ -13,11 +13,13 @@ class DraftCommands(commands.Cog):
         interaction: discord.Interaction,
         current: str,
     ) -> list[app_commands.Choice[str]]:
-        """Autocomplete for draft names"""
+        """Autocomplete for draft names - only shows current drafts with ladder set"""
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
-                    "SELECT DISTINCT draft_name FROM draft_picks ORDER BY draft_name DESC"
+                    """SELECT draft_name FROM drafts
+                       WHERE status = 'current'
+                       ORDER BY draft_id DESC"""
                 )
                 drafts = await cursor.fetchall()
 
@@ -232,22 +234,37 @@ class DraftCommands(commands.Cog):
 
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # If no draft name provided, get the most recent draft
+                # If no draft name provided, get the most recent current draft
                 if draft_name is None:
                     cursor = await db.execute(
-                        """SELECT DISTINCT draft_name
-                           FROM draft_picks
-                           ORDER BY pick_id DESC
+                        """SELECT draft_name
+                           FROM drafts
+                           WHERE status = 'current'
+                           ORDER BY draft_id DESC
                            LIMIT 1"""
                     )
                     draft_result = await cursor.fetchone()
                     if not draft_result:
                         await interaction.followup.send(
-                            "❌ No drafts found!\n"
-                            "Use `/createdraft` to create a draft."
+                            "❌ No current drafts found!\n"
+                            "Use `/setdraftladder` to set the order for a future draft."
                         )
                         return
                     draft_name = draft_result[0]
+
+                # Verify this draft is current (has ladder set)
+                cursor = await db.execute(
+                    "SELECT status FROM drafts WHERE draft_name = ?",
+                    (draft_name,)
+                )
+                draft_status = await cursor.fetchone()
+                if not draft_status or draft_status[0] != 'current':
+                    await interaction.followup.send(
+                        f"❌ Draft '{draft_name}' is not a current draft (status: {draft_status[0] if draft_status else 'unknown'})!\n"
+                        f"Only current drafts with ladder order set can be viewed.\n"
+                        f"Use `/setdraftladder` to set the order for a future draft."
+                    )
+                    return
 
                 # Get draft picks with team emojis
                 cursor = await db.execute(
@@ -258,7 +275,7 @@ class DraftCommands(commands.Cog):
                        FROM draft_picks dp
                        JOIN teams ct ON dp.current_team_id = ct.team_id
                        LEFT JOIN players p ON dp.player_selected_id = p.player_id
-                       WHERE dp.draft_name = ?
+                       WHERE dp.draft_name = ? AND dp.pick_number IS NOT NULL
                        ORDER BY dp.pick_number""",
                     (draft_name,)
                 )
@@ -267,7 +284,7 @@ class DraftCommands(commands.Cog):
                 if not picks:
                     await interaction.followup.send(
                         f"❌ No draft picks found for '{draft_name}'!\n"
-                        f"Use `/createdraft` to create a draft."
+                        f"This draft may not have a ladder order set yet."
                     )
                     return
 

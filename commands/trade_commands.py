@@ -53,18 +53,18 @@ class TradeCommands(commands.Cog):
             # Current draft with ladder set - use pick number
             return f"Pick #{pick_number}"
         else:
-            # Future draft - use season, round, and emoji
+            # Future draft - format as "Future 1st ([emoji] S11)"
             round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
             emoji_str = ""
             if emoji_id:
                 try:
                     emoji = self.bot.get_emoji(int(emoji_id))
                     if emoji:
-                        emoji_str = f" {emoji}"
+                        emoji_str = f"{emoji} "
                 except (ValueError, AttributeError):
                     # If emoji_id can't be converted or bot isn't available, skip emoji
                     pass
-            return f"S{season_number} {round_suffix}{emoji_str}"
+            return f"Future {round_suffix} ({emoji_str}S{season_number})"
 
     async def format_picks_for_display(self, db, pick_ids_json):
         """
@@ -1904,10 +1904,12 @@ class OfferingPlayerSelect(discord.ui.Select):
                 # Current draft with ladder set
                 pick_label = f"Pick #{pick_number}"
                 pick_emoji = None
+                pick_description = f"{draft_name}" + (f" - {pick_origin}" if pick_origin else "")
             else:
-                # Future draft - use season and round, emoji goes in separate field
+                # Future draft - format as "Future 1st (S11)", emoji goes in separate field
                 round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
-                pick_label = f"S{season_number} {round_suffix}"
+                pick_label = f"Future {round_suffix} (S{season_number})"
+                pick_description = None  # No description for future picks
                 pick_emoji = None
                 if emoji_id:
                     try:
@@ -1918,7 +1920,7 @@ class OfferingPlayerSelect(discord.ui.Select):
             options.append(
                 discord.SelectOption(
                     label=pick_label,
-                    description=f"{draft_name}" + (f" - {pick_origin}" if pick_origin else ""),
+                    description=pick_description,
                     value=f"pick_{pick_id}",
                     emoji=pick_emoji,
                     default=(pick_id in parent_view.initiating_picks)
@@ -1979,10 +1981,12 @@ class ReceivingPlayerSelect(discord.ui.Select):
                 # Current draft with ladder set
                 pick_label = f"Pick #{pick_number}"
                 pick_emoji = None
+                pick_description = f"{draft_name}" + (f" - {pick_origin}" if pick_origin else "")
             else:
-                # Future draft - use season and round, emoji goes in separate field
+                # Future draft - format as "Future 1st (S11)", emoji goes in separate field
                 round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
-                pick_label = f"S{season_number} {round_suffix}"
+                pick_label = f"Future {round_suffix} (S{season_number})"
+                pick_description = None  # No description for future picks
                 pick_emoji = None
                 if emoji_id:
                     try:
@@ -1993,7 +1997,7 @@ class ReceivingPlayerSelect(discord.ui.Select):
             options.append(
                 discord.SelectOption(
                     label=pick_label,
-                    description=f"{draft_name}" + (f" - {pick_origin}" if pick_origin else ""),
+                    description=pick_description,
                     value=f"pick_{pick_id}",
                     emoji=pick_emoji,
                     default=(pick_id in parent_view.receiving_picks)
