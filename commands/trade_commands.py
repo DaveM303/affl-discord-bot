@@ -57,9 +57,13 @@ class TradeCommands(commands.Cog):
             round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
             emoji_str = ""
             if emoji_id:
-                emoji = self.bot.get_emoji(int(emoji_id))
-                if emoji:
-                    emoji_str = f" {emoji}"
+                try:
+                    emoji = self.bot.get_emoji(int(emoji_id))
+                    if emoji:
+                        emoji_str = f" {emoji}"
+                except (ValueError, AttributeError):
+                    # If emoji_id can't be converted or bot isn't available, skip emoji
+                    pass
             return f"S{season_number} {round_suffix}{emoji_str}"
 
     async def format_picks_for_display(self, db, pick_ids_json):
@@ -1895,15 +1899,28 @@ class OfferingPlayerSelect(discord.ui.Select):
 
         # Add draft picks first (at top of list)
         for pick_id, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id in parent_view.initiating_draft_picks:
-            # Format pick display based on whether it has pick_number or not
-            pick_label = parent_view.parent_cog.format_pick_display(
-                pick_number, season_number, round_number, emoji_id, parent_view.current_season
-            )
+            # Format pick display and get emoji for SelectOption
+            if pick_number is not None:
+                # Current draft with ladder set
+                pick_label = f"Pick #{pick_number}"
+                pick_emoji = None
+            else:
+                # Future draft - use season and round, emoji goes in separate field
+                round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
+                pick_label = f"S{season_number} {round_suffix}"
+                pick_emoji = None
+                if emoji_id:
+                    try:
+                        pick_emoji = parent_view.bot.get_emoji(int(emoji_id))
+                    except (ValueError, AttributeError):
+                        pass
+
             options.append(
                 discord.SelectOption(
                     label=pick_label,
                     description=f"{draft_name}" + (f" - {pick_origin}" if pick_origin else ""),
                     value=f"pick_{pick_id}",
+                    emoji=pick_emoji,
                     default=(pick_id in parent_view.initiating_picks)
                 )
             )
@@ -1957,15 +1974,28 @@ class ReceivingPlayerSelect(discord.ui.Select):
 
         # Add draft picks first (at top of list)
         for pick_id, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id in parent_view.receiving_draft_picks:
-            # Format pick display based on whether it has pick_number or not
-            pick_label = parent_view.parent_cog.format_pick_display(
-                pick_number, season_number, round_number, emoji_id, parent_view.current_season
-            )
+            # Format pick display and get emoji for SelectOption
+            if pick_number is not None:
+                # Current draft with ladder set
+                pick_label = f"Pick #{pick_number}"
+                pick_emoji = None
+            else:
+                # Future draft - use season and round, emoji goes in separate field
+                round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
+                pick_label = f"S{season_number} {round_suffix}"
+                pick_emoji = None
+                if emoji_id:
+                    try:
+                        pick_emoji = parent_view.bot.get_emoji(int(emoji_id))
+                    except (ValueError, AttributeError):
+                        pass
+
             options.append(
                 discord.SelectOption(
                     label=pick_label,
                     description=f"{draft_name}" + (f" - {pick_origin}" if pick_origin else ""),
                     value=f"pick_{pick_id}",
+                    emoji=pick_emoji,
                     default=(pick_id in parent_view.receiving_picks)
                 )
             )
