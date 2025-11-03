@@ -36,9 +36,17 @@ class FreeAgencyCommands(commands.Cog):
         """Autocomplete for free agents"""
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Get current season
+                # Get current season (active or offseason)
                 cursor = await db.execute(
-                    "SELECT season_number FROM seasons ORDER BY season_number DESC LIMIT 1"
+                    """SELECT season_number FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
                 )
                 season_result = await cursor.fetchone()
                 if not season_result:
@@ -97,9 +105,17 @@ class FreeAgencyCommands(commands.Cog):
 
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Get current season
+                # Get current season (active or offseason)
                 cursor = await db.execute(
-                    "SELECT season_number FROM seasons ORDER BY season_number DESC LIMIT 1"
+                    """SELECT season_number FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
                 )
                 season_result = await cursor.fetchone()
                 if not season_result:
@@ -159,64 +175,10 @@ class FreeAgencyCommands(commands.Cog):
                         }
                     teams_dict[team_name]['players'].append((name, pos, age, ovr))
 
-                # Build embed with pagination if needed
-                embed = discord.Embed(
-                    title=f"Free Agents - Season {current_season}",
-                    description=f"Players with contracts expiring in Season {current_season - 1}",
-                    color=discord.Color.blue()
-                )
-
-                total_chars = 0
-                teams_added = 0
-                max_chars = 5500  # Leave buffer for footer and title
-
-                for team_name in sorted(teams_dict.keys()):
-                    team_data = teams_dict[team_name]
-                    players = team_data['players']
-
-                    # Get emoji
-                    emoji_str = ""
-                    if team_data['emoji_id']:
-                        try:
-                            emoji = self.bot.get_emoji(int(team_data['emoji_id']))
-                            if emoji:
-                                emoji_str = f"{emoji} "
-                        except:
-                            pass
-
-                    # Format player list
-                    player_lines = []
-                    for name, pos, age, ovr in players:
-                        player_lines.append(f"• **{name}** ({pos}, {age}, {ovr})")
-
-                    field_value = "\n".join(player_lines)
-                    field_name = f"{emoji_str}{team_name} ({len(players)} player{'s' if len(players) != 1 else ''})"
-
-                    # Check if adding this field would exceed limit
-                    field_chars = len(field_name) + len(field_value)
-                    if total_chars + field_chars > max_chars and teams_added > 0:
-                        # Send current embed and start new one
-                        embed.set_footer(text=f"Showing teams {teams_added - len(embed.fields) + 1}-{teams_added} • Total: {len(free_agents)} free agents")
-                        await interaction.followup.send(embed=embed)
-
-                        # Create new embed
-                        embed = discord.Embed(
-                            title=f"Free Agents - Season {current_season} (continued)",
-                            description=f"Players with contracts expiring in Season {current_season - 1}",
-                            color=discord.Color.blue()
-                        )
-                        total_chars = 0
-
-                    embed.add_field(
-                        name=field_name,
-                        value=field_value,
-                        inline=False
-                    )
-                    total_chars += field_chars
-                    teams_added += 1
-
-                embed.set_footer(text=f"Total: {len(free_agents)} free agent{'s' if len(free_agents) != 1 else ''}")
-                await interaction.followup.send(embed=embed)
+                # Create paginated view
+                view = FreeAgentsView(self.bot, teams_dict, current_season, len(free_agents))
+                embed = view.create_embed()
+                await interaction.followup.send(embed=embed, view=view)
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
@@ -232,9 +194,17 @@ class FreeAgencyCommands(commands.Cog):
 
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Get current season
+                # Get current season (active or offseason)
                 cursor = await db.execute(
-                    "SELECT season_number FROM seasons ORDER BY season_number DESC LIMIT 1"
+                    """SELECT season_number FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
                 )
                 season_result = await cursor.fetchone()
                 if not season_result:
@@ -397,9 +367,17 @@ class FreeAgencyCommands(commands.Cog):
 
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Get current season
+                # Get current season (active or offseason)
                 cursor = await db.execute(
-                    "SELECT season_number FROM seasons ORDER BY season_number DESC LIMIT 1"
+                    """SELECT season_number FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
                 )
                 season_result = await cursor.fetchone()
                 if not season_result:
@@ -492,9 +470,17 @@ class FreeAgencyCommands(commands.Cog):
         """Start the bidding period for free agency"""
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Get current season
+                # Get current season (active or offseason)
                 cursor = await db.execute(
-                    "SELECT season_number FROM seasons ORDER BY season_number DESC LIMIT 1"
+                    """SELECT season_number FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
                 )
                 season_result = await cursor.fetchone()
                 if not season_result:
@@ -533,51 +519,11 @@ class FreeAgencyCommands(commands.Cog):
                 period_id = cursor.lastrowid
                 await db.commit()
 
-                # Announce in all team channels
-                cursor = await db.execute("SELECT channel_id, team_name, emoji_id FROM teams WHERE channel_id IS NOT NULL")
-                teams = await cursor.fetchall()
-
-                embed = discord.Embed(
-                    title=f"🎯 Free Agency - Season {current_season}",
-                    description=f"**Bidding Period has started!**\n\nPlace bids on opposition free agents using `/placebid`.",
-                    color=discord.Color.gold()
-                )
-                embed.add_field(
-                    name="Auction Points",
-                    value="Each team has **300 points** to bid on players",
-                    inline=False
-                )
-                embed.add_field(
-                    name="Free Agents Available",
-                    value=f"**{fa_count} players** are free agents this season\nView them with `/viewfreeagents`",
-                    inline=False
-                )
-                embed.add_field(
-                    name="How to Bid",
-                    value=(
-                        "• Use `/placebid` to bid on opposition players\n"
-                        "• Use `/auctionsmenu` to view and withdraw bids\n"
-                        "• All bids are private until matching period"
-                    ),
-                    inline=False
-                )
-                embed.set_footer(text="Bidding period will continue until an admin starts the matching period")
-
-                announcement_count = 0
-                for channel_id, team_name, emoji_id in teams:
-                    try:
-                        channel = self.bot.get_channel(int(channel_id))
-                        if channel:
-                            await channel.send(embed=embed)
-                            announcement_count += 1
-                    except:
-                        pass
-
                 await interaction.followup.send(
                     f"✅ **Free Agency Bidding Period Started!**\n\n"
                     f"Season: {current_season}\n"
-                    f"Free Agents: {fa_count}\n"
-                    f"Announcements sent: {announcement_count} team channels"
+                    f"Free Agents: {fa_count}\n\n"
+                    f"Teams can now use `/placebid` to bid on opposition free agents."
                 )
 
         except Exception as e:
@@ -587,9 +533,17 @@ class FreeAgencyCommands(commands.Cog):
         """End bidding, calculate winners, and start matching period"""
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Get current season
+                # Get current season (active or offseason)
                 cursor = await db.execute(
-                    "SELECT season_number FROM seasons ORDER BY season_number DESC LIMIT 1"
+                    """SELECT season_number FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
                 )
                 season_result = await cursor.fetchone()
                 if not season_result:
@@ -735,6 +689,111 @@ class FreeAgencyCommands(commands.Cog):
         """Process matches, assign players, calculate compensation"""
         # This will be implemented next
         await interaction.followup.send("🚧 End matching period - To be implemented")
+
+
+class FreeAgentsView(discord.ui.View):
+    """Paginated view for free agents list"""
+    def __init__(self, bot, teams_dict, season_number, total_fa_count):
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.teams_dict = teams_dict
+        self.season_number = season_number
+        self.total_fa_count = total_fa_count
+        self.teams_list = sorted(teams_dict.keys())
+        self.current_page = 0
+        self.teams_per_page = 5
+
+        self.update_buttons()
+
+    def update_buttons(self):
+        """Update navigation buttons"""
+        self.clear_items()
+
+        total_pages = (len(self.teams_list) + self.teams_per_page - 1) // self.teams_per_page
+
+        # Previous button
+        prev_button = discord.ui.Button(
+            label="◀ Previous",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.current_page == 0,
+            custom_id="prev"
+        )
+        prev_button.callback = self.prev_callback
+        self.add_item(prev_button)
+
+        # Page indicator
+        page_button = discord.ui.Button(
+            label=f"Page {self.current_page + 1}/{total_pages}",
+            style=discord.ButtonStyle.secondary,
+            disabled=True,
+            custom_id="page"
+        )
+        self.add_item(page_button)
+
+        # Next button
+        next_button = discord.ui.Button(
+            label="Next ▶",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.current_page >= total_pages - 1,
+            custom_id="next"
+        )
+        next_button.callback = self.next_callback
+        self.add_item(next_button)
+
+    def create_embed(self):
+        """Create embed for current page"""
+        embed = discord.Embed(
+            title=f"Free Agents - Season {self.season_number}",
+            color=discord.Color.blue()
+        )
+
+        # Get teams for current page
+        start_idx = self.current_page * self.teams_per_page
+        end_idx = start_idx + self.teams_per_page
+        page_teams = self.teams_list[start_idx:end_idx]
+
+        # Build player list with team emojis
+        all_players = []
+        for team_name in page_teams:
+            team_data = self.teams_dict[team_name]
+            players = team_data['players']
+
+            # Get emoji
+            emoji_str = ""
+            if team_data['emoji_id']:
+                try:
+                    emoji = self.bot.get_emoji(int(team_data['emoji_id']))
+                    if emoji:
+                        emoji_str = f"{emoji} "
+                except:
+                    pass
+
+            # Add all players from this team with team emoji
+            for name, pos, age, ovr in players:
+                all_players.append(f"{emoji_str}**{name}** ({pos}, {age}, {ovr})")
+
+        # Add as single field
+        if all_players:
+            embed.description = "\n".join(all_players)
+        else:
+            embed.description = "*No free agents on this page*"
+
+        embed.set_footer(text=f"Total: {self.total_fa_count} free agents")
+        return embed
+
+    async def prev_callback(self, interaction: discord.Interaction):
+        """Go to previous page"""
+        self.current_page -= 1
+        self.update_buttons()
+        embed = self.create_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def next_callback(self, interaction: discord.Interaction):
+        """Go to next page"""
+        self.current_page += 1
+        self.update_buttons()
+        embed = self.create_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
 
 
 class MatchingView(discord.ui.View):
