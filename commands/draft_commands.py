@@ -319,12 +319,12 @@ class DraftCommands(commands.Cog):
         except:
             return []
 
-    async def pick_origin_autocomplete(
+    async def pick_identifier_autocomplete(
         self,
         interaction: discord.Interaction,
         current: str,
     ) -> list[app_commands.Choice[str]]:
-        """Autocomplete for pick origins in a draft"""
+        """Autocomplete for pick identifiers in a draft (pick number for current, origin for future)"""
         try:
             # Get the draft_name from the current interaction namespace
             draft_name = interaction.namespace.draft_name
@@ -333,36 +333,41 @@ class DraftCommands(commands.Cog):
 
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
-                    """SELECT pick_origin, pick_number, round_number, current_team_id
-                       FROM draft_picks
-                       WHERE draft_name = ?
+                    """SELECT dp.pick_origin, dp.pick_number, dp.round_number, dp.current_team_id,
+                              t_orig.team_name as original_team
+                       FROM draft_picks dp
+                       JOIN teams t_orig ON dp.original_team_id = t_orig.team_id
+                       WHERE dp.draft_name = ?
                        ORDER BY
-                         CASE WHEN pick_number IS NULL THEN 1 ELSE 0 END,
-                         pick_number,
-                         round_number""",
+                         CASE WHEN dp.pick_number IS NULL THEN 1 ELSE 0 END,
+                         dp.pick_number,
+                         dp.round_number""",
                     (draft_name,)
                 )
                 picks = await cursor.fetchall()
 
                 # Get team name for display
                 choices = []
-                for pick_origin, pick_number, round_number, current_team_id in picks:
+                for pick_origin, pick_number, round_number, current_team_id, original_team in picks:
                     cursor = await db.execute(
                         "SELECT team_name FROM teams WHERE team_id = ?",
                         (current_team_id,)
                     )
                     team_result = await cursor.fetchone()
-                    team_name = team_result[0] if team_result else "Unknown"
+                    current_team_name = team_result[0] if team_result else "Unknown"
 
                     if pick_number is not None:
-                        # Current pick with number
-                        display_name = f"Pick #{pick_number} - {pick_origin} (currently {team_name})"
+                        # Current draft - use pick number as value
+                        display_name = f"Pick #{pick_number} (owned by {current_team_name})"
+                        value = str(pick_number)
                     else:
-                        # Future pick without number
-                        display_name = f"{pick_origin} - Round {round_number} (currently {team_name})"
+                        # Future draft - use pick origin as value, format with round suffix
+                        round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
+                        display_name = f"{original_team} {round_suffix} (owned by {current_team_name})"
+                        value = pick_origin
 
                     if current.lower() in display_name.lower():
-                        choices.append(app_commands.Choice(name=display_name, value=pick_origin))
+                        choices.append(app_commands.Choice(name=display_name, value=value))
 
                 return choices[:25]
         except:
@@ -371,11 +376,11 @@ class DraftCommands(commands.Cog):
     @app_commands.command(name="transferpick", description="[ADMIN] Transfer a draft pick to another team")
     @app_commands.describe(
         draft_name="Name of the draft",
-        pick_origin="The pick to transfer (e.g., 'Adelaide R1')",
+        pick="The pick to transfer (pick number for current drafts, origin for future drafts)",
         to_team="Team to transfer pick to"
     )
-    @app_commands.autocomplete(draft_name=all_drafts_autocomplete, pick_origin=pick_origin_autocomplete, to_team=team_autocomplete)
-    async def transfer_pick(self, interaction: discord.Interaction, draft_name: str, pick_origin: str, to_team: str):
+    @app_commands.autocomplete(draft_name=all_drafts_autocomplete, pick=pick_identifier_autocomplete, to_team=team_autocomplete)
+    async def transfer_pick(self, interaction: discord.Interaction, draft_name: str, pick: str, to_team: str):
         await interaction.response.defer(ephemeral=True)
 
         # Check if user has admin role
@@ -394,24 +399,42 @@ class DraftCommands(commands.Cog):
 
                 new_team_id, new_team_name = team_data
 
-                # Get the pick
-                cursor = await db.execute(
-                    """SELECT dp.pick_id, dp.pick_number, dp.round_number, ct.team_name
-                       FROM draft_picks dp
-                       JOIN teams ct ON dp.current_team_id = ct.team_id
-                       WHERE dp.draft_name = ? AND dp.pick_origin = ?""",
-                    (draft_name, pick_origin)
-                )
-                pick_data = await cursor.fetchone()
+                # Try to determine if this is a pick number or pick origin
+                # If it's all digits, treat as pick number, otherwise as pick origin
+                pick_data = None
+                if pick.isdigit():
+                    # Current draft - search by pick number
+                    cursor = await db.execute(
+                        """SELECT dp.pick_id, dp.pick_number, dp.round_number, dp.pick_origin,
+                                  ct.team_name, ot.team_name
+                           FROM draft_picks dp
+                           JOIN teams ct ON dp.current_team_id = ct.team_id
+                           JOIN teams ot ON dp.original_team_id = ot.team_id
+                           WHERE dp.draft_name = ? AND dp.pick_number = ?""",
+                        (draft_name, int(pick))
+                    )
+                    pick_data = await cursor.fetchone()
+                else:
+                    # Future draft - search by pick origin
+                    cursor = await db.execute(
+                        """SELECT dp.pick_id, dp.pick_number, dp.round_number, dp.pick_origin,
+                                  ct.team_name, ot.team_name
+                           FROM draft_picks dp
+                           JOIN teams ct ON dp.current_team_id = ct.team_id
+                           JOIN teams ot ON dp.original_team_id = ot.team_id
+                           WHERE dp.draft_name = ? AND dp.pick_origin = ?""",
+                        (draft_name, pick)
+                    )
+                    pick_data = await cursor.fetchone()
 
                 if not pick_data:
                     await interaction.followup.send(
-                        f"❌ Pick '{pick_origin}' not found in '{draft_name}'!",
+                        f"❌ Pick '{pick}' not found in '{draft_name}'!",
                         ephemeral=True
                     )
                     return
 
-                pick_id, pick_number, round_num, current_team = pick_data
+                pick_id, pick_number, round_num, pick_origin, current_team, original_team = pick_data
 
                 # Transfer the pick
                 await db.execute(
@@ -422,9 +445,10 @@ class DraftCommands(commands.Cog):
 
                 # Format display message
                 if pick_number is not None:
-                    pick_display = f"#{pick_number} ({pick_origin})"
+                    pick_display = f"Pick #{pick_number}"
                 else:
-                    pick_display = f"{pick_origin} - Round {round_num}"
+                    round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_num, f"{round_num}th")
+                    pick_display = f"{original_team} {round_suffix}"
 
                 await interaction.followup.send(
                     f"✅ **Pick Transferred!**\n\n"
@@ -1124,8 +1148,8 @@ class DraftOrderView(discord.ui.View):
             # Get emoji for current team
             current_emoji_str = self.get_emoji(current_emoji)
 
-            # Build pick - number, emoji, and origin
-            pick_desc = f"**{pick_num}.** {current_emoji_str}{pick_origin}"
+            # Build pick - number and emoji only
+            pick_desc = f"**{pick_num}.** {current_emoji_str}"
 
             # Show if player selected
             if player_selected:

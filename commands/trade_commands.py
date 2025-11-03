@@ -854,8 +854,57 @@ class TradeMenuView(discord.ui.View):
 
         trade_id = self.incoming_trades[self.incoming_page]
 
-        # Update trade status
+        # Get trade and team info for notification
         async with aiosqlite.connect(DB_PATH) as db:
+            # Get trade details
+            cursor = await db.execute(
+                """SELECT t.initiating_team_id, t1.team_name, t1.channel_id, t1.emoji_id, t2.emoji_id,
+                          t.initiating_players, t.receiving_players, t.initiating_picks, t.receiving_picks
+                   FROM trades t
+                   JOIN teams t1 ON t.initiating_team_id = t1.team_id
+                   JOIN teams t2 ON t.receiving_team_id = t2.team_id
+                   WHERE t.trade_id = ?""",
+                (trade_id,)
+            )
+            trade_info = await cursor.fetchone()
+
+            if trade_info:
+                initiating_team_id, initiating_team_name, channel_id, init_emoji_id, recv_emoji_id, init_players_json, recv_players_json, init_picks_json, recv_picks_json = trade_info
+
+                # Build trade details
+                init_items = []
+                recv_items = []
+
+                # Get picks
+                if init_picks_json:
+                    formatted_picks = await self.parent_cog.format_picks_for_display(db, init_picks_json)
+                    init_items.extend(formatted_picks)
+
+                if recv_picks_json:
+                    formatted_picks = await self.parent_cog.format_picks_for_display(db, recv_picks_json)
+                    recv_items.extend(formatted_picks)
+
+                # Get players
+                init_players = json.loads(init_players_json) if init_players_json else []
+                recv_players = json.loads(recv_players_json) if recv_players_json else []
+
+                if init_players:
+                    placeholders = ','.join('?' * len(init_players))
+                    cursor = await db.execute(
+                        f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                        init_players
+                    )
+                    init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+
+                if recv_players:
+                    placeholders = ','.join('?' * len(recv_players))
+                    cursor = await db.execute(
+                        f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                        recv_players
+                    )
+                    recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+
+            # Update trade status
             await db.execute(
                 """UPDATE trades SET status = 'accepted', responded_at = CURRENT_TIMESTAMP,
                    responded_by_user_id = ? WHERE trade_id = ?""",
@@ -864,6 +913,36 @@ class TradeMenuView(discord.ui.View):
             await db.commit()
 
         await interaction.response.send_message("✅ Trade accepted! Sent to moderators for approval.", ephemeral=True)
+
+        # Notify the team that proposed the trade
+        if trade_info and channel_id:
+            channel = self.bot.get_channel(int(channel_id))
+            if channel:
+                # Get emojis
+                init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
+                recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
+                init_emoji_str = f"{init_emoji} " if init_emoji else ""
+                recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
+
+                embed = discord.Embed(
+                    title=f"✅ {recv_emoji_str}**{self.team_name}** have accepted your trade offer!",
+                    description="*Awaiting moderator approval*",
+                    color=discord.Color.green()
+                )
+
+                embed.add_field(
+                    name=f"**{recv_emoji_str}receive:**",
+                    value="\n".join(init_items) if init_items else "*Nothing*",
+                    inline=True
+                )
+
+                embed.add_field(
+                    name=f"**{init_emoji_str}receive:**",
+                    value="\n".join(recv_items) if recv_items else "*Nothing*",
+                    inline=True
+                )
+
+                await channel.send(embed=embed)
 
         # Send to moderators for approval
         response_view = TradeResponseView(trade_id, self.bot)
