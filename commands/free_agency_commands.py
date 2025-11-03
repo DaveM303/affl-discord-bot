@@ -512,9 +512,10 @@ class FreeAgencyCommands(commands.Cog):
                     await interaction.followup.send(f"❌ Free agency period already exists for Season {current_season} (status: {existing[1]})")
                     return
 
-                # Get free agents
+                # Get free agents (only those with a team)
                 cursor = await db.execute(
-                    """SELECT COUNT(*) FROM players WHERE contract_expiry = ?""",
+                    """SELECT COUNT(*) FROM players
+                       WHERE contract_expiry = ? AND team_id IS NOT NULL""",
                     (current_season - 1,)
                 )
                 fa_count = (await cursor.fetchone())[0]
@@ -611,12 +612,17 @@ class FreeAgencyCommands(commands.Cog):
                     await interaction.followup.send(f"❌ Period is not in bidding status (current: {status})")
                     return
 
-                # Get all free agents
+                # Get all free agents (only those with a team)
                 cursor = await db.execute(
-                    """SELECT player_id, team_id FROM players WHERE contract_expiry = ?""",
+                    """SELECT player_id, team_id FROM players
+                       WHERE contract_expiry = ? AND team_id IS NOT NULL""",
                     (current_season - 1,)
                 )
                 free_agents = await cursor.fetchall()
+
+                if not free_agents:
+                    await interaction.followup.send(f"❌ No valid free agents found (all free agents must have a team)!")
+                    return
 
                 # Calculate winning bids for each player
                 results_created = 0
