@@ -687,8 +687,121 @@ class FreeAgencyCommands(commands.Cog):
 
     async def end_matching_period(self, interaction: discord.Interaction):
         """Process matches, assign players, calculate compensation"""
-        # This will be implemented next
-        await interaction.followup.send("🚧 End matching period - To be implemented")
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get current season (active or offseason)
+                cursor = await db.execute(
+                    """SELECT season_number FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
+                )
+                season_result = await cursor.fetchone()
+                if not season_result:
+                    await interaction.followup.send("❌ No active season found!")
+                    return
+                current_season = season_result[0]
+
+                # Get period
+                cursor = await db.execute(
+                    "SELECT period_id, status FROM free_agency_periods WHERE season_number = ?",
+                    (current_season,)
+                )
+                period_result = await cursor.fetchone()
+                if not period_result:
+                    await interaction.followup.send("❌ No free agency period found!")
+                    return
+
+                period_id, status = period_result
+                if status != 'matching':
+                    await interaction.followup.send(f"❌ Period is not in matching status (current: {status})")
+                    return
+
+                # Get all free agency results
+                cursor = await db.execute(
+                    """SELECT r.result_id, r.player_id, r.original_team_id, r.winning_team_id,
+                              r.winning_bid, r.matched, p.name, p.age, p.overall_rating
+                       FROM free_agency_results r
+                       JOIN players p ON r.player_id = p.player_id
+                       WHERE r.period_id = ?""",
+                    (period_id,)
+                )
+                results = await cursor.fetchall()
+
+                players_transferred = 0
+                players_matched = 0
+                players_resigned = 0
+                compensation_picks = 0
+
+                for result_id, player_id, original_team_id, winning_team_id, winning_bid, matched, player_name, age, ovr in results:
+                    # Get new contract length based on age
+                    contract_years = await self.get_contract_years_for_age(db, age)
+                    new_contract_expiry = current_season + contract_years - 1
+
+                    if winning_team_id is None:
+                        # No bids - auto re-sign with original team
+                        await db.execute(
+                            "UPDATE players SET contract_expiry = ? WHERE player_id = ?",
+                            (new_contract_expiry, player_id)
+                        )
+                        players_resigned += 1
+
+                    elif matched:
+                        # Original team matched - player stays, winning bidder gets refund
+                        await db.execute(
+                            "UPDATE players SET contract_expiry = ? WHERE player_id = ?",
+                            (new_contract_expiry, player_id)
+                        )
+                        players_matched += 1
+
+                        # Note: Points are already not deducted for matched bids in the matching logic
+
+                    else:
+                        # Unmatched - transfer player to winning team
+                        await db.execute(
+                            "UPDATE players SET team_id = ?, contract_expiry = ? WHERE player_id = ?",
+                            (winning_team_id, new_contract_expiry, player_id)
+                        )
+                        players_transferred += 1
+
+                        # Calculate compensation for original team
+                        compensation_band = await self.get_compensation_band(db, age, ovr)
+                        if compensation_band:
+                            # Store compensation band for later pick insertion
+                            await db.execute(
+                                "UPDATE free_agency_results SET compensation_band = ? WHERE result_id = ?",
+                                (compensation_band, result_id)
+                            )
+                            compensation_picks += 1
+
+                # Update period status
+                await db.execute(
+                    """UPDATE free_agency_periods
+                       SET status = 'completed', matching_ended_at = CURRENT_TIMESTAMP
+                       WHERE period_id = ?""",
+                    (period_id,)
+                )
+                await db.commit()
+
+                # Build summary message
+                await interaction.followup.send(
+                    f"✅ **Free Agency Period Completed!**\n\n"
+                    f"**Summary:**\n"
+                    f"• {players_transferred} player{'s' if players_transferred != 1 else ''} transferred to new teams\n"
+                    f"• {players_matched} player{'s' if players_matched != 1 else ''} matched by original teams\n"
+                    f"• {players_resigned} player{'s' if players_resigned != 1 else ''} auto re-signed (no bids)\n"
+                    f"• {compensation_picks} compensation pick{'s' if compensation_picks != 1 else ''} awarded\n\n"
+                    f"**Note:** Compensation picks have been calculated but not yet inserted into drafts. "
+                    f"Use the compensation pick insertion command when the draft is created."
+                )
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {e}")
 
 
 class FreeAgentsView(discord.ui.View):

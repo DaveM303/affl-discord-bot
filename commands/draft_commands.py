@@ -59,9 +59,10 @@ class DraftCommands(commands.Cog):
         season_number="Season number to link this draft to (leave blank for manual draft)",
         draft_name="Custom draft name (only for manual drafts, leave blank for season-linked)",
         rounds="Number of rounds (default: 4)",
+        rookie_contract_years="Rookie contract length in years (default: 3)",
         save_ladder_for_season="Optional: Season number to save this ladder for (for historical records)"
     )
-    async def create_draft(self, interaction: discord.Interaction, season_number: int = None, draft_name: str = None, rounds: int = 4, save_ladder_for_season: int = None):
+    async def create_draft(self, interaction: discord.Interaction, season_number: int = None, draft_name: str = None, rounds: int = 4, rookie_contract_years: int = 3, save_ladder_for_season: int = None):
         await interaction.response.defer(ephemeral=True)
 
         # Check if user has admin role
@@ -143,7 +144,7 @@ class DraftCommands(commands.Cog):
                     return
 
                 # Send the view with Enter Ladder or Skip buttons
-                view = LadderEntryStartView(teams, final_draft_name, rounds, save_ladder_for_season, linked_season)
+                view = LadderEntryStartView(teams, final_draft_name, rounds, rookie_contract_years, save_ladder_for_season, linked_season)
 
                 draft_type = "Season-Linked" if linked_season else "Manual"
                 message = f"📊 **Create Draft: {final_draft_name}**\n\n"
@@ -151,6 +152,7 @@ class DraftCommands(commands.Cog):
                 if linked_season:
                     message += f"**Linked to:** Season {linked_season}\n"
                 message += f"**Rounds:** {rounds}\n"
+                message += f"**Rookie Contract:** {rookie_contract_years} years\n"
                 if save_ladder_for_season:
                     message += f"**Save ladder as:** Season {save_ladder_for_season} ladder\n"
                 message += f"\n**Choose an option:**\n"
@@ -793,17 +795,18 @@ class DraftCommands(commands.Cog):
 
 
 class LadderEntryStartView(discord.ui.View):
-    def __init__(self, teams, draft_name, rounds, save_ladder_for_season, linked_season=None):
+    def __init__(self, teams, draft_name, rounds, rookie_contract_years, save_ladder_for_season, linked_season=None):
         super().__init__(timeout=300)
         self.teams = teams
         self.draft_name = draft_name
         self.rounds = rounds
+        self.rookie_contract_years = rookie_contract_years
         self.save_ladder_for_season = save_ladder_for_season
         self.linked_season = linked_season
 
     @discord.ui.button(label="📝 Enter Ladder Order", style=discord.ButtonStyle.primary, row=0)
     async def enter_ladder_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        modal = LadderEntryModal(self.teams, self.draft_name, self.rounds, self.save_ladder_for_season, self.linked_season)
+        modal = LadderEntryModal(self.teams, self.draft_name, self.rounds, self.rookie_contract_years, self.save_ladder_for_season, self.linked_season)
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="⏭️ Skip - Future Draft", style=discord.ButtonStyle.secondary, row=0)
@@ -814,9 +817,9 @@ class LadderEntryStartView(discord.ui.View):
             async with aiosqlite.connect(DB_PATH) as db:
                 # Create draft in drafts table with status 'future'
                 cursor = await db.execute(
-                    """INSERT INTO drafts (draft_name, season_number, status, rounds)
-                       VALUES (?, ?, 'future', ?)""",
-                    (self.draft_name, self.linked_season, self.rounds)
+                    """INSERT INTO drafts (draft_name, season_number, status, rounds, rookie_contract_years)
+                       VALUES (?, ?, 'future', ?, ?)""",
+                    (self.draft_name, self.linked_season, self.rounds, self.rookie_contract_years)
                 )
                 draft_id = cursor.lastrowid
 
@@ -849,11 +852,12 @@ class LadderEntryStartView(discord.ui.View):
 
 
 class LadderEntryModal(discord.ui.Modal):
-    def __init__(self, teams, draft_name, rounds, save_ladder_for_season, linked_season=None):
+    def __init__(self, teams, draft_name, rounds, rookie_contract_years, save_ladder_for_season, linked_season=None):
         super().__init__(title=f"Ladder Order: {draft_name[:30]}")
         self.teams = teams
         self.draft_name = draft_name
         self.rounds = rounds
+        self.rookie_contract_years = rookie_contract_years
         self.save_ladder_for_season = save_ladder_for_season
         self.linked_season = linked_season
 
@@ -931,9 +935,9 @@ class LadderEntryModal(discord.ui.Modal):
 
                 # Create draft in drafts table with status 'current' (ladder is set)
                 cursor = await db.execute(
-                    """INSERT INTO drafts (draft_name, season_number, status, rounds, ladder_set_at)
-                       VALUES (?, ?, 'current', ?, CURRENT_TIMESTAMP)""",
-                    (self.draft_name, self.linked_season, self.rounds)
+                    """INSERT INTO drafts (draft_name, season_number, status, rounds, rookie_contract_years, ladder_set_at)
+                       VALUES (?, ?, 'current', ?, ?, CURRENT_TIMESTAMP)""",
+                    (self.draft_name, self.linked_season, self.rounds, self.rookie_contract_years)
                 )
                 draft_id = cursor.lastrowid
 

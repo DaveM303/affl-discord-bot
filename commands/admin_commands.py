@@ -1551,6 +1551,35 @@ class AdminCommands(commands.Cog):
                     if 'Worksheet Submitted_Lineups' not in str(e):
                         errors.append(f"Submitted Lineups sheet error: {str(e)}")
 
+                # Import Compensation Chart
+                compensation_chart_imported = 0
+                try:
+                    compensation_chart_df = pd.read_excel(excel_file, sheet_name='Compensation_Chart')
+
+                    # Clear existing compensation chart
+                    await db.execute("DELETE FROM compensation_chart")
+
+                    for _, row in compensation_chart_df.iterrows():
+                        try:
+                            min_age = int(row['Min_Age'])
+                            max_age = int(row['Max_Age']) if pd.notna(row['Max_Age']) and row['Max_Age'] else None
+                            min_ovr = int(row['Min_OVR'])
+                            max_ovr = int(row['Max_OVR']) if pd.notna(row['Max_OVR']) and row['Max_OVR'] else None
+                            band = int(row['Band'])
+
+                            await db.execute(
+                                """INSERT INTO compensation_chart (min_age, max_age, min_ovr, max_ovr, compensation_band)
+                                   VALUES (?, ?, ?, ?, ?)""",
+                                (min_age, max_age, min_ovr, max_ovr, band)
+                            )
+                            compensation_chart_imported += 1
+                        except Exception as e:
+                            errors.append(f"Compensation Chart row: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Compensation_Chart' not in str(e):
+                        errors.append(f"Compensation Chart sheet error: {str(e)}")
+
             # Build response
             response = "✅ **Import Complete!**\n\n"
             response += f"**Teams:** {teams_added} added, {teams_updated} updated\n"
@@ -1575,6 +1604,8 @@ class AdminCommands(commands.Cog):
                 response += f"**Submitted Lineups:** {submitted_lineups_imported} imported\n"
             if settings_imported > 0:
                 response += f"**Settings:** {settings_imported} imported\n"
+            if compensation_chart_imported > 0:
+                response += f"**Compensation Chart:** {compensation_chart_imported} entries imported\n"
 
             if duplicate_warnings:
                 response += f"\n⚠️ **{len(duplicate_warnings)} Duplicate Name Warning(s):**\n"
@@ -1592,6 +1623,75 @@ class AdminCommands(commands.Cog):
             
         except Exception as e:
             await interaction.followup.send(f"❌ Error importing file: {e}", ephemeral=True)
+
+    @app_commands.command(name="assignrookiecontracts", description="[ADMIN] Assign contract_expiry to drafted rookies")
+    @app_commands.describe(
+        draft_name="Name of the draft (e.g., 'Season 9 National Draft')"
+    )
+    async def assign_rookie_contracts(self, interaction: discord.Interaction, draft_name: str):
+        await interaction.response.defer(ephemeral=True)
+
+        # Check if user has admin role
+        if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
+            await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get draft information
+                cursor = await db.execute(
+                    "SELECT draft_id, season_number, rookie_contract_years FROM drafts WHERE draft_name = ?",
+                    (draft_name,)
+                )
+                draft_result = await cursor.fetchone()
+                if not draft_result:
+                    await interaction.followup.send(f"❌ Draft '{draft_name}' not found!")
+                    return
+
+                draft_id, season_number, rookie_contract_years = draft_result
+
+                if rookie_contract_years is None:
+                    rookie_contract_years = 3  # Default
+
+                # Calculate contract expiry: season + years - 1
+                contract_expiry = season_number + rookie_contract_years - 1
+
+                # Get all drafted players from this draft
+                cursor = await db.execute(
+                    """SELECT player_selected_id FROM draft_picks
+                       WHERE draft_id = ? AND player_selected_id IS NOT NULL""",
+                    (draft_id,)
+                )
+                drafted_players = await cursor.fetchall()
+
+                if not drafted_players:
+                    await interaction.followup.send(f"❌ No players have been drafted in '{draft_name}'!")
+                    return
+
+                # Assign contract_expiry to all drafted players
+                players_updated = 0
+                for (player_id,) in drafted_players:
+                    await db.execute(
+                        "UPDATE players SET contract_expiry = ? WHERE player_id = ?",
+                        (contract_expiry, player_id)
+                    )
+                    players_updated += 1
+
+                await db.commit()
+
+                await interaction.followup.send(
+                    f"✅ **Rookie Contracts Assigned!**\n\n"
+                    f"**Draft:** {draft_name}\n"
+                    f"**Season:** {season_number}\n"
+                    f"**Contract Length:** {rookie_contract_years} years\n"
+                    f"**Contract Expiry:** Season {contract_expiry}\n"
+                    f"**Players Updated:** {players_updated}\n\n"
+                    f"All drafted rookies now have contracts expiring after Season {contract_expiry}."
+                )
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
 
 async def setup(bot):
     await bot.add_cog(AdminCommands(bot))
