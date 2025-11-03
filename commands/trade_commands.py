@@ -1992,17 +1992,38 @@ class OfferingPlayerSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        # Parse selections - separate picks from players
-        picks = []
-        players = []
+        # Parse current page selections - separate picks from players
+        current_picks = []
+        current_players = []
         for value in self.values:
             if value.startswith("pick_"):
-                picks.append(int(value.replace("pick_", "")))
+                current_picks.append(int(value.replace("pick_", "")))
             elif value.startswith("player_"):
-                players.append(int(value.replace("player_", "")))
+                current_players.append(int(value.replace("player_", "")))
 
-        self.parent_view.initiating_picks = picks
-        self.parent_view.initiating_players = players
+        # Get all player IDs visible on this page
+        if self.parent_view.initiating_page == 0:
+            picks_count = len(self.parent_view.initiating_draft_picks)
+            available_player_slots = 25 - picks_count
+            start_idx = 0
+        else:
+            picks_count = len(self.parent_view.initiating_draft_picks)
+            page_0_player_count = 25 - picks_count
+            available_player_slots = 25
+            start_idx = page_0_player_count + ((self.parent_view.initiating_page - 1) * 25)
+
+        end_idx = start_idx + available_player_slots
+        page_player_ids = [p[0] for p in self.parent_view.initiating_roster[start_idx:end_idx]]
+
+        # Remove old selections from this page, keep selections from other pages
+        self.parent_view.initiating_players = [p for p in self.parent_view.initiating_players if p not in page_player_ids]
+        # Add new selections from this page
+        self.parent_view.initiating_players.extend(current_players)
+
+        # For picks, only update if we're on page 0 (picks only show on page 0)
+        if self.parent_view.initiating_page == 0:
+            self.parent_view.initiating_picks = current_picks
+
         await self.parent_view.update_view(interaction)
 
 
@@ -2080,17 +2101,38 @@ class ReceivingPlayerSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        # Parse selections - separate picks from players
-        picks = []
-        players = []
+        # Parse current page selections - separate picks from players
+        current_picks = []
+        current_players = []
         for value in self.values:
             if value.startswith("pick_"):
-                picks.append(int(value.replace("pick_", "")))
+                current_picks.append(int(value.replace("pick_", "")))
             elif value.startswith("player_"):
-                players.append(int(value.replace("player_", "")))
+                current_players.append(int(value.replace("player_", "")))
 
-        self.parent_view.receiving_picks = picks
-        self.parent_view.receiving_players = players
+        # Get all player IDs visible on this page
+        if self.parent_view.receiving_page == 0:
+            picks_count = len(self.parent_view.receiving_draft_picks)
+            available_player_slots = 25 - picks_count
+            start_idx = 0
+        else:
+            picks_count = len(self.parent_view.receiving_draft_picks)
+            page_0_player_count = 25 - picks_count
+            available_player_slots = 25
+            start_idx = page_0_player_count + ((self.parent_view.receiving_page - 1) * 25)
+
+        end_idx = start_idx + available_player_slots
+        page_player_ids = [p[0] for p in self.parent_view.receiving_roster[start_idx:end_idx]]
+
+        # Remove old selections from this page, keep selections from other pages
+        self.parent_view.receiving_players = [p for p in self.parent_view.receiving_players if p not in page_player_ids]
+        # Add new selections from this page
+        self.parent_view.receiving_players.extend(current_players)
+
+        # For picks, only update if we're on page 0 (picks only show on page 0)
+        if self.parent_view.receiving_page == 0:
+            self.parent_view.receiving_picks = current_picks
+
         await self.parent_view.update_view(interaction)
 
 
