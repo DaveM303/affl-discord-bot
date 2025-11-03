@@ -323,6 +323,122 @@ class SeasonCommands(commands.Cog):
                     # Can't drop column in SQLite, so just notify user it's deprecated
                     pass
 
+                # Add contract_expiry column to players if it doesn't exist
+                cursor = await db.execute("PRAGMA table_info(players)")
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+
+                if 'contract_expiry' not in column_names:
+                    await db.execute('ALTER TABLE players ADD COLUMN contract_expiry INTEGER')
+
+                    # Set default contracts for existing players (current_season + 2)
+                    cursor = await db.execute(
+                        "SELECT season_number FROM seasons ORDER BY season_number DESC LIMIT 1"
+                    )
+                    season_result = await cursor.fetchone()
+                    if season_result:
+                        current_season = season_result[0]
+                        await db.execute(
+                            "UPDATE players SET contract_expiry = ? WHERE contract_expiry IS NULL",
+                            (current_season + 2,)
+                        )
+
+                # Add rookie_contract_years to drafts table if it doesn't exist
+                cursor = await db.execute("PRAGMA table_info(drafts)")
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+
+                if 'rookie_contract_years' not in column_names:
+                    await db.execute('ALTER TABLE drafts ADD COLUMN rookie_contract_years INTEGER DEFAULT 3')
+
+                # Create Contract Config table
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS contract_config (
+                        config_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        min_age INTEGER NOT NULL,
+                        max_age INTEGER,
+                        contract_years INTEGER NOT NULL,
+                        UNIQUE(min_age, max_age)
+                    )
+                ''')
+
+                # Insert default contract config
+                await db.execute('''
+                    INSERT OR IGNORE INTO contract_config (min_age, max_age, contract_years) VALUES
+                    (0, 20, 3),
+                    (21, 23, 5),
+                    (24, 26, 4),
+                    (27, 30, 3),
+                    (31, NULL, 2)
+                ''')
+
+                # Create Compensation Chart table
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS compensation_chart (
+                        chart_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        min_age INTEGER NOT NULL,
+                        max_age INTEGER,
+                        min_ovr INTEGER NOT NULL,
+                        max_ovr INTEGER,
+                        compensation_band INTEGER NOT NULL,
+                        UNIQUE(min_age, max_age, min_ovr, max_ovr)
+                    )
+                ''')
+
+                # Create Free Agency Periods table
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS free_agency_periods (
+                        period_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        season_number INTEGER NOT NULL,
+                        status TEXT DEFAULT 'bidding',
+                        auction_points INTEGER DEFAULT 300,
+                        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        bidding_ended_at TIMESTAMP,
+                        matching_ended_at TIMESTAMP,
+                        FOREIGN KEY (season_number) REFERENCES seasons(season_number),
+                        UNIQUE(season_number)
+                    )
+                ''')
+
+                # Create Free Agency Bids table
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS free_agency_bids (
+                        bid_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        period_id INTEGER NOT NULL,
+                        team_id INTEGER NOT NULL,
+                        player_id INTEGER NOT NULL,
+                        bid_amount INTEGER NOT NULL,
+                        status TEXT DEFAULT 'active',
+                        placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (period_id) REFERENCES free_agency_periods(period_id),
+                        FOREIGN KEY (team_id) REFERENCES teams(team_id),
+                        FOREIGN KEY (player_id) REFERENCES players(player_id),
+                        UNIQUE(period_id, team_id, player_id)
+                    )
+                ''')
+
+                # Create Free Agency Results table
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS free_agency_results (
+                        result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        period_id INTEGER NOT NULL,
+                        player_id INTEGER NOT NULL,
+                        original_team_id INTEGER NOT NULL,
+                        winning_team_id INTEGER,
+                        winning_bid INTEGER,
+                        matched BOOLEAN DEFAULT 0,
+                        compensation_band INTEGER,
+                        compensation_pick_id INTEGER,
+                        FOREIGN KEY (period_id) REFERENCES free_agency_periods(period_id),
+                        FOREIGN KEY (player_id) REFERENCES players(player_id),
+                        FOREIGN KEY (original_team_id) REFERENCES teams(team_id),
+                        FOREIGN KEY (winning_team_id) REFERENCES teams(team_id),
+                        FOREIGN KEY (compensation_pick_id) REFERENCES draft_picks(pick_id),
+                        UNIQUE(period_id, player_id)
+                    )
+                ''')
+
                 await db.commit()
 
                 await interaction.followup.send(
@@ -334,8 +450,11 @@ class SeasonCommands(commands.Cog):
                     "• Suspensions table created\n"
                     "• Starting Lineups table created\n"
                     "• Ladder Positions table created\n"
-                    "• Settings table created\n\n"
-                    "You can now use all season, injury, suspension, and lineup submission commands.\n"
+                    "• Settings table created\n"
+                    "• **Players table**: Added contract_expiry column\n"
+                    "• **Drafts table**: Added rookie_contract_years column\n"
+                    "• **Free Agency tables**: Created all FA/contract tables\n\n"
+                    "You can now use all season, injury, suspension, lineup, and free agency commands.\n"
                     "Use `/setlineupschannel` to configure where lineups are posted.",
                     ephemeral=True
                 )
