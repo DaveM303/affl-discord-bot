@@ -901,6 +901,28 @@ class AdminCommands(commands.Cog):
                 submitted_lineups = await cursor.fetchall()
                 submitted_lineups_df = pd.DataFrame(submitted_lineups, columns=['Submission_ID', 'Team_Name', 'Season', 'Round', 'Player_IDs', 'Submitted_At'])
 
+                # Export Compensation Chart
+                cursor = await db.execute(
+                    """SELECT min_age as Min_Age, max_age as Max_Age, min_ovr as Min_OVR,
+                              max_ovr as Max_OVR, compensation_band as Band
+                       FROM compensation_chart
+                       ORDER BY compensation_band, min_age, min_ovr"""
+                )
+                compensation_chart = await cursor.fetchall()
+                compensation_chart_df = pd.DataFrame(compensation_chart, columns=['Min_Age', 'Max_Age', 'Min_OVR', 'Max_OVR', 'Band'])
+                compensation_chart_df['Max_Age'] = compensation_chart_df['Max_Age'].fillna('')
+                compensation_chart_df['Max_OVR'] = compensation_chart_df['Max_OVR'].fillna('')
+
+                # Export Contract Config
+                cursor = await db.execute(
+                    """SELECT min_age as Min_Age, max_age as Max_Age, contract_years as Contract_Years
+                       FROM contract_config
+                       ORDER BY min_age"""
+                )
+                contract_config = await cursor.fetchall()
+                contract_config_df = pd.DataFrame(contract_config, columns=['Min_Age', 'Max_Age', 'Contract_Years'])
+                contract_config_df['Max_Age'] = contract_config_df['Max_Age'].fillna('')
+
             # Create Excel file in memory
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -910,6 +932,8 @@ class AdminCommands(commands.Cog):
                 add_players_df.to_excel(writer, sheet_name='Add_Players', index=False)
                 seasons_df.to_excel(writer, sheet_name='Seasons', index=False)
                 settings_df.to_excel(writer, sheet_name='Settings', index=False)
+                compensation_chart_df.to_excel(writer, sheet_name='Compensation_Chart', index=False)
+                contract_config_df.to_excel(writer, sheet_name='Contract_Config', index=False)
 
                 # Relationship/State sheets (editable)
                 current_lineups_df.to_excel(writer, sheet_name='Current_Lineups', index=False)
@@ -1580,6 +1604,33 @@ class AdminCommands(commands.Cog):
                     if 'Worksheet Compensation_Chart' not in str(e):
                         errors.append(f"Compensation Chart sheet error: {str(e)}")
 
+                # Import Contract Config
+                contract_config_imported = 0
+                try:
+                    contract_config_df = pd.read_excel(excel_file, sheet_name='Contract_Config')
+
+                    # Clear existing contract config
+                    await db.execute("DELETE FROM contract_config")
+
+                    for _, row in contract_config_df.iterrows():
+                        try:
+                            min_age = int(row['Min_Age'])
+                            max_age = int(row['Max_Age']) if pd.notna(row['Max_Age']) and row['Max_Age'] else None
+                            contract_years = int(row['Contract_Years'])
+
+                            await db.execute(
+                                """INSERT INTO contract_config (min_age, max_age, contract_years)
+                                   VALUES (?, ?, ?)""",
+                                (min_age, max_age, contract_years)
+                            )
+                            contract_config_imported += 1
+                        except Exception as e:
+                            errors.append(f"Contract Config row: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Contract_Config' not in str(e):
+                        errors.append(f"Contract Config sheet error: {str(e)}")
+
             # Build response
             response = "✅ **Import Complete!**\n\n"
             response += f"**Teams:** {teams_added} added, {teams_updated} updated\n"
@@ -1606,6 +1657,8 @@ class AdminCommands(commands.Cog):
                 response += f"**Settings:** {settings_imported} imported\n"
             if compensation_chart_imported > 0:
                 response += f"**Compensation Chart:** {compensation_chart_imported} entries imported\n"
+            if contract_config_imported > 0:
+                response += f"**Contract Config:** {contract_config_imported} entries imported\n"
 
             if duplicate_warnings:
                 response += f"\n⚠️ **{len(duplicate_warnings)} Duplicate Name Warning(s):**\n"
