@@ -1611,13 +1611,10 @@ class TradeOfferView(discord.ui.View):
             current_row += 1
 
             # Pagination button for initiating team if needed
-            picks_count = len(self.initiating_draft_picks) if self.initiating_draft_picks else 0
-            page_0_player_count = 25 - picks_count
-            if len(self.initiating_roster) > page_0_player_count:
-                # Calculate total pages
-                remaining_players = len(self.initiating_roster) - page_0_player_count
-                additional_pages = (remaining_players - 1) // 25 + 1
-                total_pages = 1 + additional_pages  # page 0 + additional pages
+            total_items = len(self.initiating_draft_picks) + len(self.initiating_roster)
+            if total_items > 25:
+                # Calculate total pages (25 items per page)
+                total_pages = (total_items - 1) // 25 + 1
 
                 next_page_btn = discord.ui.Button(
                     label=f"Page {self.initiating_page + 1}/{total_pages}",
@@ -1635,13 +1632,10 @@ class TradeOfferView(discord.ui.View):
             current_row += 1
 
             # Pagination button for receiving team if needed
-            picks_count = len(self.receiving_draft_picks) if self.receiving_draft_picks else 0
-            page_0_player_count = 25 - picks_count
-            if len(self.receiving_roster) > page_0_player_count:
-                # Calculate total pages
-                remaining_players = len(self.receiving_roster) - page_0_player_count
-                additional_pages = (remaining_players - 1) // 25 + 1
-                total_pages = 1 + additional_pages  # page 0 + additional pages
+            total_items = len(self.receiving_draft_picks) + len(self.receiving_roster)
+            if total_items > 25:
+                # Calculate total pages (25 items per page)
+                total_pages = (total_items - 1) // 25 + 1
 
                 next_page_btn = discord.ui.Button(
                     label=f"Page {self.receiving_page + 1}/{total_pages}",
@@ -1749,29 +1743,17 @@ class TradeOfferView(discord.ui.View):
 
     async def next_initiating_page(self, interaction: discord.Interaction):
         """Go to next page of initiating team roster"""
-        # Calculate max pages accounting for picks on page 0
-        picks_count = len(self.initiating_draft_picks)
-        page_0_player_count = 25 - picks_count
-        remaining_players = len(self.initiating_roster) - page_0_player_count
-        if remaining_players > 0:
-            additional_pages = (remaining_players - 1) // 25 + 1
-            max_page = additional_pages  # page 0 + additional pages
-        else:
-            max_page = 0
+        # Calculate max pages (25 items per page)
+        total_items = len(self.initiating_draft_picks) + len(self.initiating_roster)
+        max_page = max(0, (total_items - 1) // 25)
         self.initiating_page = (self.initiating_page + 1) % (max_page + 1)
         await self.update_view(interaction)
 
     async def next_receiving_page(self, interaction: discord.Interaction):
         """Go to next page of receiving team roster"""
-        # Calculate max pages accounting for picks on page 0
-        picks_count = len(self.receiving_draft_picks)
-        page_0_player_count = 25 - picks_count
-        remaining_players = len(self.receiving_roster) - page_0_player_count
-        if remaining_players > 0:
-            additional_pages = (remaining_players - 1) // 25 + 1
-            max_page = additional_pages  # page 0 + additional pages
-        else:
-            max_page = 0
+        # Calculate max pages (25 items per page)
+        total_items = len(self.receiving_draft_picks) + len(self.receiving_roster)
+        max_page = max(0, (total_items - 1) // 25)
         self.receiving_page = (self.receiving_page + 1) % (max_page + 1)
         await self.update_view(interaction)
 
@@ -1925,53 +1907,55 @@ class OfferingPlayerSelect(discord.ui.Select):
 
         options = []
 
-        # Add draft picks only on page 0 (first page)
-        if parent_view.initiating_page == 0:
-            for pick_id, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id in parent_view.initiating_draft_picks:
-                # Format pick display and get emoji for SelectOption
-                if pick_number is not None:
-                    # Current draft with ladder set
-                    pick_label = f"Pick #{pick_number}"
-                    pick_emoji = None
-                    pick_description = None  # No description for picks
-                else:
-                    # Future draft - format as "Future 1st (S10)" using previous season number
-                    # Draft for Season N is named "Season N-1 National Draft", so use season_number - 1
-                    round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
-                    pick_label = f"Future {round_suffix} (S{season_number - 1})"
-                    pick_description = None  # No description for picks
-                    pick_emoji = None
-                    if emoji_id:
-                        try:
-                            pick_emoji = parent_view.bot.get_emoji(int(emoji_id))
-                        except (ValueError, AttributeError):
-                            pass
+        # Calculate pagination accounting for picks
+        total_picks = len(parent_view.initiating_draft_picks)
+        total_players = len(parent_view.initiating_roster)
+        items_per_page = 25
 
-                options.append(
-                    discord.SelectOption(
-                        label=pick_label,
-                        description=pick_description,
-                        value=f"pick_{pick_id}",
-                        emoji=pick_emoji,
-                        default=(pick_id in parent_view.initiating_picks)
-                    )
+        # Calculate how many picks and players to show on this page
+        page_start = parent_view.initiating_page * items_per_page
+        page_end = page_start + items_per_page
+
+        # Add draft picks that fall within this page
+        pick_start = max(0, page_start)
+        pick_end = min(total_picks, page_end)
+
+        for idx in range(pick_start, pick_end):
+            pick_id, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id = parent_view.initiating_draft_picks[idx]
+            # Format pick display and get emoji for SelectOption
+            if pick_number is not None:
+                # Current draft with ladder set
+                pick_label = f"Pick #{pick_number}"
+                pick_emoji = None
+                pick_description = None  # No description for picks
+            else:
+                # Future draft - format as "Future 1st (S10)" using previous season number
+                # Draft for Season N is named "Season N-1 National Draft", so use season_number - 1
+                round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
+                pick_label = f"Future {round_suffix} (S{season_number - 1})"
+                pick_description = None  # No description for picks
+                pick_emoji = None
+                if emoji_id:
+                    try:
+                        pick_emoji = parent_view.bot.get_emoji(int(emoji_id))
+                    except (ValueError, AttributeError):
+                        pass
+
+            options.append(
+                discord.SelectOption(
+                    label=pick_label,
+                    description=pick_description,
+                    value=f"pick_{pick_id}",
+                    emoji=pick_emoji,
+                    default=(pick_id in parent_view.initiating_picks)
                 )
+            )
 
-        # Calculate player pagination
-        # On page 0, account for picks taking up space
-        if parent_view.initiating_page == 0:
-            available_player_slots = 25 - len(options)
-            start_idx = 0
-        else:
-            # On subsequent pages, we can show full 25 players
-            # But need to account for players already shown on page 0
-            picks_count = len(parent_view.initiating_draft_picks)
-            page_0_player_count = 25 - picks_count
-            available_player_slots = 25
-            start_idx = page_0_player_count + ((parent_view.initiating_page - 1) * 25)
-
-        end_idx = start_idx + available_player_slots
-        page_players = parent_view.initiating_roster[start_idx:end_idx]
+        # Add players after picks
+        available_player_slots = items_per_page - len(options)
+        player_start = max(0, page_start - total_picks)
+        player_end = player_start + available_player_slots
+        page_players = parent_view.initiating_roster[player_start:player_end]
 
         # Add players
         for player_id, name, pos, ovr, age in page_players:
@@ -2001,28 +1985,30 @@ class OfferingPlayerSelect(discord.ui.Select):
             elif value.startswith("player_"):
                 current_players.append(int(value.replace("player_", "")))
 
-        # Get all player IDs visible on this page
-        if self.parent_view.initiating_page == 0:
-            picks_count = len(self.parent_view.initiating_draft_picks)
-            available_player_slots = 25 - picks_count
-            start_idx = 0
-        else:
-            picks_count = len(self.parent_view.initiating_draft_picks)
-            page_0_player_count = 25 - picks_count
-            available_player_slots = 25
-            start_idx = page_0_player_count + ((self.parent_view.initiating_page - 1) * 25)
+        # Calculate what's visible on this page
+        total_picks = len(self.parent_view.initiating_draft_picks)
+        items_per_page = 25
+        page_start = self.parent_view.initiating_page * items_per_page
+        page_end = page_start + items_per_page
 
-        end_idx = start_idx + available_player_slots
-        page_player_ids = [p[0] for p in self.parent_view.initiating_roster[start_idx:end_idx]]
+        # Get pick IDs visible on this page
+        pick_start = max(0, page_start)
+        pick_end = min(total_picks, page_end)
+        page_pick_ids = [self.parent_view.initiating_draft_picks[i][0] for i in range(pick_start, pick_end)]
+
+        # Get player IDs visible on this page
+        available_player_slots = items_per_page - len(page_pick_ids)
+        player_start = max(0, page_start - total_picks)
+        player_end = player_start + available_player_slots
+        page_player_ids = [p[0] for p in self.parent_view.initiating_roster[player_start:player_end]]
 
         # Remove old selections from this page, keep selections from other pages
+        self.parent_view.initiating_picks = [p for p in self.parent_view.initiating_picks if p not in page_pick_ids]
         self.parent_view.initiating_players = [p for p in self.parent_view.initiating_players if p not in page_player_ids]
-        # Add new selections from this page
-        self.parent_view.initiating_players.extend(current_players)
 
-        # For picks, only update if we're on page 0 (picks only show on page 0)
-        if self.parent_view.initiating_page == 0:
-            self.parent_view.initiating_picks = current_picks
+        # Add new selections from this page
+        self.parent_view.initiating_picks.extend(current_picks)
+        self.parent_view.initiating_players.extend(current_players)
 
         await self.parent_view.update_view(interaction)
 
@@ -2034,53 +2020,55 @@ class ReceivingPlayerSelect(discord.ui.Select):
 
         options = []
 
-        # Add draft picks only on page 0 (first page)
-        if parent_view.receiving_page == 0:
-            for pick_id, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id in parent_view.receiving_draft_picks:
-                # Format pick display and get emoji for SelectOption
-                if pick_number is not None:
-                    # Current draft with ladder set
-                    pick_label = f"Pick #{pick_number}"
-                    pick_emoji = None
-                    pick_description = None  # No description for picks
-                else:
-                    # Future draft - format as "Future 1st (S10)" using previous season number
-                    # Draft for Season N is named "Season N-1 National Draft", so use season_number - 1
-                    round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
-                    pick_label = f"Future {round_suffix} (S{season_number - 1})"
-                    pick_description = None  # No description for picks
-                    pick_emoji = None
-                    if emoji_id:
-                        try:
-                            pick_emoji = parent_view.bot.get_emoji(int(emoji_id))
-                        except (ValueError, AttributeError):
-                            pass
+        # Calculate pagination accounting for picks
+        total_picks = len(parent_view.receiving_draft_picks)
+        total_players = len(parent_view.receiving_roster)
+        items_per_page = 25
 
-                options.append(
-                    discord.SelectOption(
-                        label=pick_label,
-                        description=pick_description,
-                        value=f"pick_{pick_id}",
-                        emoji=pick_emoji,
-                        default=(pick_id in parent_view.receiving_picks)
-                    )
+        # Calculate how many picks and players to show on this page
+        page_start = parent_view.receiving_page * items_per_page
+        page_end = page_start + items_per_page
+
+        # Add draft picks that fall within this page
+        pick_start = max(0, page_start)
+        pick_end = min(total_picks, page_end)
+
+        for idx in range(pick_start, pick_end):
+            pick_id, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id = parent_view.receiving_draft_picks[idx]
+            # Format pick display and get emoji for SelectOption
+            if pick_number is not None:
+                # Current draft with ladder set
+                pick_label = f"Pick #{pick_number}"
+                pick_emoji = None
+                pick_description = None  # No description for picks
+            else:
+                # Future draft - format as "Future 1st (S10)" using previous season number
+                # Draft for Season N is named "Season N-1 National Draft", so use season_number - 1
+                round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
+                pick_label = f"Future {round_suffix} (S{season_number - 1})"
+                pick_description = None  # No description for picks
+                pick_emoji = None
+                if emoji_id:
+                    try:
+                        pick_emoji = parent_view.bot.get_emoji(int(emoji_id))
+                    except (ValueError, AttributeError):
+                        pass
+
+            options.append(
+                discord.SelectOption(
+                    label=pick_label,
+                    description=pick_description,
+                    value=f"pick_{pick_id}",
+                    emoji=pick_emoji,
+                    default=(pick_id in parent_view.receiving_picks)
                 )
+            )
 
-        # Calculate player pagination
-        # On page 0, account for picks taking up space
-        if parent_view.receiving_page == 0:
-            available_player_slots = 25 - len(options)
-            start_idx = 0
-        else:
-            # On subsequent pages, we can show full 25 players
-            # But need to account for players already shown on page 0
-            picks_count = len(parent_view.receiving_draft_picks)
-            page_0_player_count = 25 - picks_count
-            available_player_slots = 25
-            start_idx = page_0_player_count + ((parent_view.receiving_page - 1) * 25)
-
-        end_idx = start_idx + available_player_slots
-        page_players = parent_view.receiving_roster[start_idx:end_idx]
+        # Add players after picks
+        available_player_slots = items_per_page - len(options)
+        player_start = max(0, page_start - total_picks)
+        player_end = player_start + available_player_slots
+        page_players = parent_view.receiving_roster[player_start:player_end]
 
         # Add players
         for player_id, name, pos, ovr, age in page_players:
@@ -2110,28 +2098,30 @@ class ReceivingPlayerSelect(discord.ui.Select):
             elif value.startswith("player_"):
                 current_players.append(int(value.replace("player_", "")))
 
-        # Get all player IDs visible on this page
-        if self.parent_view.receiving_page == 0:
-            picks_count = len(self.parent_view.receiving_draft_picks)
-            available_player_slots = 25 - picks_count
-            start_idx = 0
-        else:
-            picks_count = len(self.parent_view.receiving_draft_picks)
-            page_0_player_count = 25 - picks_count
-            available_player_slots = 25
-            start_idx = page_0_player_count + ((self.parent_view.receiving_page - 1) * 25)
+        # Calculate what's visible on this page
+        total_picks = len(self.parent_view.receiving_draft_picks)
+        items_per_page = 25
+        page_start = self.parent_view.receiving_page * items_per_page
+        page_end = page_start + items_per_page
 
-        end_idx = start_idx + available_player_slots
-        page_player_ids = [p[0] for p in self.parent_view.receiving_roster[start_idx:end_idx]]
+        # Get pick IDs visible on this page
+        pick_start = max(0, page_start)
+        pick_end = min(total_picks, page_end)
+        page_pick_ids = [self.parent_view.receiving_draft_picks[i][0] for i in range(pick_start, pick_end)]
+
+        # Get player IDs visible on this page
+        available_player_slots = items_per_page - len(page_pick_ids)
+        player_start = max(0, page_start - total_picks)
+        player_end = player_start + available_player_slots
+        page_player_ids = [p[0] for p in self.parent_view.receiving_roster[player_start:player_end]]
 
         # Remove old selections from this page, keep selections from other pages
+        self.parent_view.receiving_picks = [p for p in self.parent_view.receiving_picks if p not in page_pick_ids]
         self.parent_view.receiving_players = [p for p in self.parent_view.receiving_players if p not in page_player_ids]
-        # Add new selections from this page
-        self.parent_view.receiving_players.extend(current_players)
 
-        # For picks, only update if we're on page 0 (picks only show on page 0)
-        if self.parent_view.receiving_page == 0:
-            self.parent_view.receiving_picks = current_picks
+        # Add new selections from this page
+        self.parent_view.receiving_picks.extend(current_picks)
+        self.parent_view.receiving_players.extend(current_players)
 
         await self.parent_view.update_view(interaction)
 
