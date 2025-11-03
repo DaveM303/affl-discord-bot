@@ -159,12 +159,16 @@ class FreeAgencyCommands(commands.Cog):
                         }
                     teams_dict[team_name]['players'].append((name, pos, age, ovr))
 
-                # Build embed
+                # Build embed with pagination if needed
                 embed = discord.Embed(
                     title=f"Free Agents - Season {current_season}",
-                    description=f"Players whose contracts expire this season",
+                    description=f"Players with contracts expiring in Season {current_season - 1}",
                     color=discord.Color.blue()
                 )
+
+                total_chars = 0
+                teams_added = 0
+                max_chars = 5500  # Leave buffer for footer and title
 
                 for team_name in sorted(teams_dict.keys()):
                     team_data = teams_dict[team_name]
@@ -186,11 +190,30 @@ class FreeAgencyCommands(commands.Cog):
                         player_lines.append(f"• **{name}** ({pos}, {age}, {ovr})")
 
                     field_value = "\n".join(player_lines)
+                    field_name = f"{emoji_str}{team_name} ({len(players)} player{'s' if len(players) != 1 else ''})"
+
+                    # Check if adding this field would exceed limit
+                    field_chars = len(field_name) + len(field_value)
+                    if total_chars + field_chars > max_chars and teams_added > 0:
+                        # Send current embed and start new one
+                        embed.set_footer(text=f"Showing teams {teams_added - len(embed.fields) + 1}-{teams_added} • Total: {len(free_agents)} free agents")
+                        await interaction.followup.send(embed=embed)
+
+                        # Create new embed
+                        embed = discord.Embed(
+                            title=f"Free Agents - Season {current_season} (continued)",
+                            description=f"Players with contracts expiring in Season {current_season - 1}",
+                            color=discord.Color.blue()
+                        )
+                        total_chars = 0
+
                     embed.add_field(
-                        name=f"{emoji_str}{team_name} ({len(players)} player{'s' if len(players) != 1 else ''})",
+                        name=field_name,
                         value=field_value,
                         inline=False
                     )
+                    total_chars += field_chars
+                    teams_added += 1
 
                 embed.set_footer(text=f"Total: {len(free_agents)} free agent{'s' if len(free_agents) != 1 else ''}")
                 await interaction.followup.send(embed=embed)
