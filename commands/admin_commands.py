@@ -737,17 +737,19 @@ class AdminCommands(commands.Cog):
                 # Export Players (existing players only - edit but don't add new)
                 cursor = await db.execute(
                     """SELECT p.player_id as Player_ID, p.name as Name, t.team_name as Team,
-                              p.age as Age, p.position as Pos, p.overall_rating as OVR
+                              p.age as Age, p.position as Pos, p.overall_rating as OVR,
+                              p.contract_expiry as Contract_Expiry
                        FROM players p
                        LEFT JOIN teams t ON p.team_id = t.team_id
                        ORDER BY p.name"""
                 )
                 players = await cursor.fetchall()
-                players_df = pd.DataFrame(players, columns=['Player_ID', 'Name', 'Team', 'Age', 'Pos', 'OVR'])
+                players_df = pd.DataFrame(players, columns=['Player_ID', 'Name', 'Team', 'Age', 'Pos', 'OVR', 'Contract_Expiry'])
                 players_df['Team'] = players_df['Team'].fillna('')
+                players_df['Contract_Expiry'] = players_df['Contract_Expiry'].fillna('')
 
                 # Create Add_Players sheet (for bulk adding new players)
-                add_players_df = pd.DataFrame(columns=['Name', 'Team', 'Age', 'Pos', 'OVR'])
+                add_players_df = pd.DataFrame(columns=['Name', 'Team', 'Age', 'Pos', 'OVR', 'Contract_Expiry'])
                 add_players_df = add_players_df.fillna('')
                 
                 # Export Current Lineups (editable)
@@ -1076,6 +1078,11 @@ class AdminCommands(commands.Cog):
                             rating = int(row['OVR'])
                             age = int(row['Age'])
 
+                            # Get contract_expiry if present
+                            contract_expiry = None
+                            if 'Contract_Expiry' in players_df.columns and pd.notna(row['Contract_Expiry']) and row['Contract_Expiry']:
+                                contract_expiry = int(row['Contract_Expiry'])
+
                             # Validate position
                             is_valid, normalized_pos = validate_position(position)
                             if not is_valid:
@@ -1102,14 +1109,14 @@ class AdminCommands(commands.Cog):
                             if existing:
                                 await db.execute(
                                     """UPDATE players
-                                       SET name = ?, position = ?, overall_rating = ?, age = ?, team_id = ?
+                                       SET name = ?, position = ?, overall_rating = ?, age = ?, team_id = ?, contract_expiry = ?
                                        WHERE player_id = ?""",
-                                    (name, normalized_pos, rating, age, team_id, existing[0])
+                                    (name, normalized_pos, rating, age, team_id, contract_expiry, existing[0])
                                 )
                                 players_updated += 1
                             else:
                                 errors.append(f"Player '{name}' not found - use Add_Players sheet to add new players")
-                                
+
                         except Exception as e:
                             errors.append(f"Player '{name}': {str(e)}")
                     
@@ -1137,6 +1144,11 @@ class AdminCommands(commands.Cog):
                             rating = int(row['OVR'])
                             age = int(row['Age'])
 
+                            # Get contract_expiry if present
+                            contract_expiry = None
+                            if 'Contract_Expiry' in add_players_df.columns and pd.notna(row['Contract_Expiry']) and row['Contract_Expiry']:
+                                contract_expiry = int(row['Contract_Expiry'])
+
                             # Validate position
                             is_valid, normalized_pos = validate_position(position)
                             if not is_valid:
@@ -1157,9 +1169,9 @@ class AdminCommands(commands.Cog):
                                 duplicate_warnings.append(f"Add_Players: '{name}' already exists (ID: {existing[0]}) - skipped")
                             else:
                                 await db.execute(
-                                    """INSERT INTO players (name, position, overall_rating, age, team_id)
-                                       VALUES (?, ?, ?, ?, ?)""",
-                                    (name, normalized_pos, rating, age, team_id)
+                                    """INSERT INTO players (name, position, overall_rating, age, team_id, contract_expiry)
+                                       VALUES (?, ?, ?, ?, ?, ?)""",
+                                    (name, normalized_pos, rating, age, team_id, contract_expiry)
                                 )
                                 players_added += 1
                         except Exception as e:
