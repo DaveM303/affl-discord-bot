@@ -22,7 +22,9 @@ async def init_db():
                 overall_rating INTEGER,
                 age INTEGER,
                 team_id INTEGER,
-                FOREIGN KEY (team_id) REFERENCES teams(team_id)
+                contract_expiry INTEGER,
+                FOREIGN KEY (team_id) REFERENCES teams(team_id),
+                FOREIGN KEY (contract_expiry) REFERENCES seasons(season_number)
             )
         ''')
         
@@ -83,6 +85,7 @@ async def init_db():
                 season_number INTEGER NOT NULL,
                 status TEXT DEFAULT 'future',
                 rounds INTEGER DEFAULT 4,
+                rookie_contract_years INTEGER DEFAULT 3,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 ladder_set_at TIMESTAMP NULL,
                 FOREIGN KEY (season_number) REFERENCES seasons(season_number)
@@ -216,6 +219,94 @@ async def init_db():
             )
         ''')
 
+        # Create Contract Config table (age-based contract lengths for free agents)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS contract_config (
+                config_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                min_age INTEGER NOT NULL,
+                max_age INTEGER,
+                contract_years INTEGER NOT NULL,
+                UNIQUE(min_age, max_age)
+            )
+        ''')
+
+        # Insert default contract config
+        await db.execute('''
+            INSERT OR IGNORE INTO contract_config (min_age, max_age, contract_years) VALUES
+            (0, 20, 3),
+            (21, 23, 5),
+            (24, 26, 4),
+            (27, 30, 3),
+            (31, NULL, 2)
+        ''')
+
+        # Create Compensation Chart table (free agency compensation bands)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS compensation_chart (
+                chart_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                min_age INTEGER NOT NULL,
+                max_age INTEGER,
+                min_ovr INTEGER NOT NULL,
+                max_ovr INTEGER,
+                compensation_band INTEGER NOT NULL,
+                UNIQUE(min_age, max_age, min_ovr, max_ovr)
+            )
+        ''')
+
+        # Create Free Agency Periods table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS free_agency_periods (
+                period_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                season_number INTEGER NOT NULL,
+                status TEXT DEFAULT 'bidding',
+                auction_points INTEGER DEFAULT 300,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                bidding_ended_at TIMESTAMP,
+                matching_ended_at TIMESTAMP,
+                FOREIGN KEY (season_number) REFERENCES seasons(season_number),
+                UNIQUE(season_number)
+            )
+        ''')
+
+        # Create Free Agency Bids table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS free_agency_bids (
+                bid_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                period_id INTEGER NOT NULL,
+                team_id INTEGER NOT NULL,
+                player_id INTEGER NOT NULL,
+                bid_amount INTEGER NOT NULL,
+                status TEXT DEFAULT 'active',
+                placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (period_id) REFERENCES free_agency_periods(period_id),
+                FOREIGN KEY (team_id) REFERENCES teams(team_id),
+                FOREIGN KEY (player_id) REFERENCES players(player_id),
+                UNIQUE(period_id, team_id, player_id)
+            )
+        ''')
+
+        # Create Free Agency Results table (for tracking winning bids and matches)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS free_agency_results (
+                result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                period_id INTEGER NOT NULL,
+                player_id INTEGER NOT NULL,
+                original_team_id INTEGER NOT NULL,
+                winning_team_id INTEGER,
+                winning_bid INTEGER,
+                matched BOOLEAN DEFAULT 0,
+                compensation_band INTEGER,
+                compensation_pick_id INTEGER,
+                FOREIGN KEY (period_id) REFERENCES free_agency_periods(period_id),
+                FOREIGN KEY (player_id) REFERENCES players(player_id),
+                FOREIGN KEY (original_team_id) REFERENCES teams(team_id),
+                FOREIGN KEY (winning_team_id) REFERENCES teams(team_id),
+                FOREIGN KEY (compensation_pick_id) REFERENCES draft_picks(pick_id),
+                UNIQUE(period_id, player_id)
+            )
+        ''')
+
         await db.commit()
         print("Database initialized successfully!")
 
@@ -233,6 +324,7 @@ async def on_ready():
     await bot.load_extension('commands.suspension_commands')
     await bot.load_extension('commands.trade_commands')
     await bot.load_extension('commands.draft_commands')
+    await bot.load_extension('commands.free_agency_commands')
     
     try:
         if GUILD_ID:
