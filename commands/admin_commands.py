@@ -1322,6 +1322,10 @@ class AdminCommands(commands.Cog):
                 injuries_imported = 0
                 try:
                     injuries_df = pd.read_excel(excel_file, sheet_name='Injuries')
+
+                    # Clear existing injuries before importing to avoid duplicates
+                    await db.execute("DELETE FROM injuries")
+
                     for _, row in injuries_df.iterrows():
                         try:
                             # Find player by name
@@ -1332,7 +1336,7 @@ class AdminCommands(commands.Cog):
                                 return_round = int(row['Return_Round'])
                                 recovery_rounds = return_round - injury_round
                                 await db.execute(
-                                    """INSERT OR REPLACE INTO injuries
+                                    """INSERT INTO injuries
                                        (player_id, injury_type, injury_round, recovery_rounds, return_round, status)
                                        VALUES (?, ?, ?, ?, ?, ?)""",
                                     (player[0], str(row['Injury_Type']), injury_round,
@@ -1350,6 +1354,10 @@ class AdminCommands(commands.Cog):
                 suspensions_imported = 0
                 try:
                     suspensions_df = pd.read_excel(excel_file, sheet_name='Suspensions')
+
+                    # Clear existing suspensions before importing to avoid duplicates
+                    await db.execute("DELETE FROM suspensions")
+
                     for _, row in suspensions_df.iterrows():
                         try:
                             # Find player by name
@@ -1360,7 +1368,7 @@ class AdminCommands(commands.Cog):
                                 return_round = int(row['Return_Round'])
                                 games_missed = return_round - suspension_round
                                 await db.execute(
-                                    """INSERT OR REPLACE INTO suspensions
+                                    """INSERT INTO suspensions
                                        (player_id, suspension_round, games_missed, return_round, suspension_reason, status)
                                        VALUES (?, ?, ?, ?, ?, ?)""",
                                     (player[0], suspension_round, games_missed,
