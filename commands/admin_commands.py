@@ -1648,11 +1648,11 @@ class AdminCommands(commands.Cog):
                     cell_map = {}
                     for _, row in compensation_chart_df.iterrows():
                         age_str = str(row[age_col]).strip()
-                        if not age_str or age_str == '':
+                        if not age_str or age_str == '' or age_str == 'nan':
                             continue
 
                         try:
-                            age = int(age_str)
+                            age = int(float(age_str))  # Convert through float first to handle "19.0" format
                         except:
                             continue
 
@@ -1663,11 +1663,21 @@ class AdminCommands(commands.Cog):
                                 continue
 
                             try:
-                                band = int(band_value)
-                                ovr = int(ovr_col)
+                                band = int(float(band_value))  # Convert through float first
+                                # Column name might be int or string
+                                try:
+                                    ovr = int(ovr_col)
+                                except:
+                                    ovr = int(float(str(ovr_col)))  # Handle string column names
                                 cell_map[(age, ovr)] = band
-                            except:
+                            except Exception as e:
+                                # Log parsing errors for debugging
+                                errors.append(f"Compensation Chart cell parsing error at age {age_str}, OVR {ovr_col}: {str(e)}")
                                 continue
+
+                    # Check if we parsed any data
+                    if not cell_map:
+                        errors.append("Compensation Chart: No valid data found in sheet. Check that cells contain numeric values for bands.")
 
                     # Group consecutive cells with same band into ranges
                     # Process by band number
