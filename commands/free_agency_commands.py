@@ -825,10 +825,10 @@ class FreeAgencyCommands(commands.Cog):
                 # Build map of (age, ovr) -> band by expanding ranges
                 comp_map = {}  # (age, ovr) -> band
                 for min_age, max_age, min_ovr, max_ovr, band in compensation_data:
-                    # Expand age range
-                    age_end = max_age if max_age else 99
-                    # Expand OVR range
-                    ovr_end = max_ovr if max_ovr else 99
+                    # Expand age range (if max_age is None, it's a single age)
+                    age_end = max_age if max_age is not None else min_age
+                    # Expand OVR range (if max_ovr is None, it's a single OVR)
+                    ovr_end = max_ovr if max_ovr is not None else min_ovr
 
                     for age in range(min_age, age_end + 1):
                         for ovr in range(min_ovr, ovr_end + 1):
@@ -853,18 +853,22 @@ class FreeAgencyCommands(commands.Cog):
                     # Build table for this OVR range
                     table_lines = []
 
-                    # Header row
-                    header = "Age  " + "  ".join([f"{ovr:2}" for ovr in range(ovr_start, ovr_end + 1)])
+                    # Header row - use consistent 3-char width for each column
+                    header = "Age " + " ".join([f"{ovr:3}" for ovr in range(ovr_start, ovr_end + 1)])
                     table_lines.append(header)
                     table_lines.append("━" * len(header))
 
                     # Data rows (ages 19-33)
                     for age in range(19, 34):
-                        row_values = [f"{age:2}"]
+                        row_values = [f"{age:3}"]
                         for ovr in range(ovr_start, ovr_end + 1):
                             band = comp_map.get((age, ovr), '-')
-                            row_values.append(f"{band if band else '-':>3}")
-                        table_lines.append("  ".join(row_values))
+                            # Format band value consistently
+                            if band:
+                                row_values.append(f"{band:3}")
+                            else:
+                                row_values.append("  -")
+                        table_lines.append(" ".join(row_values))
 
                     # Add as field (use code block for monospace font)
                     embed.add_field(
