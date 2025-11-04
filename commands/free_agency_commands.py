@@ -786,19 +786,85 @@ class FreeAgencyCommands(commands.Cog):
                        WHERE period_id = ?""",
                     (period_id,)
                 )
+
+                # Insert compensation picks into the current draft automatically
+                picks_inserted = 0
+                draft_name = None
+                if compensation_picks > 0:
+                    # Find the current draft
+                    cursor = await db.execute(
+                        "SELECT draft_id, draft_name, season_number FROM drafts WHERE status = 'current'"
+                    )
+                    draft = await cursor.fetchone()
+
+                    if draft:
+                        draft_id, draft_name, draft_season = draft
+
+                        # Get all compensation results for this period
+                        cursor = await db.execute(
+                            """SELECT result_id, original_team_id, compensation_band, player_id
+                               FROM free_agency_results
+                               WHERE period_id = ? AND compensation_band IS NOT NULL
+                               ORDER BY compensation_band, original_team_id""",
+                            (period_id,)
+                        )
+                        comp_results = await cursor.fetchall()
+
+                        # Insert each compensation pick
+                        for result_id, team_id, comp_band, player_id in comp_results:
+                            # Get player name for pick origin description
+                            cursor = await db.execute("SELECT name FROM players WHERE player_id = ?", (player_id,))
+                            player_name = (await cursor.fetchone())[0]
+
+                            # Insert the compensation pick
+                            cursor = await db.execute(
+                                """INSERT INTO draft_picks (draft_id, draft_name, season_number, pick_origin, original_team_id, current_team_id)
+                                   VALUES (?, ?, ?, ?, ?, ?)""",
+                                (draft_id, draft_name, draft_season, f"Compensation Band {comp_band} (lost {player_name})", team_id, team_id)
+                            )
+                            pick_id = cursor.lastrowid
+
+                            # Update free_agency_results with the pick_id reference
+                            await db.execute(
+                                "UPDATE free_agency_results SET compensation_pick_id = ? WHERE result_id = ?",
+                                (pick_id, result_id)
+                            )
+                            picks_inserted += 1
+
                 await db.commit()
 
-                # Build summary message
-                await interaction.followup.send(
+                # Build summary message with compensation pick details if any were awarded
+                message = (
                     f"✅ **Free Agency Period Completed!**\n\n"
                     f"**Summary:**\n"
                     f"• {players_transferred} player{'s' if players_transferred != 1 else ''} transferred to new teams\n"
                     f"• {players_matched} player{'s' if players_matched != 1 else ''} matched by original teams\n"
                     f"• {players_resigned} player{'s' if players_resigned != 1 else ''} auto re-signed (no bids)\n"
-                    f"• {compensation_picks} compensation pick{'s' if compensation_picks != 1 else ''} awarded\n\n"
-                    f"**Note:** Compensation picks have been calculated but not yet inserted into drafts. "
-                    f"Use the compensation pick insertion command when the draft is created."
+                    f"• {compensation_picks} compensation pick{'s' if compensation_picks != 1 else ''} awarded"
                 )
+
+                # Add compensation pick details if any were awarded
+                if compensation_picks > 0:
+                    cursor = await db.execute(
+                        """SELECT t.team_name, r.compensation_band, p.name
+                           FROM free_agency_results r
+                           JOIN teams t ON r.original_team_id = t.team_id
+                           JOIN players p ON r.player_id = p.player_id
+                           WHERE r.period_id = ? AND r.compensation_band IS NOT NULL
+                           ORDER BY r.compensation_band, t.team_name""",
+                        (period_id,)
+                    )
+                    comp_picks = await cursor.fetchall()
+
+                    if draft_name:
+                        message += f"\n\n**Compensation Picks (inserted into {draft_name}):**"
+                    else:
+                        message += "\n\n**Compensation Picks (no current draft found - picks not inserted):**"
+
+                    for team_name, band, player_name in comp_picks:
+                        message += f"\n• **{team_name}**: Band {band} pick (lost {player_name})"
+
+                await interaction.followup.send(message)
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
