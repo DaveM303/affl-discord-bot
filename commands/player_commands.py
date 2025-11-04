@@ -316,6 +316,7 @@ class PlayerCommands(commands.Cog):
         position2="Second position filter (optional)",
         position3="Third position filter (optional)",
         team_name="Team name (or 'delisted')",
+        contract_expiry="Contract expiry season (optional)",
         sort_by="Sort by (default: OVR desc)",
         limit="Max results to show (default 100)"
     )
@@ -343,6 +344,7 @@ class PlayerCommands(commands.Cog):
         position2: str = None,
         position3: str = None,
         team_name: str = None,
+        contract_expiry: int = None,
         sort_by: str = "ovr_desc",
         limit: int = 100
     ):
@@ -397,6 +399,10 @@ class PlayerCommands(commands.Cog):
                 else:
                     query += " AND t.team_name = ?"
                     params.append(team_name)
+
+            if contract_expiry is not None:
+                query += " AND p.contract_expiry = ?"
+                params.append(contract_expiry)
 
             # Build ORDER BY clause
             if sort_by == "ovr_desc":

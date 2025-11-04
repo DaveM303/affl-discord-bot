@@ -803,6 +803,83 @@ class FreeAgencyCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
 
+    @app_commands.command(name="compensationtable", description="View the compensation chart for free agency")
+    async def compensation_table(self, interaction: discord.Interaction):
+        """Display the compensation chart as a visual table"""
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get compensation chart data
+                cursor = await db.execute(
+                    """SELECT min_age, max_age, min_ovr, max_ovr, compensation_band
+                       FROM compensation_chart
+                       ORDER BY compensation_band, min_age, min_ovr"""
+                )
+                compensation_data = await cursor.fetchall()
+
+                if not compensation_data:
+                    await interaction.followup.send("❌ No compensation chart data found! Use `/migratedb` to initialize.")
+                    return
+
+                # Build map of (age, ovr) -> band by expanding ranges
+                comp_map = {}  # (age, ovr) -> band
+                for min_age, max_age, min_ovr, max_ovr, band in compensation_data:
+                    # Expand age range
+                    age_end = max_age if max_age else 99
+                    # Expand OVR range
+                    ovr_end = max_ovr if max_ovr else 99
+
+                    for age in range(min_age, age_end + 1):
+                        for ovr in range(min_ovr, ovr_end + 1):
+                            comp_map[(age, ovr)] = band
+
+                # Create embed with table visualization
+                embed = discord.Embed(
+                    title="Compensation Chart",
+                    description="Compensation bands for free agents based on age and OVR rating",
+                    color=discord.Color.green()
+                )
+
+                # Create multiple fields for different OVR ranges to avoid size limits
+                # Split into OVR ranges: 70-79, 80-89, 90-99
+                ovr_ranges = [
+                    (70, 79, "OVR 70-79"),
+                    (80, 89, "OVR 80-89"),
+                    (90, 99, "OVR 90-99")
+                ]
+
+                for ovr_start, ovr_end, range_label in ovr_ranges:
+                    # Build table for this OVR range
+                    table_lines = []
+
+                    # Header row
+                    header = "Age  " + "  ".join([f"{ovr:2}" for ovr in range(ovr_start, ovr_end + 1)])
+                    table_lines.append(header)
+                    table_lines.append("━" * len(header))
+
+                    # Data rows (ages 19-33)
+                    for age in range(19, 34):
+                        row_values = [f"{age:2}"]
+                        for ovr in range(ovr_start, ovr_end + 1):
+                            band = comp_map.get((age, ovr), '-')
+                            row_values.append(f"{band if band else '-':>3}")
+                        table_lines.append("  ".join(row_values))
+
+                    # Add as field (use code block for monospace font)
+                    embed.add_field(
+                        name=range_label,
+                        value=f"```\n{chr(10).join(table_lines)}\n```",
+                        inline=False
+                    )
+
+                embed.set_footer(text="Band numbers indicate draft pick compensation tier (higher = better compensation)")
+
+                await interaction.followup.send(embed=embed)
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {e}")
+
 
 class FreeAgentsView(discord.ui.View):
     """Paginated view for free agents list"""

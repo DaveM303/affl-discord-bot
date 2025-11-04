@@ -534,7 +534,8 @@ class AdminCommands(commands.Cog):
         ovr="New overall rating (optional)",
         age="New age (optional)",
         position="New position (optional)",
-        team="New team (optional, use 'delisted' to release)"
+        team="New team (optional, use 'delisted' to release)",
+        contract_expiry="Contract expiry season (optional)"
     )
     @app_commands.autocomplete(position=position_autocomplete, name=player_name_autocomplete, team=team_autocomplete)
     async def update_player(
@@ -545,7 +546,8 @@ class AdminCommands(commands.Cog):
         ovr: int = None,
         age: int = None,
         position: str = None,
-        team: str = None
+        team: str = None,
+        contract_expiry: int = None
     ):
         async with aiosqlite.connect(DB_PATH) as db:
             # Get player by ID (name is actually player_id from autocomplete)
@@ -559,7 +561,7 @@ class AdminCommands(commands.Cog):
                 return
 
             cursor = await db.execute(
-                """SELECT player_id, name, overall_rating, age, position, team_id
+                """SELECT player_id, name, overall_rating, age, position, team_id, contract_expiry
                    FROM players WHERE player_id = ?""",
                 (player_id,)
             )
@@ -572,7 +574,7 @@ class AdminCommands(commands.Cog):
                 )
                 return
 
-            player_id, player_name, old_rating, old_age, old_position, old_team_id = player
+            player_id, player_name, old_rating, old_age, old_position, old_team_id, old_contract_expiry = player
 
             # Get old team name if exists
             old_team_name = None
@@ -693,6 +695,12 @@ class AdminCommands(commands.Cog):
                 updates.append("team_id = ?")
                 values.append(new_team_id)
                 changes.append(f"Team: {old_team_display} → {new_team_display}")
+
+            if contract_expiry is not None:
+                updates.append("contract_expiry = ?")
+                values.append(contract_expiry)
+                old_expiry_display = f"Season {old_contract_expiry}" if old_contract_expiry else "None"
+                changes.append(f"Contract Expiry: {old_expiry_display} → Season {contract_expiry}")
 
             if not updates:
                 await interaction.response.send_message(
@@ -949,6 +957,20 @@ class AdminCommands(commands.Cog):
                 contract_config_df = pd.DataFrame(contract_config, columns=['Min_Age', 'Max_Age', 'Contract_Years'])
                 contract_config_df['Max_Age'] = contract_config_df['Max_Age'].fillna('')
 
+                # Export Free Agency Periods
+                cursor = await db.execute(
+                    """SELECT period_id as Period_ID, season_number as Season_Number,
+                              status as Status, auction_points as Auction_Points,
+                              bidding_started_at as Bidding_Started_At,
+                              matching_started_at as Matching_Started_At,
+                              matching_ended_at as Matching_Ended_At
+                       FROM free_agency_periods
+                       ORDER BY season_number DESC"""
+                )
+                free_agency_periods = await cursor.fetchall()
+                free_agency_periods_df = pd.DataFrame(free_agency_periods, columns=['Period_ID', 'Season_Number', 'Status', 'Auction_Points', 'Bidding_Started_At', 'Matching_Started_At', 'Matching_Ended_At'])
+                free_agency_periods_df = free_agency_periods_df.fillna('')
+
             # Create Excel file in memory
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -967,6 +989,7 @@ class AdminCommands(commands.Cog):
                 injuries_df.to_excel(writer, sheet_name='Injuries', index=False)
                 suspensions_df.to_excel(writer, sheet_name='Suspensions', index=False)
                 draft_picks_df.to_excel(writer, sheet_name='Draft_Picks', index=False)
+                free_agency_periods_df.to_excel(writer, sheet_name='Free_Agency_Periods', index=False)
 
                 # History/Read-only sheets
                 trades_df.to_excel(writer, sheet_name='Trades', index=False)
@@ -1710,6 +1733,44 @@ class AdminCommands(commands.Cog):
                     if 'Worksheet Contract_Config' not in str(e):
                         errors.append(f"Contract Config sheet error: {str(e)}")
 
+                # Import Free Agency Periods
+                free_agency_periods_imported = 0
+                try:
+                    free_agency_periods_df = pd.read_excel(excel_file, sheet_name='Free_Agency_Periods')
+
+                    # Clear existing free agency periods
+                    await db.execute("DELETE FROM free_agency_periods")
+
+                    for _, row in free_agency_periods_df.iterrows():
+                        try:
+                            period_id = int(row['Period_ID']) if pd.notna(row['Period_ID']) and row['Period_ID'] else None
+                            season_number = int(row['Season_Number'])
+                            status = str(row['Status'])
+                            auction_points = int(row['Auction_Points']) if pd.notna(row['Auction_Points']) else 300
+                            bidding_started_at = str(row['Bidding_Started_At']) if pd.notna(row['Bidding_Started_At']) and row['Bidding_Started_At'] else None
+                            matching_started_at = str(row['Matching_Started_At']) if pd.notna(row['Matching_Started_At']) and row['Matching_Started_At'] else None
+                            matching_ended_at = str(row['Matching_Ended_At']) if pd.notna(row['Matching_Ended_At']) and row['Matching_Ended_At'] else None
+
+                            if period_id:
+                                await db.execute(
+                                    """INSERT INTO free_agency_periods (period_id, season_number, status, auction_points, bidding_started_at, matching_started_at, matching_ended_at)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                    (period_id, season_number, status, auction_points, bidding_started_at, matching_started_at, matching_ended_at)
+                                )
+                            else:
+                                await db.execute(
+                                    """INSERT INTO free_agency_periods (season_number, status, auction_points, bidding_started_at, matching_started_at, matching_ended_at)
+                                       VALUES (?, ?, ?, ?, ?, ?)""",
+                                    (season_number, status, auction_points, bidding_started_at, matching_started_at, matching_ended_at)
+                                )
+                            free_agency_periods_imported += 1
+                        except Exception as e:
+                            errors.append(f"Free Agency Periods row: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Free_Agency_Periods' not in str(e):
+                        errors.append(f"Free Agency Periods sheet error: {str(e)}")
+
             # Build response
             response = "✅ **Import Complete!**\n\n"
             response += f"**Teams:** {teams_added} added, {teams_updated} updated\n"
@@ -1738,6 +1799,8 @@ class AdminCommands(commands.Cog):
                 response += f"**Compensation Chart:** {compensation_chart_imported} entries imported\n"
             if contract_config_imported > 0:
                 response += f"**Contract Config:** {contract_config_imported} entries imported\n"
+            if free_agency_periods_imported > 0:
+                response += f"**Free Agency Periods:** {free_agency_periods_imported} imported\n"
 
             if duplicate_warnings:
                 response += f"\n⚠️ **{len(duplicate_warnings)} Duplicate Name Warning(s):**\n"
