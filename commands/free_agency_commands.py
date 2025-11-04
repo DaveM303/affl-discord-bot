@@ -848,14 +848,14 @@ class FreeAgencyCommands(commands.Cog):
                 for ovr_start, ovr_end, range_label in ovr_ranges:
                     table_lines = []
 
-                    # Compact header - 2 chars per column
-                    header = "A│" + " ".join([f"{ovr:2}" for ovr in range(ovr_start, ovr_end + 1)])
+                    # Compact header - 2 chars per column, add space to align with data rows
+                    header = " A│" + " ".join([f"{ovr:2}" for ovr in range(ovr_start, ovr_end + 1)])
                     table_lines.append(header)
                     table_lines.append("─" * len(header))
 
                     # Data rows - ages 19-33
                     for age in range(19, 34):
-                        row_values = [f"{age:2}"[1:] if age < 20 else f"{age:2}"]  # Single digit for 19
+                        row_values = [f"{age:2}"]  # Keep both digits
                         for ovr in range(ovr_start, ovr_end + 1):
                             band = comp_map.get((age, ovr), None)
                             if band is not None:
