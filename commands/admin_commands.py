@@ -901,17 +901,43 @@ class AdminCommands(commands.Cog):
                 submitted_lineups = await cursor.fetchall()
                 submitted_lineups_df = pd.DataFrame(submitted_lineups, columns=['Submission_ID', 'Team_Name', 'Season', 'Round', 'Player_IDs', 'Submitted_At'])
 
-                # Export Compensation Chart
+                # Export Compensation Chart as 2D table (individual ages 19-33, individual OVRs 70-99)
                 cursor = await db.execute(
-                    """SELECT min_age as Min_Age, max_age as Max_Age, min_ovr as Min_OVR,
-                              max_ovr as Max_OVR, compensation_band as Band
+                    """SELECT min_age, max_age, min_ovr, max_ovr, compensation_band
                        FROM compensation_chart
-                       ORDER BY compensation_band, min_age, min_ovr"""
+                       ORDER BY min_age, min_ovr"""
                 )
-                compensation_chart = await cursor.fetchall()
-                compensation_chart_df = pd.DataFrame(compensation_chart, columns=['Min_Age', 'Max_Age', 'Min_OVR', 'Max_OVR', 'Band'])
-                compensation_chart_df['Max_Age'] = compensation_chart_df['Max_Age'].fillna('')
-                compensation_chart_df['Max_OVR'] = compensation_chart_df['Max_OVR'].fillna('')
+                compensation_data = await cursor.fetchall()
+
+                # Build map of (age, ovr) -> band by expanding ranges
+                comp_map = {}  # (age, ovr) -> band
+                for min_age, max_age, min_ovr, max_ovr, band in compensation_data:
+                    # Expand age range
+                    age_end = max_age if max_age else 99
+                    # Expand OVR range
+                    ovr_end = max_ovr if max_ovr else 99
+
+                    for age in range(min_age, age_end + 1):
+                        for ovr in range(min_ovr, ovr_end + 1):
+                            comp_map[(age, ovr)] = band
+
+                # Create 2D grid: rows = ages 19-33, columns = OVRs 70-99
+                ages = list(range(19, 34))  # 19 to 33 inclusive
+                ovrs = list(range(70, 100))  # 70 to 99 inclusive
+
+                # Build header row
+                header = ['Age \\ OVR'] + [str(ovr) for ovr in ovrs]
+
+                # Build data rows
+                table_data = []
+                for age in ages:
+                    row = [str(age)]
+                    for ovr in ovrs:
+                        band = comp_map.get((age, ovr), '')
+                        row.append(band if band else '')
+                    table_data.append(row)
+
+                compensation_chart_df = pd.DataFrame(table_data, columns=header)
 
                 # Export Contract Config
                 cursor = await db.execute(
@@ -1575,7 +1601,7 @@ class AdminCommands(commands.Cog):
                     if 'Worksheet Submitted_Lineups' not in str(e):
                         errors.append(f"Submitted Lineups sheet error: {str(e)}")
 
-                # Import Compensation Chart
+                # Import Compensation Chart (2D table format with individual ages/OVRs)
                 compensation_chart_imported = 0
                 try:
                     compensation_chart_df = pd.read_excel(excel_file, sheet_name='Compensation_Chart')
@@ -1583,22 +1609,75 @@ class AdminCommands(commands.Cog):
                     # Clear existing compensation chart
                     await db.execute("DELETE FROM compensation_chart")
 
-                    for _, row in compensation_chart_df.iterrows():
-                        try:
-                            min_age = int(row['Min_Age'])
-                            max_age = int(row['Max_Age']) if pd.notna(row['Max_Age']) and row['Max_Age'] else None
-                            min_ovr = int(row['Min_OVR'])
-                            max_ovr = int(row['Max_OVR']) if pd.notna(row['Max_OVR']) and row['Max_OVR'] else None
-                            band = int(row['Band'])
+                    # Parse 2D table: first column is ages, other columns are individual OVRs
+                    age_col = compensation_chart_df.columns[0]  # Should be "Age \ OVR" or similar
+                    ovr_cols = compensation_chart_df.columns[1:]  # All other columns are OVR values
 
-                            await db.execute(
-                                """INSERT INTO compensation_chart (min_age, max_age, min_ovr, max_ovr, compensation_band)
-                                   VALUES (?, ?, ?, ?, ?)""",
-                                (min_age, max_age, min_ovr, max_ovr, band)
-                            )
-                            compensation_chart_imported += 1
-                        except Exception as e:
-                            errors.append(f"Compensation Chart row: {str(e)}")
+                    # Build a map of (age, ovr) -> band
+                    cell_map = {}
+                    for _, row in compensation_chart_df.iterrows():
+                        age_str = str(row[age_col]).strip()
+                        if not age_str or age_str == '':
+                            continue
+
+                        try:
+                            age = int(age_str)
+                        except:
+                            continue
+
+                        # Process each OVR column
+                        for ovr_col in ovr_cols:
+                            band_value = row[ovr_col]
+                            if pd.isna(band_value) or band_value == '':
+                                continue
+
+                            try:
+                                band = int(band_value)
+                                ovr = int(ovr_col)
+                                cell_map[(age, ovr)] = band
+                            except:
+                                continue
+
+                    # Group consecutive cells with same band into ranges
+                    # Process by band number
+                    bands = set(cell_map.values())
+                    for band in sorted(bands):
+                        # Get all cells for this band
+                        band_cells = {k for k, v in cell_map.items() if v == band}
+
+                        # Group by age, then find consecutive OVR ranges
+                        age_groups = {}
+                        for age, ovr in band_cells:
+                            if age not in age_groups:
+                                age_groups[age] = []
+                            age_groups[age].append(ovr)
+
+                        # For each age, find consecutive OVR ranges
+                        for age, ovrs in age_groups.items():
+                            ovrs = sorted(ovrs)
+                            # Find consecutive ranges
+                            ranges = []
+                            start = ovrs[0]
+                            prev = ovrs[0]
+
+                            for ovr in ovrs[1:]:
+                                if ovr == prev + 1:
+                                    prev = ovr
+                                else:
+                                    ranges.append((start, prev))
+                                    start = ovr
+                                    prev = ovr
+                            ranges.append((start, prev))
+
+                            # Insert each range
+                            for min_ovr, max_ovr in ranges:
+                                await db.execute(
+                                    """INSERT INTO compensation_chart (min_age, max_age, min_ovr, max_ovr, compensation_band)
+                                       VALUES (?, ?, ?, ?, ?)""",
+                                    (age, age, min_ovr, max_ovr if max_ovr != min_ovr else None, band)
+                                )
+                                compensation_chart_imported += 1
+
                     await db.commit()
                 except Exception as e:
                     if 'Worksheet Compensation_Chart' not in str(e):
