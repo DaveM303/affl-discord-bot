@@ -961,14 +961,14 @@ class AdminCommands(commands.Cog):
                 cursor = await db.execute(
                     """SELECT period_id as Period_ID, season_number as Season_Number,
                               status as Status, auction_points as Auction_Points,
-                              bidding_started_at as Bidding_Started_At,
-                              matching_started_at as Matching_Started_At,
+                              started_at as Started_At,
+                              bidding_ended_at as Bidding_Ended_At,
                               matching_ended_at as Matching_Ended_At
                        FROM free_agency_periods
                        ORDER BY season_number DESC"""
                 )
                 free_agency_periods = await cursor.fetchall()
-                free_agency_periods_df = pd.DataFrame(free_agency_periods, columns=['Period_ID', 'Season_Number', 'Status', 'Auction_Points', 'Bidding_Started_At', 'Matching_Started_At', 'Matching_Ended_At'])
+                free_agency_periods_df = pd.DataFrame(free_agency_periods, columns=['Period_ID', 'Season_Number', 'Status', 'Auction_Points', 'Started_At', 'Bidding_Ended_At', 'Matching_Ended_At'])
                 free_agency_periods_df = free_agency_periods_df.fillna('')
 
             # Create Excel file in memory
@@ -1747,21 +1747,21 @@ class AdminCommands(commands.Cog):
                             season_number = int(row['Season_Number'])
                             status = str(row['Status'])
                             auction_points = int(row['Auction_Points']) if pd.notna(row['Auction_Points']) else 300
-                            bidding_started_at = str(row['Bidding_Started_At']) if pd.notna(row['Bidding_Started_At']) and row['Bidding_Started_At'] else None
-                            matching_started_at = str(row['Matching_Started_At']) if pd.notna(row['Matching_Started_At']) and row['Matching_Started_At'] else None
+                            started_at = str(row['Started_At']) if pd.notna(row['Started_At']) and row['Started_At'] else None
+                            bidding_ended_at = str(row['Bidding_Ended_At']) if pd.notna(row['Bidding_Ended_At']) and row['Bidding_Ended_At'] else None
                             matching_ended_at = str(row['Matching_Ended_At']) if pd.notna(row['Matching_Ended_At']) and row['Matching_Ended_At'] else None
 
                             if period_id:
                                 await db.execute(
-                                    """INSERT INTO free_agency_periods (period_id, season_number, status, auction_points, bidding_started_at, matching_started_at, matching_ended_at)
+                                    """INSERT INTO free_agency_periods (period_id, season_number, status, auction_points, started_at, bidding_ended_at, matching_ended_at)
                                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                                    (period_id, season_number, status, auction_points, bidding_started_at, matching_started_at, matching_ended_at)
+                                    (period_id, season_number, status, auction_points, started_at, bidding_ended_at, matching_ended_at)
                                 )
                             else:
                                 await db.execute(
-                                    """INSERT INTO free_agency_periods (season_number, status, auction_points, bidding_started_at, matching_started_at, matching_ended_at)
+                                    """INSERT INTO free_agency_periods (season_number, status, auction_points, started_at, bidding_ended_at, matching_ended_at)
                                        VALUES (?, ?, ?, ?, ?, ?)""",
-                                    (season_number, status, auction_points, bidding_started_at, matching_started_at, matching_ended_at)
+                                    (season_number, status, auction_points, started_at, bidding_ended_at, matching_ended_at)
                                 )
                             free_agency_periods_imported += 1
                         except Exception as e:
