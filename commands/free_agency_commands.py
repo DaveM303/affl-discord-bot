@@ -834,14 +834,12 @@ class FreeAgencyCommands(commands.Cog):
                         for ovr in range(min_ovr, ovr_end + 1):
                             comp_map[(age, ovr)] = band
 
-                # Create embed with table visualization
-                embed = discord.Embed(
-                    title="Compensation Chart",
-                    description="Compensation bands for free agents based on age and OVR rating",
-                    color=discord.Color.green()
-                )
+                # Build the full table as a plain message (not embed to avoid size limits)
+                response_parts = []
+                response_parts.append("**Compensation Chart**")
+                response_parts.append("Compensation bands for free agents based on age and OVR rating\n")
 
-                # Create multiple fields for different OVR ranges to avoid size limits
+                # Create multiple fields for different OVR ranges
                 # Split into OVR ranges: 70-79, 80-89, 90-99
                 ovr_ranges = [
                     (70, 79, "OVR 70-79"),
@@ -870,16 +868,13 @@ class FreeAgencyCommands(commands.Cog):
                                 row_values.append("  -")
                         table_lines.append(" │ ".join(row_values))
 
-                    # Add as field (use code block for monospace font)
-                    embed.add_field(
-                        name=range_label,
-                        value=f"```\n{chr(10).join(table_lines)}\n```",
-                        inline=False
-                    )
+                    # Add section with label
+                    response_parts.append(f"**{range_label}**")
+                    response_parts.append(f"```\n{chr(10).join(table_lines)}\n```")
 
-                embed.set_footer(text="Band numbers indicate draft pick compensation tier (lower = better compensation)")
+                response_parts.append("*Band numbers indicate draft pick compensation tier (lower = better compensation)*")
 
-                await interaction.followup.send(embed=embed)
+                await interaction.followup.send("\n".join(response_parts))
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
