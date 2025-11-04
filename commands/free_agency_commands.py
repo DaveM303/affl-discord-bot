@@ -834,45 +834,37 @@ class FreeAgencyCommands(commands.Cog):
                         for ovr in range(min_ovr, ovr_end + 1):
                             comp_map[(age, ovr)] = band
 
-                # Build the full table as a plain message (not embed to avoid size limits)
+                # Build compact table - use 2-char columns to save space
                 response_parts = []
-                response_parts.append("**Compensation Chart**")
-                response_parts.append("Compensation bands for free agents based on age and OVR rating\n")
+                response_parts.append("**Compensation Chart** (lower = better)\n")
 
-                # Create multiple fields for different OVR ranges
                 # Split into OVR ranges: 70-79, 80-89, 90-99
                 ovr_ranges = [
-                    (70, 79, "OVR 70-79"),
-                    (80, 89, "OVR 80-89"),
-                    (90, 99, "OVR 90-99")
+                    (70, 79, "70-79"),
+                    (80, 89, "80-89"),
+                    (90, 99, "90-99")
                 ]
 
                 for ovr_start, ovr_end, range_label in ovr_ranges:
-                    # Build table for this OVR range
                     table_lines = []
 
-                    # Header row - use consistent 3-char width for each column, add separator
-                    header = "Age │ " + " ".join([f"{ovr:3}" for ovr in range(ovr_start, ovr_end + 1)])
+                    # Compact header - 2 chars per column
+                    header = "A│" + " ".join([f"{ovr:2}" for ovr in range(ovr_start, ovr_end + 1)])
                     table_lines.append(header)
-                    table_lines.append("━" * len(header))
+                    table_lines.append("─" * len(header))
 
-                    # Data rows (ages 19-33)
+                    # Data rows - ages 19-33
                     for age in range(19, 34):
-                        row_values = [f"{age:3}"]
+                        row_values = [f"{age:2}"[1:] if age < 20 else f"{age:2}"]  # Single digit for 19
                         for ovr in range(ovr_start, ovr_end + 1):
                             band = comp_map.get((age, ovr), None)
-                            # Format band value consistently - dashes right-aligned like numbers
                             if band is not None:
-                                row_values.append(f"{band:3}")
+                                row_values.append(f"{band:2}")
                             else:
-                                row_values.append("  -")
-                        table_lines.append(" │ ".join(row_values))
+                                row_values.append(" -")
+                        table_lines.append("│".join(row_values))
 
-                    # Add section with label
-                    response_parts.append(f"**{range_label}**")
-                    response_parts.append(f"```\n{chr(10).join(table_lines)}\n```")
-
-                response_parts.append("*Band numbers indicate draft pick compensation tier (lower = better compensation)*")
+                    response_parts.append(f"**{range_label}**```\n{chr(10).join(table_lines)}```")
 
                 await interaction.followup.send("\n".join(response_parts))
 
