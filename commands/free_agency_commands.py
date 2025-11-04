@@ -853,8 +853,8 @@ class FreeAgencyCommands(commands.Cog):
                     # Build table for this OVR range
                     table_lines = []
 
-                    # Header row - use consistent 3-char width for each column
-                    header = "Age " + " ".join([f"{ovr:3}" for ovr in range(ovr_start, ovr_end + 1)])
+                    # Header row - use consistent 3-char width for each column, add separator
+                    header = "Age │ " + " ".join([f"{ovr:3}" for ovr in range(ovr_start, ovr_end + 1)])
                     table_lines.append(header)
                     table_lines.append("━" * len(header))
 
@@ -862,13 +862,13 @@ class FreeAgencyCommands(commands.Cog):
                     for age in range(19, 34):
                         row_values = [f"{age:3}"]
                         for ovr in range(ovr_start, ovr_end + 1):
-                            band = comp_map.get((age, ovr), '-')
-                            # Format band value consistently
-                            if band:
+                            band = comp_map.get((age, ovr), None)
+                            # Format band value consistently - dashes right-aligned like numbers
+                            if band is not None:
                                 row_values.append(f"{band:3}")
                             else:
                                 row_values.append("  -")
-                        table_lines.append(" ".join(row_values))
+                        table_lines.append(" │ ".join(row_values))
 
                     # Add as field (use code block for monospace font)
                     embed.add_field(
@@ -877,7 +877,7 @@ class FreeAgencyCommands(commands.Cog):
                         inline=False
                     )
 
-                embed.set_footer(text="Band numbers indicate draft pick compensation tier (higher = better compensation)")
+                embed.set_footer(text="Band numbers indicate draft pick compensation tier (lower = better compensation)")
 
                 await interaction.followup.send(embed=embed)
 
