@@ -223,10 +223,9 @@ class SeasonCommands(commands.Cog):
                     )
                 ''')
 
-                # Drop and recreate trades table with correct schema
-                await db.execute('DROP TABLE IF EXISTS trades')
+                # Create trades table (preserve existing data)
                 await db.execute('''
-                    CREATE TABLE trades (
+                    CREATE TABLE IF NOT EXISTS trades (
                         trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
                         initiating_team_id INTEGER NOT NULL,
                         receiving_team_id INTEGER NOT NULL,
@@ -262,57 +261,26 @@ class SeasonCommands(commands.Cog):
                     )
                 ''')
 
-                # Update draft_picks table schema (preserve data, migrate to new schema with drafts table)
-                cursor = await db.execute("PRAGMA table_info(draft_picks)")
-                columns = await cursor.fetchall()
-                column_names = [col[1] for col in columns]
-
-                # Check if we need to migrate from old schema (either original_team_id or missing draft_id)
-                needs_migration = ('original_team_id' in column_names and 'pick_origin' not in column_names) or 'draft_id' not in column_names
-
-                if needs_migration:
-                    # Drop and recreate with new schema (since you said starting fresh is fine)
-                    await db.execute('DROP TABLE IF EXISTS draft_picks')
-                    await db.execute('''
-                        CREATE TABLE draft_picks (
-                            pick_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            draft_id INTEGER NOT NULL,
-                            draft_name TEXT NOT NULL,
-                            season_number INTEGER NOT NULL,
-                            round_number INTEGER,
-                            pick_number INTEGER,
-                            pick_origin TEXT,
-                            original_team_id INTEGER,
-                            current_team_id INTEGER,
-                            player_selected_id INTEGER,
-                            FOREIGN KEY (draft_id) REFERENCES drafts(draft_id),
-                            FOREIGN KEY (season_number) REFERENCES seasons(season_number),
-                            FOREIGN KEY (original_team_id) REFERENCES teams(team_id),
-                            FOREIGN KEY (current_team_id) REFERENCES teams(team_id),
-                            FOREIGN KEY (player_selected_id) REFERENCES players(player_id)
-                        )
-                    ''')
-                else:
-                    # Table already has correct schema or doesn't exist yet
-                    await db.execute('''
-                        CREATE TABLE IF NOT EXISTS draft_picks (
-                            pick_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            draft_id INTEGER NOT NULL,
-                            draft_name TEXT NOT NULL,
-                            season_number INTEGER NOT NULL,
-                            round_number INTEGER,
-                            pick_number INTEGER,
-                            pick_origin TEXT,
-                            original_team_id INTEGER,
-                            current_team_id INTEGER,
-                            player_selected_id INTEGER,
-                            FOREIGN KEY (draft_id) REFERENCES drafts(draft_id),
-                            FOREIGN KEY (season_number) REFERENCES seasons(season_number),
-                            FOREIGN KEY (original_team_id) REFERENCES teams(team_id),
-                            FOREIGN KEY (current_team_id) REFERENCES teams(team_id),
-                            FOREIGN KEY (player_selected_id) REFERENCES players(player_id)
-                        )
-                    ''')
+                # Create draft_picks table (preserve existing data)
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS draft_picks (
+                        pick_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        draft_id INTEGER NOT NULL,
+                        draft_name TEXT NOT NULL,
+                        season_number INTEGER NOT NULL,
+                        round_number INTEGER,
+                        pick_number INTEGER,
+                        pick_origin TEXT,
+                        original_team_id INTEGER,
+                        current_team_id INTEGER,
+                        player_selected_id INTEGER,
+                        FOREIGN KEY (draft_id) REFERENCES drafts(draft_id),
+                        FOREIGN KEY (season_number) REFERENCES seasons(season_number),
+                        FOREIGN KEY (original_team_id) REFERENCES teams(team_id),
+                        FOREIGN KEY (current_team_id) REFERENCES teams(team_id),
+                        FOREIGN KEY (player_selected_id) REFERENCES players(player_id)
+                    )
+                ''')
 
                 # Remove lineup_channel_id from teams if it exists (moved to settings)
                 cursor = await db.execute("PRAGMA table_info(teams)")
