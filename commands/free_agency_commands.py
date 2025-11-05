@@ -871,7 +871,16 @@ class FreeAgencyCommands(commands.Cog):
                                        WHERE draft_id = ? AND round_number = ?""",
                                     (draft_id, round_num)
                                 )
-                                new_pick_num = (await cursor.fetchone())[0] + 1
+                                last_pick_in_round = (await cursor.fetchone())[0]
+                                new_pick_num = last_pick_in_round + 1
+
+                                # Shift all picks in subsequent rounds up by 1
+                                await db.execute(
+                                    """UPDATE draft_picks
+                                       SET pick_number = pick_number + 1
+                                       WHERE draft_id = ? AND pick_number >= ?""",
+                                    (draft_id, new_pick_num)
+                                )
 
                             else:
                                 # Unknown band - skip
