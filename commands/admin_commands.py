@@ -1526,6 +1526,10 @@ class AdminCommands(commands.Cog):
                 draft_picks_imported = 0
                 try:
                     draft_picks_df = pd.read_excel(excel_file, sheet_name='Draft_Picks')
+
+                    # Clear existing draft picks before importing to avoid duplicates
+                    await db.execute("DELETE FROM draft_picks")
+
                     for _, row in draft_picks_df.iterrows():
                         try:
                             # Get current team ID
@@ -1587,7 +1591,7 @@ class AdminCommands(commands.Cog):
 
                             if current_team and pick_id and draft_id:
                                 await db.execute(
-                                    """INSERT OR REPLACE INTO draft_picks
+                                    """INSERT INTO draft_picks
                                        (pick_id, draft_id, draft_name, season_number, round_number, pick_number,
                                         pick_origin, original_team_id, current_team_id, player_selected_id)
                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
