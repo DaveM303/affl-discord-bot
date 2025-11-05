@@ -800,7 +800,7 @@ class FreeAgencyCommands(commands.Cog):
                     if draft:
                         draft_id, draft_name, draft_season = draft
 
-                        # Get all compensation results for this period
+                        # Get all compensation results for this period, grouped by band
                         cursor = await db.execute(
                             """SELECT result_id, original_team_id, compensation_band, player_id
                                FROM free_agency_results
@@ -810,17 +810,79 @@ class FreeAgencyCommands(commands.Cog):
                         )
                         comp_results = await cursor.fetchall()
 
-                        # Insert each compensation pick
+                        # Process compensation picks by band to ensure correct ordering
+                        # Bands 1,3,5 go after natural picks; Bands 2,4 go at end of round
                         for result_id, team_id, comp_band, player_id in comp_results:
                             # Get player name for pick origin description
                             cursor = await db.execute("SELECT name FROM players WHERE player_id = ?", (player_id,))
                             player_name = (await cursor.fetchone())[0]
 
-                            # Insert the compensation pick
+                            # Determine round and insertion logic based on compensation band
+                            if comp_band in [1, 3, 5]:
+                                # After team's natural pick in the round
+                                round_num = {1: 1, 3: 2, 5: 3}[comp_band]
+
+                                # Get team name to identify their natural pick
+                                cursor = await db.execute("SELECT team_name FROM teams WHERE team_id = ?", (team_id,))
+                                team_name_result = await cursor.fetchone()
+                                if team_name_result:
+                                    team_name = team_name_result[0]
+                                    natural_pick_origin = f"{team_name} R{round_num}"
+
+                                    # Find the team's natural pick in this round
+                                    cursor = await db.execute(
+                                        """SELECT pick_number FROM draft_picks
+                                           WHERE draft_id = ? AND original_team_id = ? AND round_number = ?
+                                           AND pick_origin = ?
+                                           ORDER BY pick_number LIMIT 1""",
+                                        (draft_id, team_id, round_num, natural_pick_origin)
+                                    )
+                                    natural_pick = await cursor.fetchone()
+                                else:
+                                    natural_pick = None
+
+                                if natural_pick:
+                                    natural_pick_num = natural_pick[0]
+                                    new_pick_num = natural_pick_num + 1
+
+                                    # Shift all picks after this position up by 1
+                                    await db.execute(
+                                        """UPDATE draft_picks
+                                           SET pick_number = pick_number + 1
+                                           WHERE draft_id = ? AND pick_number >= ?""",
+                                        (draft_id, new_pick_num)
+                                    )
+                                else:
+                                    # Fallback: append to end of round if natural pick not found
+                                    cursor = await db.execute(
+                                        """SELECT COALESCE(MAX(pick_number), 0) FROM draft_picks
+                                           WHERE draft_id = ? AND round_number = ?""",
+                                        (draft_id, round_num)
+                                    )
+                                    new_pick_num = (await cursor.fetchone())[0] + 1
+
+                            elif comp_band in [2, 4]:
+                                # End of round, reverse ladder order
+                                round_num = {2: 1, 4: 2}[comp_band]
+
+                                # Find the last pick in this round
+                                cursor = await db.execute(
+                                    """SELECT COALESCE(MAX(pick_number), 0) FROM draft_picks
+                                       WHERE draft_id = ? AND round_number = ?""",
+                                    (draft_id, round_num)
+                                )
+                                new_pick_num = (await cursor.fetchone())[0] + 1
+
+                            else:
+                                # Unknown band - skip
+                                continue
+
+                            # Insert the compensation pick with proper round and pick number
                             cursor = await db.execute(
-                                """INSERT INTO draft_picks (draft_id, draft_name, season_number, pick_origin, original_team_id, current_team_id)
-                                   VALUES (?, ?, ?, ?, ?, ?)""",
-                                (draft_id, draft_name, draft_season, f"Compensation Band {comp_band} (lost {player_name})", team_id, team_id)
+                                """INSERT INTO draft_picks (draft_id, draft_name, season_number, round_number, pick_number, pick_origin, original_team_id, current_team_id)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (draft_id, draft_name, draft_season, round_num, new_pick_num,
+                                 f"Compensation Band {comp_band} (lost {player_name})", team_id, team_id)
                             )
                             pick_id = cursor.lastrowid
 
