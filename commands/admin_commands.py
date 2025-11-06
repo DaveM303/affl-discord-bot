@@ -974,7 +974,7 @@ class AdminCommands(commands.Cog):
                 # Export Free Agency Bids
                 cursor = await db.execute(
                     """SELECT fab.bid_id as Bid_ID, fab.period_id as Period_ID,
-                              t.name as Team, p.name as Player,
+                              t.team_name as Team, p.name as Player,
                               fab.bid_amount as Bid_Amount, fab.status as Status,
                               fab.placed_at as Placed_At
                        FROM free_agency_bids fab
