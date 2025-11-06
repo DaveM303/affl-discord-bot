@@ -671,7 +671,7 @@ class FreeAgencyCommands(commands.Cog):
                             channel = self.bot.get_channel(int(channel_id))
                             if channel:
                                 view = MatchingView(self.bot, period_id, team_id, team_name, player_bids, current_season)
-                                embed = view.create_embed()
+                                embed = await view.create_embed()
                                 await channel.send(embed=embed, view=view)
                                 matching_messages_sent += 1
                     except Exception as e:
