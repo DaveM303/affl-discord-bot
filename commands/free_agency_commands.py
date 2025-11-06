@@ -87,11 +87,11 @@ class FreeAgencyCommands(commands.Cog):
 
     async def get_compensation_band(self, db, age, ovr):
         """Get compensation band based on player age and OVR from compensation_chart table
-        Returns the BEST (lowest number) compensation band if multiple ranges match"""
+        NULL max values mean single-value ranges (e.g., max_ovr IS NULL means only min_ovr)"""
         cursor = await db.execute(
             """SELECT compensation_band FROM compensation_chart
-               WHERE min_age <= ? AND (max_age >= ? OR max_age IS NULL)
-               AND min_ovr <= ? AND (max_ovr >= ? OR max_ovr IS NULL)
+               WHERE min_age <= ? AND COALESCE(max_age, min_age) >= ?
+               AND min_ovr <= ? AND COALESCE(max_ovr, min_ovr) >= ?
                ORDER BY compensation_band ASC
                LIMIT 1""",
             (age, age, ovr, ovr)
@@ -957,8 +957,8 @@ class FreeAgencyCommands(commands.Cog):
                 cursor = await db.execute(
                     """SELECT min_age, max_age, min_ovr, max_ovr, compensation_band
                        FROM compensation_chart
-                       WHERE min_age <= ? AND (max_age >= ? OR max_age IS NULL)
-                       AND min_ovr <= ? AND (max_ovr >= ? OR max_ovr IS NULL)
+                       WHERE min_age <= ? AND COALESCE(max_age, min_age) >= ?
+                       AND min_ovr <= ? AND COALESCE(max_ovr, min_ovr) >= ?
                        ORDER BY compensation_band ASC""",
                     (age, age, ovr, ovr)
                 )
