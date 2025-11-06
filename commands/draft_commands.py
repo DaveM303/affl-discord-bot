@@ -1152,8 +1152,12 @@ class DraftOrderView(discord.ui.View):
             # Get emoji for current team
             current_emoji_str = self.get_emoji(current_emoji)
 
-            # Build pick - number and emoji only
+            # Build pick - number, emoji, and origin
             pick_desc = f"**{pick_num}.** {current_emoji_str}"
+
+            # Show pick origin (for testing/debugging)
+            if pick_origin:
+                pick_desc += f"*({pick_origin})*"
 
             # Show if player selected
             if player_selected:

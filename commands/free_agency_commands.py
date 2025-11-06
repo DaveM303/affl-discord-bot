@@ -800,7 +800,7 @@ class FreeAgencyCommands(commands.Cog):
                     if draft:
                         draft_id, draft_name, draft_season = draft
 
-                        # Get all compensation results for this period, grouped by band
+                        # Get all compensation results for this period
                         cursor = await db.execute(
                             """SELECT result_id, original_team_id, compensation_band, player_id
                                FROM free_agency_results
@@ -810,8 +810,8 @@ class FreeAgencyCommands(commands.Cog):
                         )
                         comp_results = await cursor.fetchall()
 
-                        # Process compensation picks by band to ensure correct ordering
-                        # Bands 1,3,5 go after natural picks; Bands 2,4 go at end of round
+                        # Process compensation picks in order by band (lower bands/rounds first)
+                        # Each insertion renumbers all subsequent picks globally
                         for result_id, team_id, comp_band, player_id in comp_results:
                             # Get player name for pick origin description
                             cursor = await db.execute("SELECT name FROM players WHERE player_id = ?", (player_id,))
@@ -822,24 +822,23 @@ class FreeAgencyCommands(commands.Cog):
                                 # After team's natural pick in the round
                                 round_num = {1: 1, 3: 2, 5: 3}[comp_band]
 
-                                # Get team name to identify their natural pick
+                                # Get team name to identify their natural pick by origin
                                 cursor = await db.execute("SELECT team_name FROM teams WHERE team_id = ?", (team_id,))
                                 team_name_result = await cursor.fetchone()
-                                if team_name_result:
-                                    team_name = team_name_result[0]
-                                    natural_pick_origin = f"{team_name} R{round_num}"
+                                if not team_name_result:
+                                    continue  # Skip if team not found
 
-                                    # Find the team's natural pick in this round
-                                    cursor = await db.execute(
-                                        """SELECT pick_number FROM draft_picks
-                                           WHERE draft_id = ? AND original_team_id = ? AND round_number = ?
-                                           AND pick_origin = ?
-                                           ORDER BY pick_number LIMIT 1""",
-                                        (draft_id, team_id, round_num, natural_pick_origin)
-                                    )
-                                    natural_pick = await cursor.fetchone()
-                                else:
-                                    natural_pick = None
+                                team_name = team_name_result[0]
+                                natural_pick_origin = f"{team_name} R{round_num}"
+
+                                # Find the team's natural pick in this round by origin (unchanging identifier)
+                                cursor = await db.execute(
+                                    """SELECT pick_number FROM draft_picks
+                                       WHERE draft_id = ? AND round_number = ? AND pick_origin = ?
+                                       ORDER BY pick_number LIMIT 1""",
+                                    (draft_id, round_num, natural_pick_origin)
+                                )
+                                natural_pick = await cursor.fetchone()
 
                                 if natural_pick:
                                     natural_pick_num = natural_pick[0]
