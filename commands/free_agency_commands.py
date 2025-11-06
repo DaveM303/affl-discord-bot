@@ -1360,13 +1360,13 @@ class MatchingView(discord.ui.View):
             # Update database with matches
             async with aiosqlite.connect(DB_PATH) as db:
                 for player_id in self.matches:
-                    if self.matches[player_id]:
-                        await db.execute(
-                            """UPDATE free_agency_results
-                               SET matched = 1
-                               WHERE period_id = ? AND player_id = ?""",
-                            (self.period_id, player_id)
-                        )
+                    # Update ALL players - set matched = 1 if True, matched = 0 if False
+                    await db.execute(
+                        """UPDATE free_agency_results
+                           SET matched = ?
+                           WHERE period_id = ? AND player_id = ?""",
+                        (1 if self.matches[player_id] else 0, self.period_id, player_id)
+                    )
                 await db.commit()
 
             # Mark as confirmed
