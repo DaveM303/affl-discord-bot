@@ -971,6 +971,21 @@ class AdminCommands(commands.Cog):
                 free_agency_periods_df = pd.DataFrame(free_agency_periods, columns=['Period_ID', 'Season_Number', 'Status', 'Auction_Points', 'Started_At', 'Bidding_Ended_At', 'Matching_Ended_At'])
                 free_agency_periods_df = free_agency_periods_df.fillna('')
 
+                # Export Free Agency Bids
+                cursor = await db.execute(
+                    """SELECT fab.bid_id as Bid_ID, fab.period_id as Period_ID,
+                              t.name as Team, p.name as Player,
+                              fab.bid_amount as Bid_Amount, fab.status as Status,
+                              fab.placed_at as Placed_At
+                       FROM free_agency_bids fab
+                       JOIN teams t ON fab.team_id = t.team_id
+                       JOIN players p ON fab.player_id = p.player_id
+                       ORDER BY fab.period_id DESC, fab.placed_at DESC"""
+                )
+                free_agency_bids = await cursor.fetchall()
+                free_agency_bids_df = pd.DataFrame(free_agency_bids, columns=['Bid_ID', 'Period_ID', 'Team', 'Player', 'Bid_Amount', 'Status', 'Placed_At'])
+                free_agency_bids_df = free_agency_bids_df.fillna('')
+
             # Create Excel file in memory
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -990,6 +1005,7 @@ class AdminCommands(commands.Cog):
                 suspensions_df.to_excel(writer, sheet_name='Suspensions', index=False)
                 draft_picks_df.to_excel(writer, sheet_name='Draft_Picks', index=False)
                 free_agency_periods_df.to_excel(writer, sheet_name='Free_Agency_Periods', index=False)
+                free_agency_bids_df.to_excel(writer, sheet_name='Free_Agency_Bids', index=False)
 
                 # History/Read-only sheets
                 trades_df.to_excel(writer, sheet_name='Trades', index=False)

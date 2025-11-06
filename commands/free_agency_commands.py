@@ -222,7 +222,7 @@ class FreeAgencyCommands(commands.Cog):
                 )
                 period_result = await cursor.fetchone()
                 if not period_result:
-                    await interaction.followup.send("❌ No active bidding period! Contact an admin to start free agency.")
+                    await interaction.followup.send("❌ No active bidding period!")
                     return
 
                 period_id, max_points = period_result
@@ -400,8 +400,8 @@ class FreeAgencyCommands(commands.Cog):
 
                 period_id, max_points, period_status = period_result
 
-                if period_status != 'bidding':
-                    await interaction.followup.send(f"❌ Bidding period has ended! Current status: {period_status}")
+                if period_status not in ('bidding', 'matching'):
+                    await interaction.followup.send(f"❌ No active free agency period! Current status: {period_status}")
                     return
 
                 # Get user's team
@@ -439,7 +439,7 @@ class FreeAgencyCommands(commands.Cog):
                 remaining_points = max_points - total_spent
 
                 # Create view
-                view = AuctionsMenuView(self.bot, period_id, user_team_id, user_team_name, bids, remaining_points, max_points, current_season)
+                view = AuctionsMenuView(self.bot, period_id, user_team_id, user_team_name, bids, remaining_points, max_points, current_season, period_status)
                 embed = view.create_embed()
                 await interaction.followup.send(embed=embed, view=view)
 
@@ -1174,6 +1174,7 @@ class MatchingView(discord.ui.View):
         self.player_bids = player_bids  # List of (player_id, name, pos, age, ovr, winning_team_id, team_name, emoji_id, bid)
         self.season_number = season_number
         self.matches = {}  # player_id -> bool (True = match, False = don't match)
+        self.confirmed = False  # Track if matches have been confirmed
 
         # Calculate max points (300)
         self.max_points = 300
@@ -1231,7 +1232,7 @@ class MatchingView(discord.ui.View):
         confirm_button.callback = self.confirm_callback
         self.add_item(confirm_button)
 
-    def create_embed(self):
+    async def create_embed(self):
         """Create the embed showing current matching status"""
         embed = discord.Embed(
             title=f"🤝 Free Agency Matching - {self.team_name}",
@@ -1257,6 +1258,21 @@ class MatchingView(discord.ui.View):
             value=f"**Cost if matched:** {total_cost} pts\n**Remaining:** {remaining} pts",
             inline=False
         )
+
+        # Get compensation bands for all players
+        async with aiosqlite.connect(DB_PATH) as db:
+            compensation_bands = {}
+            for player_id, name, pos, age, ovr, winning_team_id, bidding_team, emoji_id, bid in self.player_bids:
+                cursor = await db.execute(
+                    """SELECT compensation_band FROM compensation_chart
+                       WHERE min_age <= ? AND COALESCE(max_age, min_age) >= ?
+                       AND min_ovr <= ? AND COALESCE(max_ovr, min_ovr) >= ?
+                       ORDER BY compensation_band ASC
+                       LIMIT 1""",
+                    (age, age, ovr, ovr)
+                )
+                result = await cursor.fetchone()
+                compensation_bands[player_id] = result[0] if result else None
 
         # List each player with current match status
         player_lines = []
@@ -1285,9 +1301,16 @@ class MatchingView(discord.ui.View):
                 rfa_label = ""
                 cost_display = f"**{bid} pts**"
 
+            # Get compensation band label
+            comp_band = compensation_bands.get(player_id)
+            if comp_band:
+                comp_label = f" • If let go: **Band {comp_band}** compensation"
+            else:
+                comp_label = " • If let go: **No compensation**"
+
             player_lines.append(
                 f"{status} **{name}**{rfa_label} ({pos}, {age}, {ovr})\n"
-                f"    └─ {emoji_str}{bidding_team} bid {cost_display}"
+                f"    └─ {emoji_str}{bidding_team} bid {cost_display}{comp_label}"
             )
 
         embed.add_field(
@@ -1310,7 +1333,7 @@ class MatchingView(discord.ui.View):
 
         # Update the view
         self.update_buttons()
-        embed = self.create_embed()
+        embed = await self.create_embed()
         await interaction.response.edit_message(embed=embed, view=self)
 
     async def confirm_callback(self, interaction: discord.Interaction):
@@ -1346,9 +1369,19 @@ class MatchingView(discord.ui.View):
                         )
                 await db.commit()
 
-            # Disable all buttons
-            for item in self.children:
-                item.disabled = True
+            # Mark as confirmed
+            self.confirmed = True
+
+            # Replace buttons with just "Edit Matches" button
+            self.clear_items()
+            edit_button = discord.ui.Button(
+                label="Edit Matches",
+                style=discord.ButtonStyle.secondary,
+                custom_id="edit_matches",
+                row=0
+            )
+            edit_button.callback = self.edit_matches_callback
+            self.add_item(edit_button)
 
             embed = discord.Embed(
                 title=f"✅ Matches Confirmed - {self.team_name}",
@@ -1365,16 +1398,23 @@ class MatchingView(discord.ui.View):
                       f"**Let Go:** {let_go_count} player{'s' if let_go_count != 1 else ''}",
                 inline=False
             )
-            embed.set_footer(text="Waiting for admin to end matching period...")
+            embed.set_footer(text="Click 'Edit Matches' to make changes • Waiting for admin to end matching period...")
 
             await interaction.response.edit_message(embed=embed, view=self)
 
         except Exception as e:
             await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
+    async def edit_matches_callback(self, interaction: discord.Interaction):
+        """Allow editing matches after confirmation"""
+        self.confirmed = False
+        self.update_buttons()
+        embed = await self.create_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
 
 class AuctionsMenuView(discord.ui.View):
-    def __init__(self, bot, period_id, team_id, team_name, bids, remaining_points, max_points, season_number):
+    def __init__(self, bot, period_id, team_id, team_name, bids, remaining_points, max_points, season_number, period_status):
         super().__init__(timeout=180)
         self.bot = bot
         self.period_id = period_id
@@ -1384,25 +1424,64 @@ class AuctionsMenuView(discord.ui.View):
         self.remaining_points = remaining_points
         self.max_points = max_points
         self.season_number = season_number
+        self.period_status = period_status
 
-        # Add withdraw buttons for each bid (max 25 buttons, but we'll limit to reasonable amount)
-        for i, bid in enumerate(bids[:20]):  # Limit to 20 bids max
-            bid_id, player_id, amount, player_name, pos, age, ovr, team_name_player, emoji_id = bid
-            button = discord.ui.Button(
-                label=f"Withdraw: {player_name} ({amount}pts)",
-                style=discord.ButtonStyle.danger,
-                custom_id=f"withdraw_{bid_id}",
-                row=min(i // 5, 3)  # Distribute across 4 rows (5 buttons per row)
+        self.update_buttons()
+
+    def update_buttons(self):
+        """Update all buttons based on current state"""
+        self.clear_items()
+
+        # Add dropdown to withdraw bids (only during bidding period and if there are bids)
+        if self.period_status == 'bidding' and self.bids:
+            options = []
+            for bid_id, player_id, amount, player_name, pos, age, ovr, team_name_player, emoji_id in self.bids[:25]:
+                options.append(
+                    discord.SelectOption(
+                        label=f"{player_name} ({pos}, {age}, {ovr})",
+                        description=f"Bid: {amount}pts",
+                        value=str(bid_id)
+                    )
+                )
+
+            select = discord.ui.Select(
+                placeholder="Select bids to withdraw",
+                options=options,
+                min_values=1,
+                max_values=len(options),
+                custom_id="withdraw_select",
+                row=0
             )
-            button.callback = self.create_withdraw_callback(bid_id, player_name, amount)
-            self.add_item(button)
+            select.callback = self.withdraw_callback
+            self.add_item(select)
+
+        # Add matching button (only during matching period)
+        if self.period_status == 'matching':
+            matching_button = discord.ui.Button(
+                label="Manage Bid Matches",
+                style=discord.ButtonStyle.primary,
+                custom_id="manage_matches",
+                row=1
+            )
+            matching_button.callback = self.manage_matches_callback
+            self.add_item(matching_button)
+        elif self.period_status == 'bidding':
+            # Greyed out matching button during bidding
+            matching_button = discord.ui.Button(
+                label="Manage Bid Matches",
+                style=discord.ButtonStyle.secondary,
+                custom_id="manage_matches_disabled",
+                disabled=True,
+                row=1
+            )
+            self.add_item(matching_button)
 
         # Add refresh button on last row
         refresh_button = discord.ui.Button(
             label="Refresh",
             style=discord.ButtonStyle.secondary,
             custom_id="refresh",
-            row=4
+            row=2
         )
         refresh_button.callback = self.refresh_callback
         self.add_item(refresh_button)
@@ -1410,7 +1489,7 @@ class AuctionsMenuView(discord.ui.View):
     def create_embed(self):
         embed = discord.Embed(
             title=f"Free Agency Auction - Season {self.season_number}",
-            description=f"**Your Team:** {self.team_name}",
+            description=f"**Your Team:** {self.team_name}\n**Status:** {self.period_status.title()}",
             color=discord.Color.blue()
         )
 
@@ -1447,37 +1526,79 @@ class AuctionsMenuView(discord.ui.View):
                 inline=False
             )
 
-        embed.set_footer(text="Use the buttons below to withdraw bids • Click Refresh to update")
+        if self.period_status == 'bidding':
+            footer_text = "Use the dropdown to withdraw bids • Click Refresh to update"
+        else:
+            footer_text = "Click 'Manage Bid Matches' to respond to bids on your players • Click Refresh to update"
+
+        embed.set_footer(text=footer_text)
         return embed
 
-    def create_withdraw_callback(self, bid_id, player_name, amount):
-        async def callback(interaction: discord.Interaction):
-            try:
-                async with aiosqlite.connect(DB_PATH) as db:
-                    # Delete the bid
+    async def withdraw_callback(self, interaction: discord.Interaction):
+        """Handle withdrawing multiple bids from dropdown"""
+        try:
+            selected_bid_ids = [int(value) for value in interaction.data['values']]
+
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Delete the selected bids
+                for bid_id in selected_bid_ids:
                     await db.execute(
                         "DELETE FROM free_agency_bids WHERE bid_id = ?",
                         (bid_id,)
                     )
-                    await db.commit()
+                await db.commit()
 
-                # Update view
-                self.bids = [b for b in self.bids if b[0] != bid_id]
-                self.remaining_points += amount
+            # Update view
+            withdrawn_bids = [b for b in self.bids if b[0] in selected_bid_ids]
+            refund_amount = sum(b[2] for b in withdrawn_bids)
+            self.bids = [b for b in self.bids if b[0] not in selected_bid_ids]
+            self.remaining_points += refund_amount
 
-                embed = self.create_embed()
-                await interaction.response.edit_message(embed=embed, view=self)
+            self.update_buttons()
+            embed = self.create_embed()
+            await interaction.response.edit_message(embed=embed, view=self)
 
-                # Send confirmation
-                await interaction.followup.send(
-                    f"✅ Withdrawn bid on **{player_name}** ({amount} points refunded)",
-                    ephemeral=True
+            # Send confirmation
+            player_names = ", ".join(b[3] for b in withdrawn_bids)
+            await interaction.followup.send(
+                f"✅ Withdrawn {len(selected_bid_ids)} bid(s): {player_names} ({refund_amount} points refunded)",
+                ephemeral=True
+            )
+
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+
+    async def manage_matches_callback(self, interaction: discord.Interaction):
+        """Open the bid matching interface"""
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get winning bids on this team's players
+                cursor = await db.execute(
+                    """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating,
+                              t.team_id, t.name, t.emoji_id, b.bid_amount
+                       FROM players p
+                       JOIN free_agency_bids b ON p.player_id = b.player_id
+                       JOIN teams t ON b.team_id = t.team_id
+                       WHERE p.team_id = ? AND b.period_id = ? AND b.status = 'winning'
+                       ORDER BY b.bid_amount DESC""",
+                    (self.team_id, self.period_id)
                 )
+                player_bids = await cursor.fetchall()
 
-            except Exception as e:
-                await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+                if not player_bids:
+                    await interaction.response.send_message(
+                        "❌ No winning bids on your players to match!",
+                        ephemeral=True
+                    )
+                    return
 
-        return callback
+                # Create matching view
+                matching_view = MatchingView(self.bot, self.period_id, self.team_id, self.team_name, player_bids, self.season_number)
+                embed = await matching_view.create_embed()
+                await interaction.response.send_message(embed=embed, view=matching_view, ephemeral=True)
+
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
     async def refresh_callback(self, interaction: discord.Interaction):
         try:
@@ -1499,10 +1620,19 @@ class AuctionsMenuView(discord.ui.View):
                 total_spent = sum(bid[2] for bid in self.bids)
                 self.remaining_points = self.max_points - total_spent
 
+                # Re-fetch period status
+                cursor = await db.execute(
+                    "SELECT status FROM free_agency_periods WHERE period_id = ?",
+                    (self.period_id,)
+                )
+                status_result = await cursor.fetchone()
+                if status_result:
+                    self.period_status = status_result[0]
+
             # Recreate view with new buttons
             new_view = AuctionsMenuView(
                 self.bot, self.period_id, self.team_id, self.team_name,
-                self.bids, self.remaining_points, self.max_points, self.season_number
+                self.bids, self.remaining_points, self.max_points, self.season_number, self.period_status
             )
             embed = new_view.create_embed()
             await interaction.response.edit_message(embed=embed, view=new_view)
