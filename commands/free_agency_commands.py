@@ -86,11 +86,13 @@ class FreeAgencyCommands(commands.Cog):
         return result[0] if result else 2  # Default to 2 years if not found
 
     async def get_compensation_band(self, db, age, ovr):
-        """Get compensation band based on player age and OVR from compensation_chart table"""
+        """Get compensation band based on player age and OVR from compensation_chart table
+        Returns the BEST (lowest number) compensation band if multiple ranges match"""
         cursor = await db.execute(
             """SELECT compensation_band FROM compensation_chart
                WHERE min_age <= ? AND (max_age >= ? OR max_age IS NULL)
                AND min_ovr <= ? AND (max_ovr >= ? OR max_ovr IS NULL)
+               ORDER BY compensation_band ASC
                LIMIT 1""",
             (age, age, ovr, ovr)
         )
@@ -935,6 +937,45 @@ class FreeAgencyCommands(commands.Cog):
                         message += f"\n• **{team_name}**: Band {band} pick (lost {player_name})"
 
                 await interaction.followup.send(message)
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {e}")
+
+    @app_commands.command(name="debugcompensation", description="[ADMIN] Debug compensation chart ranges for a specific age/OVR")
+    @app_commands.describe(age="Player age", ovr="Player OVR")
+    async def debug_compensation(self, interaction: discord.Interaction, age: int, ovr: int):
+        """Show all compensation ranges that match a specific age/OVR"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ This command requires administrator permissions.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get all ranges that match this age/OVR
+                cursor = await db.execute(
+                    """SELECT min_age, max_age, min_ovr, max_ovr, compensation_band
+                       FROM compensation_chart
+                       WHERE min_age <= ? AND (max_age >= ? OR max_age IS NULL)
+                       AND min_ovr <= ? AND (max_ovr >= ? OR max_ovr IS NULL)
+                       ORDER BY compensation_band ASC""",
+                    (age, age, ovr, ovr)
+                )
+                matches = await cursor.fetchall()
+
+                if not matches:
+                    await interaction.followup.send(f"❌ No compensation ranges found for age {age}, OVR {ovr}")
+                    return
+
+                response = f"**Compensation Ranges for Age {age}, OVR {ovr}:**\n\n"
+                for min_age, max_age, min_ovr, max_ovr, band in matches:
+                    age_range = f"{min_age}" if max_age is None else f"{min_age}-{max_age}"
+                    ovr_range = f"{min_ovr}" if max_ovr is None else f"{min_ovr}-{max_ovr}"
+                    response += f"• **Band {band}**: Age {age_range}, OVR {ovr_range}\n"
+
+                response += f"\n**Result:** Band {matches[0][4]} (best match)"
+                await interaction.followup.send(response)
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
