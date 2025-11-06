@@ -1188,24 +1188,45 @@ class MatchingView(discord.ui.View):
         """Update all buttons based on current state"""
         self.clear_items()
 
-        # Add toggle buttons for each player (limit to first 20)
-        for i, (player_id, name, pos, age, ovr, winning_team_id, bidding_team, emoji_id, bid) in enumerate(self.player_bids[:20]):
-            is_matched = self.matches.get(player_id, False)
-            button = discord.ui.Button(
-                label=f"{name}: {'✅ Match' if is_matched else '❌ Let Go'}",
-                style=discord.ButtonStyle.success if is_matched else discord.ButtonStyle.danger,
-                custom_id=f"toggle_{player_id}",
-                row=min(i // 5, 3)
-            )
-            button.callback = self.create_toggle_callback(player_id)
-            self.add_item(button)
+        # Add dropdown to select players to match (limit to 25)
+        if self.player_bids:
+            options = []
+            for player_id, name, pos, age, ovr, _, bidding_team, _, bid in self.player_bids[:25]:
+                # Check if RFA and calculate cost
+                is_rfa = age <= 25
+                if is_rfa:
+                    match_cost = round(bid * 0.8)
+                    cost_label = f"{match_cost}pts (RFA discount)"
+                else:
+                    match_cost = bid
+                    cost_label = f"{bid}pts"
 
-        # Add confirm button on last row
+                options.append(
+                    discord.SelectOption(
+                        label=f"{name} ({pos}, {age}, {ovr})",
+                        description=f"Bid: {cost_label}",
+                        value=str(player_id),
+                        default=self.matches.get(player_id, False)
+                    )
+                )
+
+            select = discord.ui.Select(
+                placeholder="Select players to MATCH (unselected = let go)",
+                options=options,
+                min_values=0,
+                max_values=len(options),
+                custom_id="player_select",
+                row=0
+            )
+            select.callback = self.select_callback
+            self.add_item(select)
+
+        # Add confirm button
         confirm_button = discord.ui.Button(
             label="Confirm Matches",
             style=discord.ButtonStyle.primary,
             custom_id="confirm",
-            row=4
+            row=1
         )
         confirm_button.callback = self.confirm_callback
         self.add_item(confirm_button)
@@ -1275,20 +1296,22 @@ class MatchingView(discord.ui.View):
             inline=False
         )
 
-        embed.set_footer(text="Toggle each player, then click Confirm Matches when ready")
+        embed.set_footer(text="Use the dropdown to select players to match, then click Confirm")
         return embed
 
-    def create_toggle_callback(self, player_id):
-        async def callback(interaction: discord.Interaction):
-            # Toggle the match status
-            self.matches[player_id] = not self.matches.get(player_id, False)
+    async def select_callback(self, interaction: discord.Interaction):
+        """Handle player selection from dropdown"""
+        # Get selected player IDs
+        selected_ids = {int(value) for value in interaction.data['values']}
 
-            # Update buttons and embed
-            self.update_buttons()
-            embed = self.create_embed()
-            await interaction.response.edit_message(embed=embed, view=self)
+        # Update matches dict - selected = match, not selected = let go
+        for player_id, _, _, _, _, _, _, _, _ in self.player_bids:
+            self.matches[player_id] = player_id in selected_ids
 
-        return callback
+        # Update the view
+        self.update_buttons()
+        embed = self.create_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
 
     async def confirm_callback(self, interaction: discord.Interaction):
         """Confirm the matching decisions"""
