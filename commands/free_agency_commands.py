@@ -789,6 +789,13 @@ class FreeAgencyCommands(commands.Cog):
                     (period_id,)
                 )
 
+                # Clear all bids for this period now that it's completed
+                # This "refunds" all auction points for the next season
+                await db.execute(
+                    "DELETE FROM free_agency_bids WHERE period_id = ?",
+                    (period_id,)
+                )
+
                 # Insert compensation picks into the current draft automatically
                 picks_inserted = 0
                 draft_name = None
