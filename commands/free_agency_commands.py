@@ -1085,9 +1085,11 @@ class FreeAgentsView(discord.ui.View):
                 except:
                     pass
 
-            # Add all players from this team with team emoji
+            # Add all players from this team with team emoji and RFA status
             for name, pos, age, ovr in players:
-                all_players.append(f"{emoji_str}**{name}** ({pos}, {age}, {ovr})")
+                # Check if RFA (age <= 25)
+                rfa_label = " [RFA]" if age <= 25 else ""
+                all_players.append(f"{emoji_str}**{name}**{rfa_label} ({pos}, {age}, {ovr})")
 
         # Add as single field
         if all_players:
@@ -1168,8 +1170,17 @@ class MatchingView(discord.ui.View):
             color=discord.Color.orange()
         )
 
-        # Calculate points needed if all current matches go through
-        total_cost = sum(bid for player_id, _, _, _, _, _, _, _, bid in self.player_bids if self.matches.get(player_id, False))
+        # Calculate points needed if all current matches go through (with RFA discount)
+        total_cost = 0
+        for player_id, _, _, age, _, _, _, _, bid in self.player_bids:
+            if self.matches.get(player_id, False):
+                # Apply 20% discount for RFAs (age <= 25)
+                if age <= 25:
+                    match_cost = round(bid * 0.8)  # 20% discount
+                else:
+                    match_cost = bid
+                total_cost += match_cost
+
         remaining = self.max_points - total_cost
 
         embed.add_field(
@@ -1193,9 +1204,21 @@ class MatchingView(discord.ui.View):
 
             is_matched = self.matches.get(player_id, False)
             status = "✅ MATCH" if is_matched else "❌ LET GO"
+
+            # Check if RFA (age <= 25) and calculate match cost
+            is_rfa = age <= 25
+            if is_rfa:
+                match_cost = round(bid * 0.8)  # 20% discount
+                rfa_label = " [RFA]"
+                cost_display = f"**{match_cost} pts** (20% discount from {bid} pts)"
+            else:
+                match_cost = bid
+                rfa_label = ""
+                cost_display = f"**{bid} pts**"
+
             player_lines.append(
-                f"{status} **{name}** ({pos}, {age}, {ovr})\n"
-                f"    └─ {emoji_str}{bidding_team} bid **{bid} pts**"
+                f"{status} **{name}**{rfa_label} ({pos}, {age}, {ovr})\n"
+                f"    └─ {emoji_str}{bidding_team} bid {cost_display}"
             )
 
         embed.add_field(
@@ -1222,8 +1245,16 @@ class MatchingView(discord.ui.View):
     async def confirm_callback(self, interaction: discord.Interaction):
         """Confirm the matching decisions"""
         try:
-            # Calculate total cost
-            total_cost = sum(bid for player_id, _, _, _, _, _, _, _, bid in self.player_bids if self.matches.get(player_id, False))
+            # Calculate total cost (with RFA discount)
+            total_cost = 0
+            for player_id, _, _, age, _, _, _, _, bid in self.player_bids:
+                if self.matches.get(player_id, False):
+                    # Apply 20% discount for RFAs (age <= 25)
+                    if age <= 25:
+                        match_cost = round(bid * 0.8)
+                    else:
+                        match_cost = bid
+                    total_cost += match_cost
 
             if total_cost > self.max_points:
                 await interaction.response.send_message(
