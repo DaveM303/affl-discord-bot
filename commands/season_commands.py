@@ -411,9 +411,11 @@ class SeasonCommands(commands.Cog):
                     CREATE TABLE IF NOT EXISTS free_agency_periods (
                         period_id INTEGER PRIMARY KEY AUTOINCREMENT,
                         season_number INTEGER NOT NULL,
-                        status TEXT DEFAULT 'bidding',
+                        status TEXT DEFAULT 'resign',
                         auction_points INTEGER DEFAULT 300,
                         started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        resign_started_at TIMESTAMP,
+                        bidding_started_at TIMESTAMP,
                         bidding_ended_at TIMESTAMP,
                         matching_ended_at TIMESTAMP,
                         FOREIGN KEY (season_number) REFERENCES seasons(season_number),
@@ -460,6 +462,32 @@ class SeasonCommands(commands.Cog):
                         UNIQUE(period_id, player_id)
                     )
                 ''')
+
+                # Create Free Re-Signs table
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS free_agency_resigns (
+                        resign_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        period_id INTEGER NOT NULL,
+                        team_id INTEGER NOT NULL,
+                        player_id INTEGER NOT NULL,
+                        confirmed BOOLEAN DEFAULT 0,
+                        confirmed_at TIMESTAMP,
+                        FOREIGN KEY (period_id) REFERENCES free_agency_periods(period_id),
+                        FOREIGN KEY (team_id) REFERENCES teams(team_id),
+                        FOREIGN KEY (player_id) REFERENCES players(player_id),
+                        UNIQUE(period_id, team_id, player_id)
+                    )
+                ''')
+
+                # Add columns to free_agency_periods if they don't exist
+                cursor = await db.execute("PRAGMA table_info(free_agency_periods)")
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+
+                if 'resign_started_at' not in column_names:
+                    await db.execute("ALTER TABLE free_agency_periods ADD COLUMN resign_started_at TIMESTAMP")
+                if 'bidding_started_at' not in column_names:
+                    await db.execute("ALTER TABLE free_agency_periods ADD COLUMN bidding_started_at TIMESTAMP")
 
                 # Add confirmed_at column to free_agency_results if it doesn't exist
                 cursor = await db.execute("PRAGMA table_info(free_agency_results)")
@@ -1065,80 +1093,6 @@ class SeasonCommands(commands.Cog):
             embed.add_field(name="Current", value=round_name, inline=True)
 
             await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(name="migrateseasons", description="[ADMIN] ONE-TIME: Migrate to new season cycle (offseason at end)")
-    async def migrate_seasons(self, interaction: discord.Interaction):
-        """
-        One-time migration to change season cycle so offseason happens at END of season.
-        Run this during offseason BEFORE starting new season.
-        """
-        await interaction.response.defer(ephemeral=True)
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            try:
-                # Get current offseason season (under old system, this is the NEXT season's offseason)
-                cursor = await db.execute(
-                    "SELECT season_id, season_number FROM seasons WHERE status = 'offseason'"
-                )
-                offseason_result = await cursor.fetchone()
-
-                if not offseason_result:
-                    await interaction.followup.send("❌ No offseason season found! Migration may have already run or database is in unexpected state.")
-                    return
-
-                offseason_id, offseason_num = offseason_result
-
-                # Get the completed season (this is the season that just ended)
-                cursor = await db.execute(
-                    "SELECT season_id, season_number FROM seasons WHERE status = 'completed' ORDER BY season_number DESC LIMIT 1"
-                )
-                completed_result = await cursor.fetchone()
-
-                if not completed_result:
-                    await interaction.followup.send("❌ No completed season found! Cannot determine which season just ended.")
-                    return
-
-                completed_id, completed_num = completed_result
-
-                # Verify the offseason is numbered one after completed
-                if offseason_num != completed_num + 1:
-                    await interaction.followup.send(
-                        f"❌ Unexpected season numbering! Completed season is {completed_num}, offseason is {offseason_num}. "
-                        f"Expected offseason to be {completed_num + 1}."
-                    )
-                    return
-
-                # THE MIGRATION:
-                # 1. Change current "offseason X" to "future X" (it's really the NEXT season, not an offseason)
-                # 2. Change "completed X-1" to "offseason X-1" (it's really in its offseason period)
-
-                await db.execute(
-                    "UPDATE seasons SET status = 'future' WHERE season_id = ?",
-                    (offseason_id,)
-                )
-
-                await db.execute(
-                    "UPDATE seasons SET status = 'offseason', round_name = 'Offseason' WHERE season_id = ?",
-                    (completed_id,)
-                )
-
-                await db.commit()
-
-                await interaction.followup.send(
-                    f"✅ **Season Cycle Migration Complete!**\n\n"
-                    f"**Changes:**\n"
-                    f"• Season {completed_num}: 'completed' → 'offseason'\n"
-                    f"• Season {offseason_num}: 'offseason' → 'future'\n\n"
-                    f"**New System:**\n"
-                    f"• You are now in **Offseason {completed_num}**\n"
-                    f"• Free agents with contract_expiry = {completed_num} will be available\n"
-                    f"• When you run `/startseason`, Season {offseason_num} will begin\n\n"
-                    f"⚠️ **IMPORTANT:** Do NOT run this command again!"
-                )
-
-            except Exception as e:
-                await interaction.followup.send(f"❌ Migration failed: {e}")
-
 
 async def setup(bot):
     await bot.add_cog(SeasonCommands(bot))
