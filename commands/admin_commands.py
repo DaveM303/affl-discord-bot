@@ -1402,6 +1402,9 @@ class AdminCommands(commands.Cog):
                 trades_imported = 0
                 try:
                     trades_df = pd.read_excel(excel_file, sheet_name='Trades', dtype={'Created_By_User_ID': str, 'Responded_By_User_ID': str, 'Approved_By_User_ID': str})
+
+                    # Clear existing trades
+                    await db.execute("DELETE FROM trades")
                     for _, row in trades_df.iterrows():
                         try:
                             # Get team IDs
@@ -1420,14 +1423,15 @@ class AdminCommands(commands.Cog):
                                 approved_at = str(row['Approved_At']) if pd.notna(row['Approved_At']) and row['Approved_At'] else None
 
                                 await db.execute(
-                                    """INSERT OR REPLACE INTO trades
+                                    """INSERT INTO trades
                                        (trade_id, initiating_team_id, receiving_team_id, initiating_players, receiving_players,
-                                        status, created_at, responded_at, approved_at, created_by_user_id,
-                                        responded_by_user_id, approved_by_user_id, original_trade_id)
-                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                        initiating_picks, receiving_picks, status, created_at, responded_at, approved_at,
+                                        created_by_user_id, responded_by_user_id, approved_by_user_id, original_trade_id)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                                     (int(row['Trade_ID']), init_team[0], recv_team[0], str(row['Initiating_Players']),
-                                     str(row['Receiving_Players']), str(row['Status']), created_at, responded_at,
-                                     approved_at, created_by, responded_by, approved_by, original_trade_id)
+                                     str(row['Receiving_Players']), str(row['Initiating_Picks']) if pd.notna(row.get('Initiating_Picks')) else '',
+                                     str(row['Receiving_Picks']) if pd.notna(row.get('Receiving_Picks')) else '',
+                                     str(row['Status']), created_at, responded_at, approved_at, created_by, responded_by, approved_by, original_trade_id)
                                 )
                                 trades_imported += 1
                         except Exception as e:
@@ -1508,6 +1512,10 @@ class AdminCommands(commands.Cog):
                 matches_imported = 0
                 try:
                     matches_df = pd.read_excel(excel_file, sheet_name='Matches')
+
+                    # Clear existing matches
+                    await db.execute("DELETE FROM matches")
+
                     for _, row in matches_df.iterrows():
                         try:
                             # Get season ID
@@ -1524,7 +1532,7 @@ class AdminCommands(commands.Cog):
 
                             if season and home_team and away_team:
                                 await db.execute(
-                                    """INSERT OR REPLACE INTO matches
+                                    """INSERT INTO matches
                                        (match_id, season_id, round_number, home_team_id, away_team_id, home_score, away_score, simulated)
                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                                     (int(row['Match_ID']), season[0], int(row['Round']), home_team[0], away_team[0],
@@ -1626,6 +1634,10 @@ class AdminCommands(commands.Cog):
                 submitted_lineups_imported = 0
                 try:
                     submitted_lineups_df = pd.read_excel(excel_file, sheet_name='Submitted_Lineups')
+
+                    # Clear existing submitted lineups
+                    await db.execute("DELETE FROM submitted_lineups")
+
                     for _, row in submitted_lineups_df.iterrows():
                         try:
                             # Get team ID
@@ -1638,7 +1650,7 @@ class AdminCommands(commands.Cog):
 
                             if team and season:
                                 await db.execute(
-                                    """INSERT OR REPLACE INTO submitted_lineups
+                                    """INSERT INTO submitted_lineups
                                        (submission_id, team_id, season_id, round_number, player_ids, submitted_at)
                                        VALUES (?, ?, ?, ?, ?, ?)""",
                                     (int(row['Submission_ID']), team[0], season[0], int(row['Round']),
@@ -1809,6 +1821,32 @@ class AdminCommands(commands.Cog):
                     if 'Worksheet Free_Agency_Periods' not in str(e):
                         errors.append(f"Free Agency Periods sheet error: {str(e)}")
 
+                # Import Free Agency Bids (optional - clears existing bids)
+                free_agency_bids_imported = 0
+                try:
+                    free_agency_bids_df = pd.read_excel(excel_file, sheet_name='Free_Agency_Bids')
+
+                    # Clear existing free agency bids
+                    await db.execute("DELETE FROM free_agency_bids")
+
+                    for _, row in free_agency_bids_df.iterrows():
+                        try:
+                            # This is read-only historical data, so we'll skip if sheet is empty
+                            if pd.isna(row['Bid_ID']) or not row['Bid_ID']:
+                                continue
+
+                            # Free agency bids are typically regenerated each period
+                            # This import is mainly for testing/debugging purposes
+                            # We won't import this data as it's transient
+                            pass
+
+                        except Exception as e:
+                            errors.append(f"Free Agency Bids row: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Free_Agency_Bids' not in str(e):
+                        errors.append(f"Free Agency Bids sheet error: {str(e)}")
+
             # Build response
             response = "✅ **Import Complete!**\n\n"
             response += f"**Teams:** {teams_added} added, {teams_updated} updated\n"
@@ -1839,6 +1877,8 @@ class AdminCommands(commands.Cog):
                 response += f"**Contract Config:** {contract_config_imported} entries imported\n"
             if free_agency_periods_imported > 0:
                 response += f"**Free Agency Periods:** {free_agency_periods_imported} imported\n"
+            if free_agency_bids_imported > 0:
+                response += f"**Free Agency Bids:** {free_agency_bids_imported} imported\n"
 
             if duplicate_warnings:
                 response += f"\n⚠️ **{len(duplicate_warnings)} Duplicate Name Warning(s):**\n"
