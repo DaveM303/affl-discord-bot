@@ -275,7 +275,7 @@ class FreeAgencyCommands(commands.Cog):
                     await interaction.followup.send(f"❌ Bid amount must be between 1 and {max_points} points!")
                     return
 
-                # Calculate user's remaining points
+                # Calculate user's remaining points (excluding current player)
                 cursor = await db.execute(
                     """SELECT COALESCE(SUM(bid_amount), 0) FROM free_agency_bids
                        WHERE period_id = ? AND team_id = ? AND status = 'active'
@@ -284,15 +284,13 @@ class FreeAgencyCommands(commands.Cog):
                 )
                 spent_points = (await cursor.fetchone())[0]
 
-                # Check if user already has a bid on this player
+                # Check if user already has a bid on this player (for validation)
                 cursor = await db.execute(
                     """SELECT bid_amount FROM free_agency_bids
                        WHERE period_id = ? AND team_id = ? AND player_id = ?""",
                     (period_id, user_team_id, player_id)
                 )
                 existing_bid = await cursor.fetchone()
-                if existing_bid:
-                    spent_points -= existing_bid[0]  # Don't count the old bid
 
                 remaining_points = max_points - spent_points
 
@@ -723,6 +721,42 @@ class FreeAgencyCommands(commands.Cog):
                 period_id, status = period_result
                 if status != 'matching':
                     await interaction.followup.send(f"❌ Period is not in matching status (current: {status})")
+                    return
+
+                # Check if all teams have confirmed their matches
+                # Get teams with winning bids on their players and check if they've confirmed
+                cursor = await db.execute(
+                    """SELECT DISTINCT t.team_id, t.team_name
+                       FROM free_agency_results r
+                       JOIN teams t ON r.original_team_id = t.team_id
+                       WHERE r.period_id = ? AND r.winning_team_id IS NOT NULL""",
+                    (period_id,)
+                )
+                teams_with_bids = await cursor.fetchall()
+
+                # Check which teams haven't confirmed
+                unconfirmed_teams = []
+                for team_id, team_name in teams_with_bids:
+                    # Check if this team has any unconfirmed results (confirmed_at IS NULL)
+                    cursor = await db.execute(
+                        """SELECT COUNT(*) FROM free_agency_results
+                           WHERE period_id = ? AND original_team_id = ?
+                           AND winning_team_id IS NOT NULL AND confirmed_at IS NULL""",
+                        (period_id, team_id)
+                    )
+                    unconfirmed_count = (await cursor.fetchone())[0]
+
+                    if unconfirmed_count > 0:
+                        unconfirmed_teams.append(team_name)
+
+                # If there are unconfirmed teams, don't allow ending the matching period
+                if unconfirmed_teams:
+                    team_list = "\n• ".join(unconfirmed_teams)
+                    await interaction.followup.send(
+                        f"❌ Cannot end matching period!\n\n"
+                        f"The following teams have not confirmed their bid matches:\n• {team_list}\n\n"
+                        f"All teams must confirm their matching decisions before the period can end."
+                    )
                     return
 
                 # Get all free agency results
@@ -1325,6 +1359,20 @@ class MatchingView(discord.ui.View):
 
     async def select_callback(self, interaction: discord.Interaction):
         """Handle player selection from dropdown"""
+        # Check if period is still active
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT status FROM free_agency_periods WHERE period_id = ?",
+                (self.period_id,)
+            )
+            period_status = await cursor.fetchone()
+            if not period_status or period_status[0] != 'matching':
+                await interaction.response.send_message(
+                    "❌ The matching period has ended! Matches are no longer editable.",
+                    ephemeral=True
+                )
+                return
+
         # Get selected player IDs
         selected_ids = {int(value) for value in interaction.data['values']}
 
@@ -1340,6 +1388,20 @@ class MatchingView(discord.ui.View):
     async def confirm_callback(self, interaction: discord.Interaction):
         """Confirm the matching decisions"""
         try:
+            # Check if period is still active
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT status FROM free_agency_periods WHERE period_id = ?",
+                    (self.period_id,)
+                )
+                period_status = await cursor.fetchone()
+                if not period_status or period_status[0] != 'matching':
+                    await interaction.response.send_message(
+                        "❌ The matching period has ended! Matches are no longer editable.",
+                        ephemeral=True
+                    )
+                    return
+
             # Calculate total cost (with RFA discount)
             total_cost = 0
             for player_id, _, _, age, _, _, _, _, bid in self.player_bids:
@@ -1362,9 +1424,10 @@ class MatchingView(discord.ui.View):
             async with aiosqlite.connect(DB_PATH) as db:
                 for player_id in self.matches:
                     # Update ALL players - set matched = 1 if True, matched = 0 if False
+                    # Also set confirmed_at timestamp to track that this team has confirmed
                     await db.execute(
                         """UPDATE free_agency_results
-                           SET matched = ?
+                           SET matched = ?, confirmed_at = CURRENT_TIMESTAMP
                            WHERE period_id = ? AND player_id = ?""",
                         (1 if self.matches[player_id] else 0, self.period_id, player_id)
                     )
@@ -1408,6 +1471,20 @@ class MatchingView(discord.ui.View):
 
     async def edit_matches_callback(self, interaction: discord.Interaction):
         """Allow editing matches after confirmation"""
+        # Check if period is still active
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT status FROM free_agency_periods WHERE period_id = ?",
+                (self.period_id,)
+            )
+            period_status = await cursor.fetchone()
+            if not period_status or period_status[0] != 'matching':
+                await interaction.response.send_message(
+                    "❌ The matching period has ended! Matches are no longer editable.",
+                    ephemeral=True
+                )
+                return
+
         self.confirmed = False
         self.update_buttons()
         embed = await self.create_embed()
@@ -1573,6 +1650,19 @@ class AuctionsMenuView(discord.ui.View):
         """Open the bid matching interface"""
         try:
             async with aiosqlite.connect(DB_PATH) as db:
+                # Check if period is still in matching status
+                cursor = await db.execute(
+                    "SELECT status FROM free_agency_periods WHERE period_id = ?",
+                    (self.period_id,)
+                )
+                period_status = await cursor.fetchone()
+                if not period_status or period_status[0] != 'matching':
+                    await interaction.response.send_message(
+                        "❌ The matching period has ended! Matches are no longer editable.",
+                        ephemeral=True
+                    )
+                    return
+
                 # Get winning bids on this team's players
                 cursor = await db.execute(
                     """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating,

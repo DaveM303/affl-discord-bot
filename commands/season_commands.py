@@ -396,6 +396,7 @@ class SeasonCommands(commands.Cog):
                         winning_team_id INTEGER,
                         winning_bid INTEGER,
                         matched BOOLEAN DEFAULT 0,
+                        confirmed_at TIMESTAMP,
                         compensation_band INTEGER,
                         compensation_pick_id INTEGER,
                         FOREIGN KEY (period_id) REFERENCES free_agency_periods(period_id),
@@ -406,6 +407,14 @@ class SeasonCommands(commands.Cog):
                         UNIQUE(period_id, player_id)
                     )
                 ''')
+
+                # Add confirmed_at column to free_agency_results if it doesn't exist
+                cursor = await db.execute("PRAGMA table_info(free_agency_results)")
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+
+                if 'confirmed_at' not in column_names:
+                    await db.execute("ALTER TABLE free_agency_results ADD COLUMN confirmed_at TIMESTAMP")
 
                 await db.commit()
 
