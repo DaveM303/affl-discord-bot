@@ -635,7 +635,7 @@ class FreeAgencyCommands(commands.Cog):
                         view = FreeResignButtonView(period_id, team_id, allowance)
 
                         try:
-                            channel = self.bot.get_channel(channel_id)
+                            channel = self.bot.get_channel(int(channel_id))
                             if channel:
                                 await channel.send(embed=embed, view=view)
                                 notifications_sent += 1
