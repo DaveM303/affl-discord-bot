@@ -778,7 +778,9 @@ class FreeAgencyCommands(commands.Cog):
                 for result_id, player_id, original_team_id, winning_team_id, winning_bid, matched, player_name, age, ovr in results:
                     # Get new contract length based on age
                     contract_years = await self.get_contract_years_for_age(db, age)
-                    new_contract_expiry = current_season + contract_years - 1
+                    # current_season is the season that just ended (Offseason 9 means Season 9 just ended)
+                    # Adding contract_years gives us the last season they'll play under the new contract
+                    new_contract_expiry = current_season + contract_years
 
                     if winning_team_id is None:
                         # No bids - auto re-sign with original team
