@@ -279,7 +279,8 @@ class AdminCommands(commands.Cog):
         lineups_channel="Channel where all lineup submissions are posted",
         delist_log_channel="Channel where player delistings are logged",
         trade_approval_channel="Channel where trades are sent for moderator approval",
-        trade_log_channel="Channel where approved trades are announced"
+        trade_log_channel="Channel where approved trades are announced",
+        season_1_year="Calendar year of Season 1 (for player aging)"
     )
     async def config(
         self,
@@ -287,15 +288,16 @@ class AdminCommands(commands.Cog):
         lineups_channel: discord.TextChannel = None,
         delist_log_channel: discord.TextChannel = None,
         trade_approval_channel: discord.TextChannel = None,
-        trade_log_channel: discord.TextChannel = None
+        trade_log_channel: discord.TextChannel = None,
+        season_1_year: int = None
     ):
         # If no parameters provided, show current settings
-        if all(ch is None for ch in [lineups_channel, delist_log_channel, trade_approval_channel, trade_log_channel]):
+        if all(ch is None for ch in [lineups_channel, delist_log_channel, trade_approval_channel, trade_log_channel, season_1_year]):
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
                     """SELECT setting_key, setting_value FROM settings
                        WHERE setting_key IN ('lineups_channel_id', 'delist_log_channel_id',
-                                             'trade_approval_channel_id', 'trade_log_channel_id')"""
+                                             'trade_approval_channel_id', 'trade_log_channel_id', 'season_1_year')"""
                 )
                 results = await cursor.fetchall()
 
@@ -335,6 +337,13 @@ class AdminCommands(commands.Cog):
                 channel_display = "*Not set*"
             embed.add_field(name="Trade Log Channel", value=channel_display, inline=False)
 
+            # Season 1 Year
+            if 'season_1_year' in settings and settings['season_1_year']:
+                year_display = settings['season_1_year']
+            else:
+                year_display = "*Not set (defaults to 2016)*"
+            embed.add_field(name="Season 1 Year", value=year_display, inline=False)
+
             embed.set_footer(text="Use /config with parameters to update settings")
 
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -370,6 +379,13 @@ class AdminCommands(commands.Cog):
                     ("trade_log_channel_id", str(trade_log_channel.id))
                 )
                 updates.append(f"Trade Log Channel → {trade_log_channel.mention}")
+
+            if season_1_year is not None:
+                await db.execute(
+                    "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
+                    ("season_1_year", str(season_1_year))
+                )
+                updates.append(f"Season 1 Year → {season_1_year}")
 
             await db.commit()
 
@@ -419,17 +435,19 @@ class AdminCommands(commands.Cog):
         position="Player position",
         rating="Overall rating (1-100)",
         age="Player age",
-        team_name="Team name (leave empty for delisted)"
+        team_name="Team name (leave empty for delisted)",
+        contract_expiry="Contract expiry season (optional)"
     )
     @app_commands.autocomplete(position=position_autocomplete)
     async def add_player(
-        self, 
-        interaction: discord.Interaction, 
-        name: str, 
-        position: str, 
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        position: str,
         rating: int,
         age: int,
-        team_name: str = None
+        team_name: str = None,
+        contract_expiry: int = None
     ):
         is_valid, normalized_pos = validate_position(position)
         if not is_valid:
@@ -473,16 +491,40 @@ class AdminCommands(commands.Cog):
 
                 team_id = team[0]
 
+            # Calculate birth_year from age
+            cursor = await db.execute(
+                """SELECT season_number FROM seasons
+                   ORDER BY
+                       CASE status
+                           WHEN 'active' THEN 1
+                           WHEN 'offseason' THEN 2
+                           ELSE 3
+                       END,
+                       season_number DESC
+                   LIMIT 1"""
+            )
+            season_result = await cursor.fetchone()
+            current_season = season_result[0] if season_result else 1
+
+            cursor = await db.execute(
+                "SELECT setting_value FROM settings WHERE setting_key = 'season_1_year'"
+            )
+            setting_result = await cursor.fetchone()
+            season_1_year = int(setting_result[0]) if setting_result else current_season
+            current_year = season_1_year + (current_season - 1)
+            birth_year = current_year - age
+
             # Add player
             await db.execute(
-                """INSERT INTO players (name, position, overall_rating, age, team_id)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (name, normalized_pos, rating, age, team_id)
+                """INSERT INTO players (name, position, overall_rating, age, birth_year, team_id, contract_expiry)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (name, normalized_pos, rating, age, birth_year, team_id, contract_expiry)
             )
             await db.commit()
 
             team_text = f"to **{team_name}**" if team_name else "as delisted"
-            success_msg = f"✅ Added **{name}** ({normalized_pos}, {rating} OVR, {age}yo) {team_text}!"
+            contract_text = f", contract expires Season {contract_expiry}" if contract_expiry else ""
+            success_msg = f"✅ Added **{name}** ({normalized_pos}, {rating} OVR, {age}yo{contract_text}) {team_text}!"
 
             # Add warning if duplicate name exists
             if duplicate:
@@ -618,8 +660,33 @@ class AdminCommands(commands.Cog):
                 changes.append(f"OVR: {old_rating} → {ovr}")
 
             if age is not None:
+                # Calculate new birth_year from age
+                cursor = await db.execute(
+                    """SELECT season_number FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
+                )
+                season_result = await cursor.fetchone()
+                current_season = season_result[0] if season_result else 1
+
+                cursor = await db.execute(
+                    "SELECT setting_value FROM settings WHERE setting_key = 'season_1_year'"
+                )
+                setting_result = await cursor.fetchone()
+                season_1_year = int(setting_result[0]) if setting_result else current_season
+                current_year = season_1_year + (current_season - 1)
+                birth_year = current_year - age
+
                 updates.append("age = ?")
+                updates.append("birth_year = ?")
                 values.append(age)
+                values.append(birth_year)
                 changes.append(f"Age: {old_age} → {age}")
 
             if position is not None:
@@ -745,15 +812,16 @@ class AdminCommands(commands.Cog):
                 # Export Players (existing players only - edit but don't add new)
                 cursor = await db.execute(
                     """SELECT p.player_id as Player_ID, p.name as Name, t.team_name as Team,
-                              p.age as Age, p.position as Pos, p.overall_rating as OVR,
+                              p.age as Age, p.birth_year as Birth_Year, p.position as Pos, p.overall_rating as OVR,
                               p.contract_expiry as Contract_Expiry
                        FROM players p
                        LEFT JOIN teams t ON p.team_id = t.team_id
                        ORDER BY p.name"""
                 )
                 players = await cursor.fetchall()
-                players_df = pd.DataFrame(players, columns=['Player_ID', 'Name', 'Team', 'Age', 'Pos', 'OVR', 'Contract_Expiry'])
+                players_df = pd.DataFrame(players, columns=['Player_ID', 'Name', 'Team', 'Age', 'Birth_Year', 'Pos', 'OVR', 'Contract_Expiry'])
                 players_df['Team'] = players_df['Team'].fillna('')
+                players_df['Birth_Year'] = players_df['Birth_Year'].fillna('')
                 players_df['Contract_Expiry'] = players_df['Contract_Expiry'].fillna('')
 
                 # Create Add_Players sheet (for bulk adding new players)
@@ -1167,6 +1235,34 @@ class AdminCommands(commands.Cog):
                             rating = int(row['OVR'])
                             age = int(row['Age'])
 
+                            # Get birth_year if present, otherwise calculate from age
+                            birth_year = None
+                            if 'Birth_Year' in players_df.columns and pd.notna(row['Birth_Year']) and row['Birth_Year']:
+                                birth_year = int(row['Birth_Year'])
+                            else:
+                                # Calculate birth_year from age
+                                cursor = await db.execute(
+                                    """SELECT season_number FROM seasons
+                                       ORDER BY
+                                           CASE status
+                                               WHEN 'active' THEN 1
+                                               WHEN 'offseason' THEN 2
+                                               ELSE 3
+                                           END,
+                                           season_number DESC
+                                       LIMIT 1"""
+                                )
+                                season_result = await cursor.fetchone()
+                                current_season = season_result[0] if season_result else 1
+
+                                cursor = await db.execute(
+                                    "SELECT setting_value FROM settings WHERE setting_key = 'season_1_year'"
+                                )
+                                setting_result = await cursor.fetchone()
+                                season_1_year = int(setting_result[0]) if setting_result else current_season
+                                current_year = season_1_year + (current_season - 1)
+                                birth_year = current_year - age
+
                             # Get contract_expiry if present
                             contract_expiry = None
                             if 'Contract_Expiry' in players_df.columns and pd.notna(row['Contract_Expiry']) and row['Contract_Expiry']:
@@ -1198,9 +1294,9 @@ class AdminCommands(commands.Cog):
                             if existing:
                                 await db.execute(
                                     """UPDATE players
-                                       SET name = ?, position = ?, overall_rating = ?, age = ?, team_id = ?, contract_expiry = ?
+                                       SET name = ?, position = ?, overall_rating = ?, age = ?, birth_year = ?, team_id = ?, contract_expiry = ?
                                        WHERE player_id = ?""",
-                                    (name, normalized_pos, rating, age, team_id, contract_expiry, existing[0])
+                                    (name, normalized_pos, rating, age, birth_year, team_id, contract_expiry, existing[0])
                                 )
                                 players_updated += 1
                             else:
@@ -1233,6 +1329,29 @@ class AdminCommands(commands.Cog):
                             rating = int(row['OVR'])
                             age = int(row['Age'])
 
+                            # Calculate birth_year from age
+                            cursor = await db.execute(
+                                """SELECT season_number FROM seasons
+                                   ORDER BY
+                                       CASE status
+                                           WHEN 'active' THEN 1
+                                           WHEN 'offseason' THEN 2
+                                           ELSE 3
+                                       END,
+                                       season_number DESC
+                                   LIMIT 1"""
+                            )
+                            season_result = await cursor.fetchone()
+                            current_season = season_result[0] if season_result else 1
+
+                            cursor = await db.execute(
+                                "SELECT setting_value FROM settings WHERE setting_key = 'season_1_year'"
+                            )
+                            setting_result = await cursor.fetchone()
+                            season_1_year = int(setting_result[0]) if setting_result else current_season
+                            current_year = season_1_year + (current_season - 1)
+                            birth_year = current_year - age
+
                             # Get contract_expiry if present
                             contract_expiry = None
                             if 'Contract_Expiry' in add_players_df.columns and pd.notna(row['Contract_Expiry']) and row['Contract_Expiry']:
@@ -1258,9 +1377,9 @@ class AdminCommands(commands.Cog):
                                 duplicate_warnings.append(f"Add_Players: '{name}' already exists (ID: {existing[0]}) - skipped")
                             else:
                                 await db.execute(
-                                    """INSERT INTO players (name, position, overall_rating, age, team_id, contract_expiry)
-                                       VALUES (?, ?, ?, ?, ?, ?)""",
-                                    (name, normalized_pos, rating, age, team_id, contract_expiry)
+                                    """INSERT INTO players (name, position, overall_rating, age, birth_year, team_id, contract_expiry)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                    (name, normalized_pos, rating, age, birth_year, team_id, contract_expiry)
                                 )
                                 players_added += 1
                         except Exception as e:

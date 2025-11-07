@@ -311,6 +311,59 @@ class SeasonCommands(commands.Cog):
                             (current_season + 2,)
                         )
 
+                # Add birth_year column to players if it doesn't exist
+                cursor = await db.execute("PRAGMA table_info(players)")
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+
+                if 'birth_year' not in column_names:
+                    await db.execute('ALTER TABLE players ADD COLUMN birth_year INTEGER')
+
+                    # Calculate birth_year from existing age column if it exists
+                    if 'age' in column_names:
+                        # Get current season
+                        cursor = await db.execute(
+                            "SELECT season_number FROM seasons ORDER BY season_number DESC LIMIT 1"
+                        )
+                        season_result = await cursor.fetchone()
+                        if season_result:
+                            current_season = season_result[0]
+
+                            # Get season_1_year setting (default to current_season if not set)
+                            cursor = await db.execute(
+                                "SELECT setting_value FROM settings WHERE setting_key = 'season_1_year'"
+                            )
+                            setting_result = await cursor.fetchone()
+                            if setting_result:
+                                season_1_year = int(setting_result[0])
+                                current_year = season_1_year + (current_season - 1)
+                            else:
+                                # Default: assume current season year equals season number for migration
+                                current_year = current_season
+
+                            # Calculate birth_year = current_year - age for all players
+                            await db.execute(
+                                "UPDATE players SET birth_year = ? - age WHERE age IS NOT NULL",
+                                (current_year,)
+                            )
+
+                # Add season_1_year setting if it doesn't exist
+                cursor = await db.execute(
+                    "SELECT setting_value FROM settings WHERE setting_key = 'season_1_year'"
+                )
+                if not await cursor.fetchone():
+                    # Get current season number
+                    cursor = await db.execute(
+                        "SELECT season_number FROM seasons ORDER BY season_number DESC LIMIT 1"
+                    )
+                    season_result = await cursor.fetchone()
+                    if season_result:
+                        current_season = season_result[0]
+                        # Default to 2016 for Season 1 (adjust as needed)
+                        await db.execute(
+                            "INSERT INTO settings (setting_key, setting_value) VALUES ('season_1_year', '2016')"
+                        )
+
                 # Add rookie_contract_years to drafts table if it doesn't exist
                 cursor = await db.execute("PRAGMA table_info(drafts)")
                 columns = await cursor.fetchall()
@@ -605,6 +658,21 @@ class SeasonCommands(commands.Cog):
                         suspensions_carried_over += 1
 
                 await db.commit()
+
+            # Update player ages for the new season
+            cursor = await db.execute(
+                "SELECT setting_value FROM settings WHERE setting_key = 'season_1_year'"
+            )
+            setting_result = await cursor.fetchone()
+            if setting_result:
+                season_1_year = int(setting_result[0])
+                current_year = season_1_year + (season_number - 1)
+
+                # Update age column based on birth_year
+                await db.execute(
+                    "UPDATE players SET age = ? - birth_year WHERE birth_year IS NOT NULL",
+                    (current_year,)
+                )
 
             # Start the season
             round_name = get_round_name(1, regular_rounds)
