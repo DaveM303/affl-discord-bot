@@ -2071,21 +2071,6 @@ class FreeResignButtonView(discord.ui.View):
         """Open the free re-sign selection interface"""
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Verify this is a team member
-                cursor = await db.execute(
-                    "SELECT role_id FROM teams WHERE team_id = ?",
-                    (self.team_id,)
-                )
-                team_result = await cursor.fetchone()
-                if not team_result:
-                    await interaction.response.send_message("❌ Team not found!", ephemeral=True)
-                    return
-
-                role_id = team_result[0]
-                if not any(role.id == role_id for role in interaction.user.roles):
-                    await interaction.response.send_message("❌ You're not a member of this team!", ephemeral=True)
-                    return
-
                 # Get current season
                 cursor = await db.execute(
                     """SELECT season_number FROM seasons
