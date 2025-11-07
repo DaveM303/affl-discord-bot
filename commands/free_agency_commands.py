@@ -334,8 +334,9 @@ class FreeAgencyCommands(commands.Cog):
                     except:
                         pass
 
-                # Calculate new remaining points
-                new_remaining = remaining_points - amount
+                # Calculate new remaining points after this bid
+                # spent_points already excludes the old bid if it existed
+                new_remaining = max_points - (spent_points + amount)
 
                 embed = discord.Embed(
                     title=f"✅ Bid {action}!",
