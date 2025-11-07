@@ -53,14 +53,14 @@ class FreeAgencyCommands(commands.Cog):
                     return []
                 current_season = season_result[0]
 
-                # Get players whose contracts expire this season
+                # Get players whose contracts expired (contract_expiry = current season during offseason)
                 cursor = await db.execute(
                     """SELECT p.player_id, p.name, p.position, p.overall_rating, p.age, t.team_name
                        FROM players p
                        JOIN teams t ON p.team_id = t.team_id
                        WHERE p.contract_expiry = ?
                        ORDER BY p.name""",
-                    (current_season - 1,)
+                    (current_season,)
                 )
                 free_agents = await cursor.fetchall()
 
@@ -145,7 +145,7 @@ class FreeAgencyCommands(commands.Cog):
                            JOIN teams t ON p.team_id = t.team_id
                            WHERE p.contract_expiry = ? AND LOWER(t.team_name) = LOWER(?)
                            ORDER BY p.overall_rating DESC, p.name""",
-                        (current_season - 1, team)
+                        (current_season, team)
                     )
                 else:
                     # Get all free agents
@@ -155,7 +155,7 @@ class FreeAgencyCommands(commands.Cog):
                            JOIN teams t ON p.team_id = t.team_id
                            WHERE p.contract_expiry = ?
                            ORDER BY t.team_name, p.overall_rating DESC, p.name""",
-                        (current_season - 1,)
+                        (current_season,)
                     )
 
                 free_agents = await cursor.fetchall()
@@ -244,8 +244,8 @@ class FreeAgencyCommands(commands.Cog):
 
                 player_name, pos, age, ovr, player_team_id, contract_expiry, team_name, emoji_id = player_data
 
-                # Verify player is a free agent
-                if contract_expiry != current_season - 1:
+                # Verify player is a free agent (contract expired = contract_expiry matches current season)
+                if contract_expiry != current_season:
                     await interaction.followup.send(f"❌ {player_name} is not a free agent this season!")
                     return
 
@@ -503,7 +503,7 @@ class FreeAgencyCommands(commands.Cog):
                 cursor = await db.execute(
                     """SELECT COUNT(*) FROM players
                        WHERE contract_expiry = ? AND team_id IS NOT NULL""",
-                    (current_season - 1,)
+                    (current_season,)
                 )
                 fa_count = (await cursor.fetchone())[0]
 
@@ -571,7 +571,7 @@ class FreeAgencyCommands(commands.Cog):
                 cursor = await db.execute(
                     """SELECT player_id, team_id FROM players
                        WHERE contract_expiry = ? AND team_id IS NOT NULL""",
-                    (current_season - 1,)
+                    (current_season,)
                 )
                 free_agents = await cursor.fetchall()
 

@@ -659,35 +659,70 @@ class SeasonCommands(commands.Cog):
 
                 await db.commit()
 
-            # Update player ages for the new season
+            # Update player ages at START of new season
+            # The new season (season_number + 1) is starting, so age players for that year
             cursor = await db.execute(
                 "SELECT setting_value FROM settings WHERE setting_key = 'season_1_year'"
             )
             setting_result = await cursor.fetchone()
             if setting_result:
                 season_1_year = int(setting_result[0])
-                current_year = season_1_year + (season_number - 1)
-
-                # Update age column based on birth_year
+                # Calculate the year for the NEW season that's about to start
+                new_season_year = season_1_year + season_number  # season_number is the offseason, +1 is the new season
                 await db.execute(
                     "UPDATE players SET age = ? - birth_year WHERE birth_year IS NOT NULL",
-                    (current_year,)
+                    (new_season_year,)
                 )
 
-            # Start the season
-            round_name = get_round_name(1, regular_rounds)
+            # Mark the offseason season as completed
+            await db.execute(
+                """UPDATE seasons
+                   SET status = 'completed', round_name = 'Season Complete'
+                   WHERE season_id = ?""",
+                (season_id,)
+            )
+
+            # Get or create the NEXT season (season_number + 1)
+            next_season_num = season_number + 1
+            cursor = await db.execute(
+                "SELECT season_id, status, regular_rounds FROM seasons WHERE season_number = ?",
+                (next_season_num,)
+            )
+            next_season_result = await cursor.fetchone()
+
+            if not next_season_result:
+                # Next season doesn't exist, create it
+                await db.execute(
+                    """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
+                       VALUES (?, 1, 24, 29, 'Round 1', 'active')""",
+                    (next_season_num,)
+                )
+                next_season_id = cursor.lastrowid
+                next_regular_rounds = 24
+            else:
+                next_season_id, next_status, next_regular_rounds = next_season_result
+                if next_status != 'future':
+                    await interaction.followup.send(
+                        f"❌ Season {next_season_num} has unexpected status '{next_status}' (expected 'future')",
+                        ephemeral=True
+                    )
+                    return
+
+            # Start the next season
+            round_name = get_round_name(1, next_regular_rounds)
             await db.execute(
                 """UPDATE seasons
                    SET current_round = 1, round_name = ?, status = 'active'
                    WHERE season_id = ?""",
-                (round_name, season_id)
+                (round_name, next_season_id)
             )
             await db.commit()
 
             # Ensure next 2 future seasons exist for draft pick trading
-            created_seasons = await ensure_future_seasons_exist(db, season_number, num_future=2)
+            created_seasons = await ensure_future_seasons_exist(db, next_season_num, num_future=2)
 
-            message = f"✅ **Season {season_number}** has started!\nCurrent: {round_name}"
+            message = f"✅ **Season {next_season_num}** has started!\nCurrent: {round_name}\n"
+            message += f"**Previous:** Offseason {season_number} → Completed"
 
             if created_seasons:
                 message += f"\n\n🔮 **Auto-created future seasons for trading:**"
@@ -933,10 +968,11 @@ class SeasonCommands(commands.Cog):
             if next_season_rounds is None:
                 next_season_rounds = current_regular_rounds
 
-            # End the current season
+            # End the current season (set to offseason, not completed)
+            # Note: Player ages will be updated when the new season STARTS (in /startseason)
             await db.execute(
                 """UPDATE seasons
-                   SET status = 'completed', round_name = 'Season Complete'
+                   SET status = 'offseason', round_name = 'Offseason'
                    WHERE season_id = ?""",
                 (season_id,)
             )
@@ -949,29 +985,24 @@ class SeasonCommands(commands.Cog):
             )
             existing = await cursor.fetchone()
 
-            message = f"✅ **Season {season_number}** has ended!"
+            message = f"✅ **Season {season_number}** has ended and is now in offseason!"
 
             if existing:
                 existing_id, existing_status = existing
-                # If next season exists and is 'future', promote it to 'offseason'
-                if existing_status == 'future':
-                    await db.execute(
-                        """UPDATE seasons SET status = 'offseason', round_name = 'Offseason'
-                           WHERE season_id = ?""",
-                        (existing_id,)
-                    )
-                    message += f"\n✅ **Season {next_season_num}** promoted to offseason"
+                # Next season already exists - should be 'future'
+                if existing_status != 'future':
+                    message += f"\n⚠️ Season {next_season_num} already exists with status '{existing_status}' (expected 'future')"
                 else:
-                    message += f"\n⚠️ Season {next_season_num} already exists ({existing_status})"
+                    message += f"\n✅ **Season {next_season_num}** is ready as a future season"
             else:
-                # Create next season in offseason status
+                # Create next season as 'future' status
                 total_rounds = next_season_rounds + len(FINALS_ROUNDS)
                 await db.execute(
                     """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
-                       VALUES (?, 0, ?, ?, 'Offseason', 'offseason')""",
+                       VALUES (?, 0, ?, ?, 'Future', 'future')""",
                     (next_season_num, next_season_rounds, total_rounds)
                 )
-                message += f"\n✅ **Season {next_season_num}** created in offseason ({next_season_rounds} rounds)"
+                message += f"\n✅ **Season {next_season_num}** created as future season ({next_season_rounds} rounds)"
 
             await db.commit()
 
@@ -984,6 +1015,7 @@ class SeasonCommands(commands.Cog):
                     draft_name = f"Season {future_season - 1} National Draft"
                     message += f"\n• Season {future_season} with **{draft_name}**"
 
+            message += f"\n\n**Current Status:** Offseason {season_number}"
             message += f"\n\nUse `/startseason` when ready to begin Season {next_season_num}."
 
             await interaction.response.send_message(message, ephemeral=True)
@@ -1033,6 +1065,79 @@ class SeasonCommands(commands.Cog):
             embed.add_field(name="Current", value=round_name, inline=True)
 
             await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="migrateseasons", description="[ADMIN] ONE-TIME: Migrate to new season cycle (offseason at end)")
+    async def migrate_seasons(self, interaction: discord.Interaction):
+        """
+        One-time migration to change season cycle so offseason happens at END of season.
+        Run this during offseason BEFORE starting new season.
+        """
+        await interaction.response.defer(ephemeral=True)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            try:
+                # Get current offseason season (under old system, this is the NEXT season's offseason)
+                cursor = await db.execute(
+                    "SELECT season_id, season_number FROM seasons WHERE status = 'offseason'"
+                )
+                offseason_result = await cursor.fetchone()
+
+                if not offseason_result:
+                    await interaction.followup.send("❌ No offseason season found! Migration may have already run or database is in unexpected state.")
+                    return
+
+                offseason_id, offseason_num = offseason_result
+
+                # Get the completed season (this is the season that just ended)
+                cursor = await db.execute(
+                    "SELECT season_id, season_number FROM seasons WHERE status = 'completed' ORDER BY season_number DESC LIMIT 1"
+                )
+                completed_result = await cursor.fetchone()
+
+                if not completed_result:
+                    await interaction.followup.send("❌ No completed season found! Cannot determine which season just ended.")
+                    return
+
+                completed_id, completed_num = completed_result
+
+                # Verify the offseason is numbered one after completed
+                if offseason_num != completed_num + 1:
+                    await interaction.followup.send(
+                        f"❌ Unexpected season numbering! Completed season is {completed_num}, offseason is {offseason_num}. "
+                        f"Expected offseason to be {completed_num + 1}."
+                    )
+                    return
+
+                # THE MIGRATION:
+                # 1. Change current "offseason X" to "future X" (it's really the NEXT season, not an offseason)
+                # 2. Change "completed X-1" to "offseason X-1" (it's really in its offseason period)
+
+                await db.execute(
+                    "UPDATE seasons SET status = 'future' WHERE season_id = ?",
+                    (offseason_id,)
+                )
+
+                await db.execute(
+                    "UPDATE seasons SET status = 'offseason', round_name = 'Offseason' WHERE season_id = ?",
+                    (completed_id,)
+                )
+
+                await db.commit()
+
+                await interaction.followup.send(
+                    f"✅ **Season Cycle Migration Complete!**\n\n"
+                    f"**Changes:**\n"
+                    f"• Season {completed_num}: 'completed' → 'offseason'\n"
+                    f"• Season {offseason_num}: 'offseason' → 'future'\n\n"
+                    f"**New System:**\n"
+                    f"• You are now in **Offseason {completed_num}**\n"
+                    f"• Free agents with contract_expiry = {completed_num} will be available\n"
+                    f"• When you run `/startseason`, Season {offseason_num} will begin\n\n"
+                    f"⚠️ **IMPORTANT:** Do NOT run this command again!"
+                )
+
+            except Exception as e:
+                await interaction.followup.send(f"❌ Migration failed: {e}")
 
 
 async def setup(bot):
