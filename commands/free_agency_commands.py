@@ -101,7 +101,7 @@ class FreeAgencyCommands(commands.Cog):
 
     async def calculate_free_resign_allowance(self, db, team_id, current_season):
         """Calculate how many free re-signs a team gets based on their free agents
-        Formula: 0.5 per Band 1 player + 0.25 per Band 2 player, rounded down (0.5 rounds to 0)"""
+        Formula: 0.5 per Band 1 player + 0.25 per Band 2 player, rounded to nearest (0.5 rounds down)"""
         # Get all free agents for this team
         cursor = await db.execute(
             """SELECT p.player_id, p.age, p.overall_rating
@@ -119,8 +119,15 @@ class FreeAgencyCommands(commands.Cog):
             elif band == 2:
                 credits += 0.25
 
-        # Round down (0.5 becomes 0, 1.5 becomes 1, etc.)
-        return int(credits)
+        # Round to nearest whole number, with 0.5 rounding down
+        # Examples: 0.5→0, 0.51→1, 1.25→1, 1.5→1, 1.75→2, 2.5→2
+        import math
+        if credits % 1 == 0.5:
+            # Exactly 0.5, round down
+            return int(credits)
+        else:
+            # Otherwise, round to nearest
+            return round(credits)
 
     async def process_free_resigns(self, db, period_id, current_season):
         """Process all confirmed free re-signs and assign contracts"""
