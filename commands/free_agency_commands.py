@@ -587,11 +587,18 @@ class FreeAgencyCommands(commands.Cog):
 
                 # Send notifications to eligible teams
                 notifications_sent = 0
+                debug_info = []  # For debugging
+
                 for team_id, team_name, channel_id in teams_with_fas:
                     # Calculate how many free re-signs this team gets
                     allowance = await self.calculate_free_resign_allowance(db, team_id, current_season)
+                    debug_info.append(f"{team_name}: allowance={allowance}, channel_id={channel_id}")
 
-                    if allowance > 0 and channel_id:
+                    if allowance > 0:
+                        if not channel_id:
+                            debug_info.append(f"  → Skipped (no channel)")
+                            continue
+
                         # Get the team's free agents
                         cursor = await db.execute(
                             """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating
@@ -632,16 +639,24 @@ class FreeAgencyCommands(commands.Cog):
                             if channel:
                                 await channel.send(embed=embed, view=view)
                                 notifications_sent += 1
+                                debug_info.append(f"  → Sent notification")
+                            else:
+                                debug_info.append(f"  → Channel not found (ID: {channel_id})")
                         except Exception as e:
+                            debug_info.append(f"  → Error: {e}")
                             print(f"Error sending notification to {team_name}: {e}")
 
-                await interaction.followup.send(
+                # Build response with debug info
+                response = (
                     f"✅ **Free Re-Sign Period Started!**\n\n"
                     f"Season: {current_season}\n"
                     f"Free Agents: {fa_count}\n"
                     f"Notifications sent: {notifications_sent} teams with free re-sign allowances\n\n"
+                    f"**Debug Info:**\n" + "\n".join(debug_info[:20]) + "\n\n"  # Limit to first 20 teams
                     f"Once all teams have confirmed their free re-signs, you can start the bidding period."
                 )
+
+                await interaction.followup.send(response)
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
