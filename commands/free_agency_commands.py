@@ -243,6 +243,7 @@ class FreeAgencyCommands(commands.Cog):
         """Log winning bids to auctions channel"""
         log_channel = await self.get_auctions_log_channel(db)
         if not log_channel:
+            print("No auctions log channel configured")
             return
 
         # Get all winning bids
@@ -266,8 +267,8 @@ class FreeAgencyCommands(commands.Cog):
 
         # Build embed
         embed = discord.Embed(
-            title="🔨 Winning Bids - Matching Period",
-            description=f"**Season {current_season}** - {len(winning_bids)} player{'s' if len(winning_bids) != 1 else ''} with winning bids",
+            title=f"Season {current_season} Auctions - Matching Period",
+            description="**Winning bids:**",
             color=discord.Color.gold()
         )
 
@@ -322,47 +323,19 @@ class FreeAgencyCommands(commands.Cog):
             remaining_points = team_points.get(orig_team_id, 0)
 
             if remaining_points >= match_cost:
-                match_status = f"**Pending Match** ({match_cost}pts)"
+                match_text = f"({orig_emoji_str}can match {match_cost}pts)"
             else:
-                match_status = "**Can't Match**"
+                match_text = f"({orig_emoji_str}can't afford to match)"
 
             rfa_tag = " [RFA]" if is_rfa else ""
             player_lines.append(
-                f"**{name}**{rfa_tag} ({pos}, {age}, {ovr})\n"
-                f"├ From: {orig_emoji_str}{orig_team}\n"
-                f"├ To: {bid_emoji_str}{bid_team}\n"
-                f"└ Bid: {winning_bid}pts - {match_status}"
+                f"{orig_emoji_str}**{name}**{rfa_tag} ({pos}, {age}, {ovr})\n"
+                f"Winning bid: {bid_emoji_str}{winning_bid}pts {match_text}"
             )
 
-        # Discord has a 1024 character limit per field, so split if needed
+        # Add all bids as one long field (no splitting needed - much more compact now)
         if player_lines:
-            current_field = []
-            current_length = 0
-            field_num = 1
-
-            for line in player_lines:
-                line_length = len(line) + 1  # +1 for newline
-                if current_length + line_length > 1000 and current_field:  # Leave some buffer
-                    # Add current field
-                    embed.add_field(
-                        name=f"Bids (Part {field_num})" if field_num > 1 else "Bids",
-                        value="\n".join(current_field),
-                        inline=False
-                    )
-                    current_field = []
-                    current_length = 0
-                    field_num += 1
-
-                current_field.append(line)
-                current_length += line_length
-
-            # Add remaining
-            if current_field:
-                embed.add_field(
-                    name=f"Bids (Part {field_num})" if field_num > 1 else "Bids",
-                    value="\n".join(current_field),
-                    inline=False
-                )
+            embed.description += "\n\n" + "\n\n".join(player_lines)
 
         try:
             await log_channel.send(embed=embed)
@@ -373,6 +346,7 @@ class FreeAgencyCommands(commands.Cog):
         """Log final player movements and compensation picks to auctions channel"""
         log_channel = await self.get_auctions_log_channel(db)
         if not log_channel:
+            print("No auctions log channel configured for final movements")
             return
 
         # Get all results
@@ -510,9 +484,13 @@ class FreeAgencyCommands(commands.Cog):
             )
 
         try:
+            print(f"Attempting to log final movements to channel {log_channel.id}")
             await log_channel.send(embed=embed)
+            print("Final movements logged successfully")
         except Exception as e:
             print(f"Error logging final movements: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _split_field_content(self, lines, field_name):
         """Split content into multiple fields if it exceeds Discord's limit"""
