@@ -280,6 +280,7 @@ class AdminCommands(commands.Cog):
         delist_log_channel="Channel where player delistings are logged",
         trade_approval_channel="Channel where trades are sent for moderator approval",
         trade_log_channel="Channel where approved trades are announced",
+        auctions_log_channel="Channel where free agency auction results are logged",
         season_1_year="Calendar year of Season 1 (for player aging)"
     )
     async def config(
@@ -289,15 +290,17 @@ class AdminCommands(commands.Cog):
         delist_log_channel: discord.TextChannel = None,
         trade_approval_channel: discord.TextChannel = None,
         trade_log_channel: discord.TextChannel = None,
+        auctions_log_channel: discord.TextChannel = None,
         season_1_year: int = None
     ):
         # If no parameters provided, show current settings
-        if all(ch is None for ch in [lineups_channel, delist_log_channel, trade_approval_channel, trade_log_channel, season_1_year]):
+        if all(ch is None for ch in [lineups_channel, delist_log_channel, trade_approval_channel, trade_log_channel, auctions_log_channel, season_1_year]):
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
                     """SELECT setting_key, setting_value FROM settings
                        WHERE setting_key IN ('lineups_channel_id', 'delist_log_channel_id',
-                                             'trade_approval_channel_id', 'trade_log_channel_id', 'season_1_year')"""
+                                             'trade_approval_channel_id', 'trade_log_channel_id',
+                                             'auctions_log_channel_id', 'season_1_year')"""
                 )
                 results = await cursor.fetchall()
 
@@ -336,6 +339,14 @@ class AdminCommands(commands.Cog):
             else:
                 channel_display = "*Not set*"
             embed.add_field(name="Trade Log Channel", value=channel_display, inline=False)
+
+            # Auctions Log Channel
+            if 'auctions_log_channel_id' in settings and settings['auctions_log_channel_id']:
+                channel = interaction.guild.get_channel(int(settings['auctions_log_channel_id']))
+                channel_display = channel.mention if channel else f"<#{settings['auctions_log_channel_id']}> (channel not found)"
+            else:
+                channel_display = "*Not set*"
+            embed.add_field(name="Auctions Log Channel", value=channel_display, inline=False)
 
             # Season 1 Year
             if 'season_1_year' in settings and settings['season_1_year']:
@@ -379,6 +390,13 @@ class AdminCommands(commands.Cog):
                     ("trade_log_channel_id", str(trade_log_channel.id))
                 )
                 updates.append(f"Trade Log Channel → {trade_log_channel.mention}")
+
+            if auctions_log_channel:
+                await db.execute(
+                    "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
+                    ("auctions_log_channel_id", str(auctions_log_channel.id))
+                )
+                updates.append(f"Auctions Log Channel → {auctions_log_channel.mention}")
 
             if season_1_year is not None:
                 await db.execute(

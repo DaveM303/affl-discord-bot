@@ -74,6 +74,19 @@ class FreeAgencyCommands(commands.Cog):
         except:
             return []
 
+    async def get_auctions_log_channel(self, db):
+        """Get the auctions log channel from settings"""
+        cursor = await db.execute(
+            "SELECT setting_value FROM settings WHERE setting_key = 'auctions_log_channel_id'"
+        )
+        result = await cursor.fetchone()
+        if result and result[0]:
+            try:
+                return self.bot.get_channel(int(result[0]))
+            except:
+                return None
+        return None
+
     async def get_contract_years_for_age(self, db, age):
         """Get contract years based on player age from contract_config table"""
         cursor = await db.execute(
@@ -157,6 +170,376 @@ class FreeAgencyCommands(commands.Cog):
             )
 
         await db.commit()
+
+    async def log_free_resign_results(self, db, period_id, current_season):
+        """Log free re-sign results to auctions channel"""
+        log_channel = await self.get_auctions_log_channel(db)
+        if not log_channel:
+            return
+
+        # Get all confirmed free re-signs
+        cursor = await db.execute(
+            """SELECT p.name, p.position, p.age, p.overall_rating, t.team_name, t.emoji_id, p.contract_expiry
+               FROM free_agency_resigns r
+               JOIN players p ON r.player_id = p.player_id
+               JOIN teams t ON p.team_id = t.team_id
+               WHERE r.period_id = ? AND r.confirmed = 1
+               ORDER BY t.team_name, p.name""",
+            (period_id,)
+        )
+        resigns = await cursor.fetchall()
+
+        if not resigns:
+            return
+
+        # Build embed
+        embed = discord.Embed(
+            title="📝 Free Re-Signs Completed",
+            description=f"**Season {current_season}** - {len(resigns)} player{'s' if len(resigns) != 1 else ''} re-signed for free",
+            color=discord.Color.blue()
+        )
+
+        # Group by team
+        teams_dict = {}
+        for name, pos, age, ovr, team_name, emoji_id, contract_expiry in resigns:
+            if team_name not in teams_dict:
+                teams_dict[team_name] = {
+                    'emoji_id': emoji_id,
+                    'players': []
+                }
+            teams_dict[team_name]['players'].append((name, pos, age, ovr, contract_expiry))
+
+        # Add field for each team
+        for team_name in sorted(teams_dict.keys()):
+            team_data = teams_dict[team_name]
+
+            # Get emoji
+            emoji_str = ""
+            if team_data['emoji_id']:
+                try:
+                    emoji = self.bot.get_emoji(int(team_data['emoji_id']))
+                    if emoji:
+                        emoji_str = f"{emoji} "
+                except:
+                    pass
+
+            player_lines = []
+            for name, pos, age, ovr, contract_expiry in team_data['players']:
+                contract_years = contract_expiry - current_season
+                player_lines.append(f"**{name}** ({pos}, {age}, {ovr}) - {contract_years}yr contract")
+
+            embed.add_field(
+                name=f"{emoji_str}{team_name}",
+                value="\n".join(player_lines),
+                inline=False
+            )
+
+        try:
+            await log_channel.send(embed=embed)
+        except Exception as e:
+            print(f"Error logging free re-sign results: {e}")
+
+    async def log_winning_bids(self, db, period_id, current_season):
+        """Log winning bids to auctions channel"""
+        log_channel = await self.get_auctions_log_channel(db)
+        if not log_channel:
+            return
+
+        # Get all winning bids
+        cursor = await db.execute(
+            """SELECT p.name, p.position, p.age, p.overall_rating,
+                      orig_team.team_name as original_team, orig_team.emoji_id as orig_emoji,
+                      bid_team.team_name as bidding_team, bid_team.emoji_id as bid_emoji,
+                      r.winning_bid
+               FROM free_agency_results r
+               JOIN players p ON r.player_id = p.player_id
+               JOIN teams orig_team ON r.original_team_id = orig_team.team_id
+               LEFT JOIN teams bid_team ON r.winning_team_id = bid_team.team_id
+               WHERE r.period_id = ? AND r.winning_team_id IS NOT NULL
+               ORDER BY r.winning_bid DESC, p.name""",
+            (period_id,)
+        )
+        winning_bids = await cursor.fetchall()
+
+        if not winning_bids:
+            return
+
+        # Build embed
+        embed = discord.Embed(
+            title="🔨 Winning Bids - Matching Period",
+            description=f"**Season {current_season}** - {len(winning_bids)} player{'s' if len(winning_bids) != 1 else ''} with winning bids",
+            color=discord.Color.gold()
+        )
+
+        # Calculate team points for match checking
+        cursor = await db.execute(
+            """SELECT team_id FROM teams"""
+        )
+        all_teams = await cursor.fetchall()
+
+        team_points = {}
+        for (team_id,) in all_teams:
+            # Calculate spent points
+            cursor = await db.execute(
+                """SELECT COALESCE(SUM(bid_amount), 0) FROM free_agency_bids
+                   WHERE period_id = ? AND team_id = ? AND status = 'active'""",
+                (period_id, team_id)
+            )
+            spent = (await cursor.fetchone())[0]
+            team_points[team_id] = 300 - spent
+
+        player_lines = []
+        for name, pos, age, ovr, orig_team, orig_emoji, bid_team, bid_emoji, winning_bid in winning_bids:
+            # Get emojis
+            orig_emoji_str = ""
+            if orig_emoji:
+                try:
+                    emoji = self.bot.get_emoji(int(orig_emoji))
+                    if emoji:
+                        orig_emoji_str = f"{emoji} "
+                except:
+                    pass
+
+            bid_emoji_str = ""
+            if bid_emoji:
+                try:
+                    emoji = self.bot.get_emoji(int(bid_emoji))
+                    if emoji:
+                        bid_emoji_str = f"{emoji} "
+                except:
+                    pass
+
+            # Check if RFA (can match at 80%)
+            is_rfa = age <= 25
+            match_cost = round(winning_bid * 0.8) if is_rfa else winning_bid
+
+            # Determine if team can match
+            cursor = await db.execute(
+                "SELECT team_id FROM teams WHERE team_name = ?",
+                (orig_team,)
+            )
+            orig_team_id = (await cursor.fetchone())[0]
+            remaining_points = team_points.get(orig_team_id, 0)
+
+            if remaining_points >= match_cost:
+                match_status = f"**Pending Match** ({match_cost}pts)"
+            else:
+                match_status = "**Can't Match**"
+
+            rfa_tag = " [RFA]" if is_rfa else ""
+            player_lines.append(
+                f"**{name}**{rfa_tag} ({pos}, {age}, {ovr})\n"
+                f"├ From: {orig_emoji_str}{orig_team}\n"
+                f"├ To: {bid_emoji_str}{bid_team}\n"
+                f"└ Bid: {winning_bid}pts - {match_status}"
+            )
+
+        # Discord has a 1024 character limit per field, so split if needed
+        if player_lines:
+            current_field = []
+            current_length = 0
+            field_num = 1
+
+            for line in player_lines:
+                line_length = len(line) + 1  # +1 for newline
+                if current_length + line_length > 1000 and current_field:  # Leave some buffer
+                    # Add current field
+                    embed.add_field(
+                        name=f"Bids (Part {field_num})" if field_num > 1 else "Bids",
+                        value="\n".join(current_field),
+                        inline=False
+                    )
+                    current_field = []
+                    current_length = 0
+                    field_num += 1
+
+                current_field.append(line)
+                current_length += line_length
+
+            # Add remaining
+            if current_field:
+                embed.add_field(
+                    name=f"Bids (Part {field_num})" if field_num > 1 else "Bids",
+                    value="\n".join(current_field),
+                    inline=False
+                )
+
+        try:
+            await log_channel.send(embed=embed)
+        except Exception as e:
+            print(f"Error logging winning bids: {e}")
+
+    async def log_final_movements(self, db, period_id, current_season):
+        """Log final player movements and compensation picks to auctions channel"""
+        log_channel = await self.get_auctions_log_channel(db)
+        if not log_channel:
+            return
+
+        # Get all results
+        cursor = await db.execute(
+            """SELECT p.name, p.position, p.age, p.overall_rating, p.contract_expiry,
+                      orig_team.team_name as original_team, orig_team.emoji_id as orig_emoji,
+                      new_team.team_name as new_team, new_team.emoji_id as new_emoji,
+                      r.winning_bid, r.matched, r.compensation_band
+               FROM free_agency_results r
+               JOIN players p ON r.player_id = p.player_id
+               JOIN teams orig_team ON r.original_team_id = orig_team.team_id
+               LEFT JOIN teams new_team ON r.winning_team_id = new_team.team_id
+               WHERE r.period_id = ?
+               ORDER BY
+                   CASE
+                       WHEN r.winning_team_id IS NULL THEN 3
+                       WHEN r.matched THEN 2
+                       ELSE 1
+                   END,
+                   r.winning_bid DESC,
+                   p.name""",
+            (period_id,)
+        )
+        all_results = await cursor.fetchall()
+
+        if not all_results:
+            return
+
+        # Build embed
+        embed = discord.Embed(
+            title="✅ Free Agency Completed - Final Movements",
+            description=f"**Season {current_season}** - All player movements finalized",
+            color=discord.Color.green()
+        )
+
+        # Group results by category
+        transfers = []
+        matches = []
+        resignings = []
+
+        for name, pos, age, ovr, contract_expiry, orig_team, orig_emoji, new_team, new_emoji, winning_bid, matched, comp_band in all_results:
+            contract_years = contract_expiry - current_season
+
+            # Get emojis
+            orig_emoji_str = ""
+            if orig_emoji:
+                try:
+                    emoji = self.bot.get_emoji(int(orig_emoji))
+                    if emoji:
+                        orig_emoji_str = f"{emoji} "
+                except:
+                    pass
+
+            new_emoji_str = ""
+            if new_emoji:
+                try:
+                    emoji = self.bot.get_emoji(int(new_emoji))
+                    if emoji:
+                        new_emoji_str = f"{emoji} "
+                except:
+                    pass
+
+            is_rfa = age <= 25
+            rfa_tag = " [RFA]" if is_rfa else ""
+
+            if new_team is None:
+                # No bids - auto re-signed
+                resignings.append(
+                    f"**{name}**{rfa_tag} ({pos}, {age}, {ovr}) - {orig_emoji_str}{orig_team} - {contract_years}yr"
+                )
+            elif matched:
+                # Matched
+                match_cost = round(winning_bid * 0.8) if is_rfa else winning_bid
+                matches.append(
+                    f"**{name}**{rfa_tag} ({pos}, {age}, {ovr})\n"
+                    f"├ {orig_emoji_str}{orig_team} matched {new_emoji_str}{new_team}'s bid ({match_cost}pts)\n"
+                    f"└ {contract_years}yr contract"
+                )
+            else:
+                # Transferred
+                comp_text = f" • Band {comp_band} comp" if comp_band else ""
+                transfers.append(
+                    f"**{name}**{rfa_tag} ({pos}, {age}, {ovr})\n"
+                    f"├ {orig_emoji_str}{orig_team} → {new_emoji_str}{new_team}\n"
+                    f"└ {winning_bid}pts • {contract_years}yr{comp_text}"
+                )
+
+        # Add fields for each category
+        if transfers:
+            # Split if too long
+            transfer_chunks = self._split_field_content(transfers, "Transfers")
+            for name, value in transfer_chunks:
+                embed.add_field(name=name, value=value, inline=False)
+
+        if matches:
+            match_chunks = self._split_field_content(matches, "Matched")
+            for name, value in match_chunks:
+                embed.add_field(name=name, value=value, inline=False)
+
+        if resignings:
+            resign_chunks = self._split_field_content(resignings, "Auto Re-Signed (No Bids)")
+            for name, value in resign_chunks:
+                embed.add_field(name=name, value=value, inline=False)
+
+        # Add compensation summary
+        cursor = await db.execute(
+            """SELECT t.team_name, t.emoji_id, r.compensation_band, p.name
+               FROM free_agency_results r
+               JOIN teams t ON r.original_team_id = t.team_id
+               JOIN players p ON r.player_id = p.player_id
+               WHERE r.period_id = ? AND r.compensation_band IS NOT NULL
+               ORDER BY r.compensation_band, t.team_name""",
+            (period_id,)
+        )
+        comp_picks = await cursor.fetchall()
+
+        if comp_picks:
+            comp_lines = []
+            for team_name, emoji_id, band, player_name in comp_picks:
+                emoji_str = ""
+                if emoji_id:
+                    try:
+                        emoji = self.bot.get_emoji(int(emoji_id))
+                        if emoji:
+                            emoji_str = f"{emoji} "
+                    except:
+                        pass
+
+                comp_lines.append(f"{emoji_str}**{team_name}**: Band {band} (lost {player_name})")
+
+            embed.add_field(
+                name="Compensation Picks",
+                value="\n".join(comp_lines),
+                inline=False
+            )
+
+        try:
+            await log_channel.send(embed=embed)
+        except Exception as e:
+            print(f"Error logging final movements: {e}")
+
+    def _split_field_content(self, lines, field_name):
+        """Split content into multiple fields if it exceeds Discord's limit"""
+        chunks = []
+        current_chunk = []
+        current_length = 0
+
+        for line in lines:
+            line_length = len(line) + 1  # +1 for newline
+            if current_length + line_length > 1000 and current_chunk:  # Leave buffer
+                # Add current chunk
+                chunk_num = len(chunks) + 1
+                name = f"{field_name} (Part {chunk_num})" if chunks else field_name
+                chunks.append((name, "\n".join(current_chunk)))
+                current_chunk = []
+                current_length = 0
+
+            current_chunk.append(line)
+            current_length += line_length
+
+        # Add remaining
+        if current_chunk:
+            chunk_num = len(chunks) + 1
+            name = f"{field_name} (Part {chunk_num})" if chunks else field_name
+            chunks.append((name, "\n".join(current_chunk)))
+
+        return chunks
 
     @app_commands.command(name="viewfreeagents", description="View players whose contracts expire this season")
     @app_commands.describe(team="Filter by team (optional)")
@@ -741,6 +1124,9 @@ class FreeAgencyCommands(commands.Cog):
                         # First, process the free re-signs
                         await self.process_free_resigns(db, period_id, current_season)
 
+                        # Log free re-sign results
+                        await self.log_free_resign_results(db, period_id, current_season)
+
                         # Update period status to bidding
                         await db.execute(
                             """UPDATE free_agency_periods
@@ -903,6 +1289,9 @@ class FreeAgencyCommands(commands.Cog):
                     (period_id,)
                 )
                 await db.commit()
+
+                # Log winning bids
+                await self.log_winning_bids(db, period_id, current_season)
 
                 # Send matching interface to teams with winning bids on their players
                 cursor = await db.execute(
@@ -1212,6 +1601,9 @@ class FreeAgencyCommands(commands.Cog):
                             picks_inserted += 1
 
                 await db.commit()
+
+                # Log final movements and compensation
+                await self.log_final_movements(db, period_id, current_season)
 
                 # Build summary message with compensation pick details if any were awarded
                 message = (
