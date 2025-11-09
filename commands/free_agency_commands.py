@@ -983,7 +983,7 @@ class FreeAgencyCommands(commands.Cog):
                         embed.set_footer(text="Use the button below to select which players to re-sign for free.")
 
                         # Create view with button to open selection UI
-                        view = FreeResignButtonView(period_id, team_id, allowance)
+                        view = FreeResignButtonView(self.bot, period_id, team_id, allowance)
 
                         try:
                             channel = self.bot.get_channel(int(channel_id))
@@ -2470,8 +2470,9 @@ class AuctionsMenuView(discord.ui.View):
 
 class FreeResignButtonView(discord.ui.View):
     """Simple view with a button to open the free re-sign selection interface"""
-    def __init__(self, period_id, team_id, allowance):
+    def __init__(self, bot, period_id, team_id, allowance):
         super().__init__(timeout=None)
+        self.bot = bot
         self.period_id = period_id
         self.team_id = team_id
         self.allowance = allowance
@@ -2518,7 +2519,7 @@ class FreeResignButtonView(discord.ui.View):
 
                 # Create the selection view
                 view = FreeResignSelectionView(
-                    interaction.client, self.period_id, self.team_id, self.allowance,
+                    self.bot, self.period_id, self.team_id, self.allowance,
                     free_agents, selected_players, is_confirmed, current_season
                 )
                 embed = view.create_embed()
