@@ -281,6 +281,7 @@ class AdminCommands(commands.Cog):
         trade_approval_channel="Channel where trades are sent for moderator approval",
         trade_log_channel="Channel where approved trades are announced",
         auctions_log_channel="Channel where free agency auction results are logged",
+        bot_logs_channel="Channel where bot actions (bids, re-signs, matches) are logged",
         season_1_year="Calendar year of Season 1 (for player aging)"
     )
     async def config(
@@ -291,16 +292,17 @@ class AdminCommands(commands.Cog):
         trade_approval_channel: discord.TextChannel = None,
         trade_log_channel: discord.TextChannel = None,
         auctions_log_channel: discord.TextChannel = None,
+        bot_logs_channel: discord.TextChannel = None,
         season_1_year: int = None
     ):
         # If no parameters provided, show current settings
-        if all(ch is None for ch in [lineups_channel, delist_log_channel, trade_approval_channel, trade_log_channel, auctions_log_channel, season_1_year]):
+        if all(ch is None for ch in [lineups_channel, delist_log_channel, trade_approval_channel, trade_log_channel, auctions_log_channel, bot_logs_channel, season_1_year]):
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
                     """SELECT setting_key, setting_value FROM settings
                        WHERE setting_key IN ('lineups_channel_id', 'delist_log_channel_id',
                                              'trade_approval_channel_id', 'trade_log_channel_id',
-                                             'auctions_log_channel_id', 'season_1_year')"""
+                                             'auctions_log_channel_id', 'bot_logs_channel_id', 'season_1_year')"""
                 )
                 results = await cursor.fetchall()
 
@@ -347,6 +349,14 @@ class AdminCommands(commands.Cog):
             else:
                 channel_display = "*Not set*"
             embed.add_field(name="Auctions Log Channel", value=channel_display, inline=False)
+
+            # Bot Logs Channel
+            if 'bot_logs_channel_id' in settings and settings['bot_logs_channel_id']:
+                channel = interaction.guild.get_channel(int(settings['bot_logs_channel_id']))
+                channel_display = channel.mention if channel else f"<#{settings['bot_logs_channel_id']}> (channel not found)"
+            else:
+                channel_display = "*Not set*"
+            embed.add_field(name="Bot Logs Channel", value=channel_display, inline=False)
 
             # Season 1 Year
             if 'season_1_year' in settings and settings['season_1_year']:
@@ -397,6 +407,13 @@ class AdminCommands(commands.Cog):
                     ("auctions_log_channel_id", str(auctions_log_channel.id))
                 )
                 updates.append(f"Auctions Log Channel → {auctions_log_channel.mention}")
+
+            if bot_logs_channel:
+                await db.execute(
+                    "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
+                    ("bot_logs_channel_id", str(bot_logs_channel.id))
+                )
+                updates.append(f"Bot Logs Channel → {bot_logs_channel.mention}")
 
             if season_1_year is not None:
                 await db.execute(
@@ -1048,13 +1065,15 @@ class AdminCommands(commands.Cog):
                     """SELECT period_id as Period_ID, season_number as Season_Number,
                               status as Status, auction_points as Auction_Points,
                               started_at as Started_At,
+                              resign_started_at as Resign_Started_At,
+                              bidding_started_at as Bidding_Started_At,
                               bidding_ended_at as Bidding_Ended_At,
                               matching_ended_at as Matching_Ended_At
                        FROM free_agency_periods
                        ORDER BY season_number DESC"""
                 )
                 free_agency_periods = await cursor.fetchall()
-                free_agency_periods_df = pd.DataFrame(free_agency_periods, columns=['Period_ID', 'Season_Number', 'Status', 'Auction_Points', 'Started_At', 'Bidding_Ended_At', 'Matching_Ended_At'])
+                free_agency_periods_df = pd.DataFrame(free_agency_periods, columns=['Period_ID', 'Season_Number', 'Status', 'Auction_Points', 'Started_At', 'Resign_Started_At', 'Bidding_Started_At', 'Bidding_Ended_At', 'Matching_Ended_At'])
                 free_agency_periods_df = free_agency_periods_df.fillna('')
 
                 # Export Free Agency Bids
@@ -1071,6 +1090,37 @@ class AdminCommands(commands.Cog):
                 free_agency_bids = await cursor.fetchall()
                 free_agency_bids_df = pd.DataFrame(free_agency_bids, columns=['Bid_ID', 'Period_ID', 'Team', 'Player', 'Bid_Amount', 'Status', 'Placed_At'])
                 free_agency_bids_df = free_agency_bids_df.fillna('')
+
+                # Export Free Agency Re-Signs
+                cursor = await db.execute(
+                    """SELECT far.resign_id as Resign_ID, far.period_id as Period_ID,
+                              t.team_name as Team, p.name as Player,
+                              far.confirmed as Confirmed, far.confirmed_at as Confirmed_At
+                       FROM free_agency_resigns far
+                       JOIN teams t ON far.team_id = t.team_id
+                       JOIN players p ON far.player_id = p.player_id
+                       ORDER BY far.period_id DESC, far.confirmed_at DESC"""
+                )
+                free_agency_resigns = await cursor.fetchall()
+                free_agency_resigns_df = pd.DataFrame(free_agency_resigns, columns=['Resign_ID', 'Period_ID', 'Team', 'Player', 'Confirmed', 'Confirmed_At'])
+                free_agency_resigns_df = free_agency_resigns_df.fillna('')
+
+                # Export Free Agency Results
+                cursor = await db.execute(
+                    """SELECT far.result_id as Result_ID, far.period_id as Period_ID,
+                              p.name as Player, orig.team_name as Original_Team,
+                              win.team_name as Winning_Team, far.winning_bid as Winning_Bid,
+                              far.matched as Matched, far.compensation_band as Compensation_Band,
+                              far.confirmed_at as Confirmed_At
+                       FROM free_agency_results far
+                       JOIN players p ON far.player_id = p.player_id
+                       JOIN teams orig ON far.original_team_id = orig.team_id
+                       LEFT JOIN teams win ON far.winning_team_id = win.team_id
+                       ORDER BY far.period_id DESC, far.result_id"""
+                )
+                free_agency_results = await cursor.fetchall()
+                free_agency_results_df = pd.DataFrame(free_agency_results, columns=['Result_ID', 'Period_ID', 'Player', 'Original_Team', 'Winning_Team', 'Winning_Bid', 'Matched', 'Compensation_Band', 'Confirmed_At'])
+                free_agency_results_df = free_agency_results_df.fillna('')
 
             # Create Excel file in memory
             output = io.BytesIO()
@@ -1092,6 +1142,8 @@ class AdminCommands(commands.Cog):
                 draft_picks_df.to_excel(writer, sheet_name='Draft_Picks', index=False)
                 free_agency_periods_df.to_excel(writer, sheet_name='Free_Agency_Periods', index=False)
                 free_agency_bids_df.to_excel(writer, sheet_name='Free_Agency_Bids', index=False)
+                free_agency_resigns_df.to_excel(writer, sheet_name='Free_Agency_Re-Signs', index=False)
+                free_agency_results_df.to_excel(writer, sheet_name='Free_Agency_Results', index=False)
 
                 # History/Read-only sheets
                 trades_df.to_excel(writer, sheet_name='Trades', index=False)
@@ -1935,20 +1987,22 @@ class AdminCommands(commands.Cog):
                             status = str(row['Status'])
                             auction_points = int(row['Auction_Points']) if pd.notna(row['Auction_Points']) else 300
                             started_at = str(row['Started_At']) if pd.notna(row['Started_At']) and row['Started_At'] else None
+                            resign_started_at = str(row['Resign_Started_At']) if pd.notna(row['Resign_Started_At']) and row['Resign_Started_At'] else None
+                            bidding_started_at = str(row['Bidding_Started_At']) if pd.notna(row['Bidding_Started_At']) and row['Bidding_Started_At'] else None
                             bidding_ended_at = str(row['Bidding_Ended_At']) if pd.notna(row['Bidding_Ended_At']) and row['Bidding_Ended_At'] else None
                             matching_ended_at = str(row['Matching_Ended_At']) if pd.notna(row['Matching_Ended_At']) and row['Matching_Ended_At'] else None
 
                             if period_id:
                                 await db.execute(
-                                    """INSERT INTO free_agency_periods (period_id, season_number, status, auction_points, started_at, bidding_ended_at, matching_ended_at)
-                                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                                    (period_id, season_number, status, auction_points, started_at, bidding_ended_at, matching_ended_at)
+                                    """INSERT INTO free_agency_periods (period_id, season_number, status, auction_points, started_at, resign_started_at, bidding_started_at, bidding_ended_at, matching_ended_at)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                    (period_id, season_number, status, auction_points, started_at, resign_started_at, bidding_started_at, bidding_ended_at, matching_ended_at)
                                 )
                             else:
                                 await db.execute(
-                                    """INSERT INTO free_agency_periods (season_number, status, auction_points, started_at, bidding_ended_at, matching_ended_at)
-                                       VALUES (?, ?, ?, ?, ?, ?)""",
-                                    (season_number, status, auction_points, started_at, bidding_ended_at, matching_ended_at)
+                                    """INSERT INTO free_agency_periods (season_number, status, auction_points, started_at, resign_started_at, bidding_started_at, bidding_ended_at, matching_ended_at)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                    (season_number, status, auction_points, started_at, resign_started_at, bidding_started_at, bidding_ended_at, matching_ended_at)
                                 )
                             free_agency_periods_imported += 1
                         except Exception as e:
@@ -1984,6 +2038,115 @@ class AdminCommands(commands.Cog):
                     if 'Worksheet Free_Agency_Bids' not in str(e):
                         errors.append(f"Free Agency Bids sheet error: {str(e)}")
 
+                # Import Free Agency Re-Signs
+                free_agency_resigns_imported = 0
+                try:
+                    free_agency_resigns_df = pd.read_excel(excel_file, sheet_name='Free_Agency_Re-Signs')
+
+                    # Clear existing free agency re-signs
+                    await db.execute("DELETE FROM free_agency_resigns")
+
+                    for _, row in free_agency_resigns_df.iterrows():
+                        try:
+                            if pd.isna(row['Resign_ID']) or not row['Resign_ID']:
+                                continue
+
+                            resign_id = int(row['Resign_ID'])
+                            period_id = int(row['Period_ID'])
+                            team_name = str(row['Team'])
+                            player_name = str(row['Player'])
+                            confirmed = int(row['Confirmed']) if pd.notna(row['Confirmed']) else 0
+                            confirmed_at = str(row['Confirmed_At']) if pd.notna(row['Confirmed_At']) and row['Confirmed_At'] else None
+
+                            # Get team_id and player_id from names
+                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
+                            team = await cursor.fetchone()
+                            if not team:
+                                errors.append(f"Free Agency Re-Sign: Team '{team_name}' not found")
+                                continue
+                            team_id = team[0]
+
+                            cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (player_name,))
+                            player = await cursor.fetchone()
+                            if not player:
+                                errors.append(f"Free Agency Re-Sign: Player '{player_name}' not found")
+                                continue
+                            player_id = player[0]
+
+                            await db.execute(
+                                """INSERT INTO free_agency_resigns (resign_id, period_id, team_id, player_id, confirmed, confirmed_at)
+                                   VALUES (?, ?, ?, ?, ?, ?)""",
+                                (resign_id, period_id, team_id, player_id, confirmed, confirmed_at)
+                            )
+                            free_agency_resigns_imported += 1
+
+                        except Exception as e:
+                            errors.append(f"Free Agency Re-Signs row: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Free_Agency_Re-Signs' not in str(e):
+                        errors.append(f"Free Agency Re-Signs sheet error: {str(e)}")
+
+                # Import Free Agency Results
+                free_agency_results_imported = 0
+                try:
+                    free_agency_results_df = pd.read_excel(excel_file, sheet_name='Free_Agency_Results')
+
+                    # Clear existing free agency results
+                    await db.execute("DELETE FROM free_agency_results")
+
+                    for _, row in free_agency_results_df.iterrows():
+                        try:
+                            if pd.isna(row['Result_ID']) or not row['Result_ID']:
+                                continue
+
+                            result_id = int(row['Result_ID'])
+                            period_id = int(row['Period_ID'])
+                            player_name = str(row['Player'])
+                            original_team_name = str(row['Original_Team'])
+                            winning_team_name = str(row['Winning_Team']) if pd.notna(row['Winning_Team']) and row['Winning_Team'] else None
+                            winning_bid = int(row['Winning_Bid']) if pd.notna(row['Winning_Bid']) and row['Winning_Bid'] else None
+                            matched = int(row['Matched']) if pd.notna(row['Matched']) else 0
+                            compensation_band = int(row['Compensation_Band']) if pd.notna(row['Compensation_Band']) and row['Compensation_Band'] else None
+                            confirmed_at = str(row['Confirmed_At']) if pd.notna(row['Confirmed_At']) and row['Confirmed_At'] else None
+
+                            # Get IDs from names
+                            cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (player_name,))
+                            player = await cursor.fetchone()
+                            if not player:
+                                errors.append(f"Free Agency Results: Player '{player_name}' not found")
+                                continue
+                            player_id = player[0]
+
+                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (original_team_name,))
+                            orig_team = await cursor.fetchone()
+                            if not orig_team:
+                                errors.append(f"Free Agency Results: Original team '{original_team_name}' not found")
+                                continue
+                            original_team_id = orig_team[0]
+
+                            winning_team_id = None
+                            if winning_team_name:
+                                cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (winning_team_name,))
+                                win_team = await cursor.fetchone()
+                                if win_team:
+                                    winning_team_id = win_team[0]
+
+                            await db.execute(
+                                """INSERT INTO free_agency_results
+                                   (result_id, period_id, player_id, original_team_id, winning_team_id, winning_bid, matched, compensation_band, confirmed_at)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (result_id, period_id, player_id, original_team_id, winning_team_id, winning_bid, matched, compensation_band, confirmed_at)
+                            )
+                            free_agency_results_imported += 1
+
+                        except Exception as e:
+                            errors.append(f"Free Agency Results row: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Free_Agency_Results' not in str(e):
+                        errors.append(f"Free Agency Results sheet error: {str(e)}")
+
             # Build response
             response = "✅ **Import Complete!**\n\n"
             response += f"**Teams:** {teams_added} added, {teams_updated} updated\n"
@@ -2016,6 +2179,10 @@ class AdminCommands(commands.Cog):
                 response += f"**Free Agency Periods:** {free_agency_periods_imported} imported\n"
             if free_agency_bids_imported > 0:
                 response += f"**Free Agency Bids:** {free_agency_bids_imported} imported\n"
+            if free_agency_resigns_imported > 0:
+                response += f"**Free Agency Re-Signs:** {free_agency_resigns_imported} imported\n"
+            if free_agency_results_imported > 0:
+                response += f"**Free Agency Results:** {free_agency_results_imported} imported\n"
 
             if duplicate_warnings:
                 response += f"\n⚠️ **{len(duplicate_warnings)} Duplicate Name Warning(s):**\n"

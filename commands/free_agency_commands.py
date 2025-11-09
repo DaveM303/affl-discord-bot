@@ -87,6 +87,19 @@ class FreeAgencyCommands(commands.Cog):
                 return None
         return None
 
+    async def get_bot_logs_channel(self, db):
+        """Get the bot logs channel from settings"""
+        cursor = await db.execute(
+            "SELECT setting_value FROM settings WHERE setting_key = 'bot_logs_channel_id'"
+        )
+        result = await cursor.fetchone()
+        if result and result[0]:
+            try:
+                return self.bot.get_channel(int(result[0]))
+            except:
+                return None
+        return None
+
     async def get_contract_years_for_age(self, db, age):
         """Get contract years based on player age from contract_config table"""
         cursor = await db.execute(
@@ -349,47 +362,35 @@ class FreeAgencyCommands(commands.Cog):
             print("No auctions log channel configured for final movements")
             return
 
-        # Get all results
+        # Get only players who moved clubs (not matched, has new team)
         cursor = await db.execute(
-            """SELECT p.name, p.position, p.age, p.overall_rating, p.contract_expiry,
+            """SELECT p.name, p.position, p.age, p.overall_rating,
                       orig_team.team_name as original_team, orig_team.emoji_id as orig_emoji,
                       new_team.team_name as new_team, new_team.emoji_id as new_emoji,
-                      r.winning_bid, r.matched, r.compensation_band
+                      r.compensation_band, r.compensation_pick_id
                FROM free_agency_results r
                JOIN players p ON r.player_id = p.player_id
                JOIN teams orig_team ON r.original_team_id = orig_team.team_id
                LEFT JOIN teams new_team ON r.winning_team_id = new_team.team_id
-               WHERE r.period_id = ?
-               ORDER BY
-                   CASE
-                       WHEN r.winning_team_id IS NULL THEN 3
-                       WHEN r.matched THEN 2
-                       ELSE 1
-                   END,
-                   r.winning_bid DESC,
-                   p.name""",
+               WHERE r.period_id = ? AND r.matched = 0 AND r.winning_team_id IS NOT NULL
+               ORDER BY p.name""",
             (period_id,)
         )
-        all_results = await cursor.fetchall()
+        transfers = await cursor.fetchall()
 
-        if not all_results:
+        if not transfers:
+            # No movements to log
             return
 
         # Build embed
         embed = discord.Embed(
-            title="✅ Free Agency Completed - Final Movements",
-            description=f"**Season {current_season}** - All player movements finalized",
+            title=f"Season {current_season} Free Agency Player Movements",
             color=discord.Color.green()
         )
 
-        # Group results by category
-        transfers = []
-        matches = []
-        resignings = []
-
-        for name, pos, age, ovr, contract_expiry, orig_team, orig_emoji, new_team, new_emoji, winning_bid, matched, comp_band in all_results:
-            contract_years = contract_expiry - current_season
-
+        # Build movement lines
+        movement_lines = []
+        for name, pos, age, ovr, orig_team, orig_emoji, new_team, new_emoji, comp_band, comp_pick_id in transfers:
             # Get emojis
             orig_emoji_str = ""
             if orig_emoji:
@@ -409,79 +410,30 @@ class FreeAgencyCommands(commands.Cog):
                 except:
                     pass
 
-            is_rfa = age <= 25
-            rfa_tag = " [RFA]" if is_rfa else ""
+            # Build player line
+            player_line = f"{orig_emoji_str}**{name}** ({pos}, {age}, {ovr}) → {new_emoji_str}{new_team}"
 
-            if new_team is None:
-                # No bids - auto re-signed
-                resignings.append(
-                    f"**{name}**{rfa_tag} ({pos}, {age}, {ovr}) - {orig_emoji_str}{orig_team} - {contract_years}yr"
+            # Add compensation line if applicable
+            if comp_band and comp_pick_id:
+                # Get pick number from draft_picks table
+                cursor = await db.execute(
+                    "SELECT pick_number FROM draft_picks WHERE pick_id = ?",
+                    (comp_pick_id,)
                 )
-            elif matched:
-                # Matched
-                match_cost = round(winning_bid * 0.8) if is_rfa else winning_bid
-                matches.append(
-                    f"**{name}**{rfa_tag} ({pos}, {age}, {ovr})\n"
-                    f"├ {orig_emoji_str}{orig_team} matched {new_emoji_str}{new_team}'s bid ({match_cost}pts)\n"
-                    f"└ {contract_years}yr contract"
-                )
-            else:
-                # Transferred
-                comp_text = f" • Band {comp_band} comp" if comp_band else ""
-                transfers.append(
-                    f"**{name}**{rfa_tag} ({pos}, {age}, {ovr})\n"
-                    f"├ {orig_emoji_str}{orig_team} → {new_emoji_str}{new_team}\n"
-                    f"└ {winning_bid}pts • {contract_years}yr{comp_text}"
-                )
+                pick_result = await cursor.fetchone()
+                if pick_result:
+                    pick_num = pick_result[0]
+                    comp_line = f"└ {orig_emoji_str}receive Band {comp_band} compensation (pick {pick_num})"
+                    player_line += f"\n{comp_line}"
 
-        # Add fields for each category
-        if transfers:
-            # Split if too long
-            transfer_chunks = self._split_field_content(transfers, "Transfers")
-            for name, value in transfer_chunks:
-                embed.add_field(name=name, value=value, inline=False)
+            movement_lines.append(player_line)
 
-        if matches:
-            match_chunks = self._split_field_content(matches, "Matched")
-            for name, value in match_chunks:
-                embed.add_field(name=name, value=value, inline=False)
-
-        if resignings:
-            resign_chunks = self._split_field_content(resignings, "Auto Re-Signed (No Bids)")
-            for name, value in resign_chunks:
-                embed.add_field(name=name, value=value, inline=False)
-
-        # Add compensation summary
-        cursor = await db.execute(
-            """SELECT t.team_name, t.emoji_id, r.compensation_band, p.name
-               FROM free_agency_results r
-               JOIN teams t ON r.original_team_id = t.team_id
-               JOIN players p ON r.player_id = p.player_id
-               WHERE r.period_id = ? AND r.compensation_band IS NOT NULL
-               ORDER BY r.compensation_band, t.team_name""",
-            (period_id,)
-        )
-        comp_picks = await cursor.fetchall()
-
-        if comp_picks:
-            comp_lines = []
-            for team_name, emoji_id, band, player_name in comp_picks:
-                emoji_str = ""
-                if emoji_id:
-                    try:
-                        emoji = self.bot.get_emoji(int(emoji_id))
-                        if emoji:
-                            emoji_str = f"{emoji} "
-                    except:
-                        pass
-
-                comp_lines.append(f"{emoji_str}**{team_name}**: Band {band} (lost {player_name})")
-
-            embed.add_field(
-                name="Compensation Picks",
-                value="\n".join(comp_lines),
-                inline=False
-            )
+        # Split into fields if needed
+        if movement_lines:
+            movement_chunks = self._split_field_content(movement_lines, "", max_length=1000)
+            for i, (field_name, value) in enumerate(movement_chunks):
+                # Use blank field name for all chunks to keep it clean
+                embed.add_field(name="\u200b" if i > 0 else "", value=value, inline=False)
 
         try:
             print(f"Attempting to log final movements to channel {log_channel.id}")
@@ -492,7 +444,7 @@ class FreeAgencyCommands(commands.Cog):
             import traceback
             traceback.print_exc()
 
-    def _split_field_content(self, lines, field_name):
+    def _split_field_content(self, lines, field_name, max_length=1000):
         """Split content into multiple fields if it exceeds Discord's limit"""
         chunks = []
         current_chunk = []
@@ -500,7 +452,7 @@ class FreeAgencyCommands(commands.Cog):
 
         for line in lines:
             line_length = len(line) + 1  # +1 for newline
-            if current_length + line_length > 1000 and current_chunk:  # Leave buffer
+            if current_length + line_length > max_length and current_chunk:  # Leave buffer
                 # Add current chunk
                 chunk_num = len(chunks) + 1
                 name = f"{field_name} (Part {chunk_num})" if chunks else field_name
@@ -741,6 +693,37 @@ class FreeAgencyCommands(commands.Cog):
                     action = "Placed"
 
                 await db.commit()
+
+                # Log to bot logs channel
+                log_channel = await self.get_bot_logs_channel(db)
+                if log_channel:
+                    # Get bidding team info
+                    cursor = await db.execute("SELECT team_name, emoji_id FROM teams WHERE team_id = ?", (user_team_id,))
+                    bidding_team_data = await cursor.fetchone()
+                    bidding_team_name = bidding_team_data[0] if bidding_team_data else "Unknown Team"
+                    bidding_emoji_id = bidding_team_data[1] if bidding_team_data and bidding_team_data[1] else None
+
+                    bidding_emoji_str = ""
+                    if bidding_emoji_id:
+                        try:
+                            emoji = self.bot.get_emoji(int(bidding_emoji_id))
+                            if emoji:
+                                bidding_emoji_str = f"{emoji} "
+                        except:
+                            pass
+
+                    # Get player's original team emoji
+                    original_emoji_str = ""
+                    if emoji_id:
+                        try:
+                            emoji = self.bot.get_emoji(int(emoji_id))
+                            if emoji:
+                                original_emoji_str = f"{emoji} "
+                        except:
+                            pass
+
+                    action_text = "updated their bid on" if existing_bid else "placed a bid on"
+                    await log_channel.send(f"💰 {bidding_emoji_str}**{bidding_team_name}** {action_text} {original_emoji_str}**{player_name}**: {amount}pts")
 
                 # Get emoji
                 emoji_str = ""
@@ -2069,6 +2052,32 @@ class MatchingView(discord.ui.View):
                     )
                 await db.commit()
 
+                # Log to bot logs channel
+                log_channel = await self.bot.get_cog('FreeAgencyCommands').get_bot_logs_channel(db)
+                if log_channel:
+                    # Get team info
+                    cursor = await db.execute("SELECT team_name, emoji_id FROM teams WHERE team_id = ?", (self.team_id,))
+                    team_data = await cursor.fetchone()
+                    team_name = team_data[0] if team_data else "Unknown Team"
+                    emoji_id = team_data[1] if team_data and team_data[1] else None
+
+                    emoji_str = ""
+                    if emoji_id:
+                        try:
+                            emoji = self.bot.get_emoji(int(emoji_id))
+                            if emoji:
+                                emoji_str = f"{emoji} "
+                        except:
+                            pass
+
+                    matched_count = sum(1 for m in self.matches.values() if m)
+                    let_go_count = len(self.matches) - matched_count
+
+                    await log_channel.send(
+                        f"✅ {emoji_str}**{team_name}** confirmed matches: "
+                        f"{matched_count} matched ({total_cost}pts), {let_go_count} let go"
+                    )
+
             # Mark as confirmed
             self.confirmed = True
 
@@ -2282,6 +2291,30 @@ class AuctionsMenuView(discord.ui.View):
                         (bid_id,)
                     )
                 await db.commit()
+
+                # Log to bot logs channel
+                log_channel = await self.bot.get_cog('FreeAgencyCommands').get_bot_logs_channel(db)
+                if log_channel:
+                    # Get team info
+                    cursor = await db.execute("SELECT team_name, emoji_id FROM teams WHERE team_id = ?", (self.team_id,))
+                    team_data = await cursor.fetchone()
+                    team_name = team_data[0] if team_data else "Unknown Team"
+                    emoji_id = team_data[1] if team_data and team_data[1] else None
+
+                    emoji_str = ""
+                    if emoji_id:
+                        try:
+                            emoji = self.bot.get_emoji(int(emoji_id))
+                            if emoji:
+                                emoji_str = f"{emoji} "
+                        except:
+                            pass
+
+                    # Get withdrawn bids for logging
+                    withdrawn_bids_temp = [b for b in self.bids if b[0] in selected_bid_ids]
+                    player_names_log = ", ".join(b[3] for b in withdrawn_bids_temp)
+
+                    await log_channel.send(f"🚫 {emoji_str}**{team_name}** withdrew bid(s): {player_names_log}")
 
             # Update view
             withdrawn_bids = [b for b in self.bids if b[0] in selected_bid_ids]
@@ -2600,6 +2633,37 @@ class FreeResignSelectionView(discord.ui.View):
                     (self.period_id, self.team_id)
                 )
                 await db.commit()
+
+                # Log to bot logs channel
+                log_channel = await self.bot.get_cog('FreeAgencyCommands').get_bot_logs_channel(db)
+                if log_channel:
+                    # Get team and player names
+                    cursor = await db.execute("SELECT team_name, emoji_id FROM teams WHERE team_id = ?", (self.team_id,))
+                    team_data = await cursor.fetchone()
+                    team_name = team_data[0] if team_data else "Unknown Team"
+                    emoji_id = team_data[1] if team_data and team_data[1] else None
+
+                    emoji_str = ""
+                    if emoji_id:
+                        try:
+                            emoji = self.bot.get_emoji(int(emoji_id))
+                            if emoji:
+                                emoji_str = f"{emoji} "
+                        except:
+                            pass
+
+                    if self.selected_players:
+                        player_names = []
+                        for player_id in self.selected_players:
+                            cursor = await db.execute("SELECT name FROM players WHERE player_id = ?", (player_id,))
+                            player = await cursor.fetchone()
+                            if player:
+                                player_names.append(player[0])
+
+                        players_str = ", ".join(player_names)
+                        await log_channel.send(f"✅ {emoji_str}**{team_name}** confirmed free re-signs: {players_str}")
+                    else:
+                        await log_channel.send(f"✅ {emoji_str}**{team_name}** confirmed 0 free re-signs")
 
             self.is_confirmed = True
 
