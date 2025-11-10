@@ -1955,8 +1955,12 @@ class AdminCommands(commands.Cog):
 
                     for _, row in contract_config_df.iterrows():
                         try:
+                            # Skip empty rows
+                            if pd.isna(row['Min_Age']) or row['Min_Age'] == '':
+                                continue
+
                             min_age = int(row['Min_Age'])
-                            max_age = int(row['Max_Age']) if pd.notna(row['Max_Age']) and row['Max_Age'] else None
+                            max_age = int(row['Max_Age']) if pd.notna(row['Max_Age']) and row['Max_Age'] != '' else None
                             contract_years = int(row['Contract_Years'])
 
                             await db.execute(

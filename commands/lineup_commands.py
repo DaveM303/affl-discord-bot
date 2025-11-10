@@ -344,10 +344,10 @@ class LineupCommands(commands.Cog):
                 )
                 return
 
-        # Check if it's offseason
+        # Check if it's offseason and get current season
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
-                "SELECT status FROM seasons WHERE status = 'offseason' LIMIT 1"
+                "SELECT season_number FROM seasons WHERE status = 'offseason' LIMIT 1"
             )
             season = await cursor.fetchone()
 
@@ -357,6 +357,8 @@ class LineupCommands(commands.Cog):
                     ephemeral=True
                 )
                 return
+
+            current_season = season[0]
 
             # Collect all player names
             player_names = [player1, player2, player3, player4, player5, player6, player7, player8]
@@ -387,10 +389,10 @@ class LineupCommands(commands.Cog):
 
                 player_id, full_name, position, rating, age = matches[0]
 
-                # Delist the player
+                # Delist the player (set team_id to NULL and contract_expiry to current season)
                 await db.execute(
-                    "UPDATE players SET team_id = NULL WHERE player_id = ?",
-                    (player_id,)
+                    "UPDATE players SET team_id = NULL, contract_expiry = ? WHERE player_id = ?",
+                    (current_season, player_id)
                 )
 
                 # Remove from lineups

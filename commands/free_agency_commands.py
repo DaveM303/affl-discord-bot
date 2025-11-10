@@ -723,7 +723,7 @@ class FreeAgencyCommands(commands.Cog):
                             pass
 
                     action_text = "updated their bid on" if existing_bid else "placed a bid on"
-                    await log_channel.send(f"💰 {bidding_emoji_str}**{bidding_team_name}** {action_text} {original_emoji_str}**{player_name}**: {amount}pts")
+                    await log_channel.send(f"💰 {bidding_emoji_str}**{bidding_team_name}** {action_text} {original_emoji_str}**{player_name}**: {amount}pts ({interaction.user.mention})")
 
                 # Get emoji
                 emoji_str = ""
@@ -1887,41 +1887,83 @@ class FreeAgencyCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
 
-    @app_commands.command(name="debugcompensation", description="[ADMIN] Debug compensation chart ranges for a specific age/OVR")
-    @app_commands.describe(age="Player age", ovr="Player OVR")
-    async def debug_compensation(self, interaction: discord.Interaction, age: int, ovr: int):
-        """Show all compensation ranges that match a specific age/OVR"""
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ This command requires administrator permissions.", ephemeral=True)
-            return
-
+    @app_commands.command(name="contractstatus", description="View contract expiry years for all players on a team")
+    @app_commands.describe(team="The team to view contracts for")
+    @app_commands.autocomplete(team=team_autocomplete)
+    async def contract_status(self, interaction: discord.Interaction, team: str):
+        """Display contract expiry years for all players on a team"""
         await interaction.response.defer(ephemeral=True)
 
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Get all ranges that match this age/OVR
+                # Get team info
                 cursor = await db.execute(
-                    """SELECT min_age, max_age, min_ovr, max_ovr, compensation_band
-                       FROM compensation_chart
-                       WHERE min_age <= ? AND COALESCE(max_age, min_age) >= ?
-                       AND min_ovr <= ? AND COALESCE(max_ovr, min_ovr) >= ?
-                       ORDER BY compensation_band ASC""",
-                    (age, age, ovr, ovr)
+                    "SELECT team_id, team_name FROM teams WHERE team_name = ?",
+                    (team,)
                 )
-                matches = await cursor.fetchall()
-
-                if not matches:
-                    await interaction.followup.send(f"❌ No compensation ranges found for age {age}, OVR {ovr}")
+                team_result = await cursor.fetchone()
+                if not team_result:
+                    await interaction.followup.send(f"❌ Team '{team}' not found!")
                     return
 
-                response = f"**Compensation Ranges for Age {age}, OVR {ovr}:**\n\n"
-                for min_age, max_age, min_ovr, max_ovr, band in matches:
-                    age_range = f"{min_age}" if max_age is None else f"{min_age}-{max_age}"
-                    ovr_range = f"{min_ovr}" if max_ovr is None else f"{min_ovr}-{max_ovr}"
-                    response += f"• **Band {band}**: Age {age_range}, OVR {ovr_range}\n"
+                team_id, team_name = team_result
 
-                response += f"\n**Result:** Band {matches[0][4]} (best match)"
-                await interaction.followup.send(response)
+                # Get all players grouped by contract expiry year
+                cursor = await db.execute(
+                    """SELECT contract_expiry, name, position, age, overall_rating
+                       FROM players
+                       WHERE team_id = ?
+                       ORDER BY contract_expiry ASC, overall_rating DESC, name""",
+                    (team_id,)
+                )
+                players = await cursor.fetchall()
+
+                if not players:
+                    await interaction.followup.send(f"❌ No players found for {team_name}!")
+                    return
+
+                # Group players by contract expiry year
+                players_by_year = {}
+                for contract_expiry, name, pos, age, ovr in players:
+                    if contract_expiry not in players_by_year:
+                        players_by_year[contract_expiry] = []
+                    players_by_year[contract_expiry].append(f"{name} ({pos}, {age}, {ovr})")
+
+                # Build response
+                embed = discord.Embed(
+                    title=f"📋 Contract Status - {team_name}",
+                    description=f"Players grouped by contract expiry year",
+                    color=discord.Color.blue()
+                )
+
+                for year in sorted(players_by_year.keys()):
+                    player_list = players_by_year[year]
+                    # Add field for each year
+                    field_value = "\n".join(player_list)
+                    # Discord has a 1024 character limit per field
+                    if len(field_value) > 1024:
+                        # Split into multiple fields if needed
+                        chunks = []
+                        current_chunk = []
+                        current_length = 0
+                        for player in player_list:
+                            if current_length + len(player) + 1 > 1024:
+                                chunks.append("\n".join(current_chunk))
+                                current_chunk = [player]
+                                current_length = len(player)
+                            else:
+                                current_chunk.append(player)
+                                current_length += len(player) + 1
+                        if current_chunk:
+                            chunks.append("\n".join(current_chunk))
+
+                        for i, chunk in enumerate(chunks):
+                            field_name = f"Season {year}" if i == 0 else f"Season {year} (cont.)"
+                            embed.add_field(name=field_name, value=chunk, inline=False)
+                    else:
+                        embed.add_field(name=f"Season {year}", value=field_value, inline=False)
+
+                await interaction.followup.send(embed=embed)
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
@@ -2360,7 +2402,7 @@ class MatchingView(discord.ui.View):
 
                     await log_channel.send(
                         f"✅ {emoji_str}**{team_name}** confirmed matches: "
-                        f"{matched_count} matched ({total_cost}pts), {let_go_count} let go"
+                        f"{matched_count} matched ({total_cost}pts), {let_go_count} let go ({interaction.user.mention})"
                     )
 
             # Mark as confirmed
@@ -2599,7 +2641,7 @@ class AuctionsMenuView(discord.ui.View):
                     withdrawn_bids_temp = [b for b in self.bids if b[0] in selected_bid_ids]
                     player_names_log = ", ".join(b[3] for b in withdrawn_bids_temp)
 
-                    await log_channel.send(f"🚫 {emoji_str}**{team_name}** withdrew bid(s): {player_names_log}")
+                    await log_channel.send(f"🚫 {emoji_str}**{team_name}** withdrew bid(s): {player_names_log} ({interaction.user.mention})")
 
             # Update view
             withdrawn_bids = [b for b in self.bids if b[0] in selected_bid_ids]
@@ -2963,9 +3005,9 @@ class FreeResignSelectionView(discord.ui.View):
                                 player_names.append(player[0])
 
                         players_str = ", ".join(player_names)
-                        await log_channel.send(f"✅ {emoji_str}**{team_name}** confirmed free re-signs: {players_str}")
+                        await log_channel.send(f"✅ {emoji_str}**{team_name}** confirmed free re-signs: {players_str} ({interaction.user.mention})")
                     else:
-                        await log_channel.send(f"✅ {emoji_str}**{team_name}** confirmed 0 free re-signs")
+                        await log_channel.send(f"✅ {emoji_str}**{team_name}** confirmed 0 free re-signs ({interaction.user.mention})")
 
             self.is_confirmed = True
 
