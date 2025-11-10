@@ -848,14 +848,57 @@ class FreeAgencyCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
 
+    async def period_action_autocomplete(self, interaction: discord.Interaction, current: str):
+        """Dynamic autocomplete for free agency period actions based on current status"""
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get current season
+                cursor = await db.execute(
+                    """SELECT season_number FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
+                )
+                season_result = await cursor.fetchone()
+                if not season_result:
+                    return [app_commands.Choice(name="Check Status", value="check_status")]
+
+                current_season = season_result[0]
+
+                # Check if there's an existing period
+                cursor = await db.execute(
+                    "SELECT status FROM free_agency_periods WHERE season_number = ?",
+                    (current_season,)
+                )
+                period = await cursor.fetchone()
+
+                choices = [app_commands.Choice(name="Check Status", value="check_status")]
+
+                if not period:
+                    # No period - allow starting resign or bidding
+                    choices.append(app_commands.Choice(name="Start Free Re-Sign Period", value="start_resign"))
+                    choices.append(app_commands.Choice(name="Start Bidding Period", value="start_bidding"))
+                else:
+                    status = period[0]
+                    if status == "resign":
+                        choices.append(app_commands.Choice(name="Start Bidding Period", value="start_bidding"))
+                    elif status == "bidding":
+                        choices.append(app_commands.Choice(name="Start Matching Period", value="start_matching"))
+                    elif status == "matching":
+                        choices.append(app_commands.Choice(name="End Matching Period", value="end_matching"))
+
+                return choices
+        except:
+            return [app_commands.Choice(name="Check Status", value="check_status")]
+
     @app_commands.command(name="freeagencyperiod", description="[ADMIN] Control free agency periods")
     @app_commands.describe(action="The action to perform")
-    @app_commands.choices(action=[
-        app_commands.Choice(name="Start Free Re-Sign Period", value="start_resign"),
-        app_commands.Choice(name="Start Bidding Period", value="start_bidding"),
-        app_commands.Choice(name="Start Matching Period", value="start_matching"),
-        app_commands.Choice(name="End Matching Period", value="end_matching")
-    ])
+    @app_commands.autocomplete(action=period_action_autocomplete)
     async def free_agency_period(self, interaction: discord.Interaction, action: str):
         # Check if user has admin role
         if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
@@ -864,7 +907,9 @@ class FreeAgencyCommands(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        if action == "start_resign":
+        if action == "check_status":
+            await self.check_period_status(interaction)
+        elif action == "start_resign":
             await self.start_resign_period(interaction)
         elif action == "start_bidding":
             await self.start_bidding_period(interaction)
@@ -872,6 +917,149 @@ class FreeAgencyCommands(commands.Cog):
             await self.start_matching_period(interaction)
         elif action == "end_matching":
             await self.end_matching_period(interaction)
+
+    async def check_period_status(self, interaction: discord.Interaction):
+        """Check the current free agency period status"""
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get current season
+                cursor = await db.execute(
+                    """SELECT season_number FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
+                )
+                season_result = await cursor.fetchone()
+                if not season_result:
+                    await interaction.followup.send("❌ No active season found!")
+                    return
+                current_season = season_result[0]
+
+                # Check if there's an existing period
+                cursor = await db.execute(
+                    "SELECT period_id, status FROM free_agency_periods WHERE season_number = ?",
+                    (current_season,)
+                )
+                period = await cursor.fetchone()
+
+                if not period:
+                    await interaction.followup.send(
+                        f"📊 **Free Agency Status - Season {current_season}**\n\n"
+                        f"**Status:** No active free agency period\n\n"
+                        f"Use `/freeagencyperiod` to start a free re-sign or bidding period."
+                    )
+                    return
+
+                period_id, status = period
+
+                # Build status message based on period status
+                if status == "resign":
+                    # Get teams that haven't confirmed
+                    cursor = await db.execute(
+                        """SELECT DISTINCT t.team_name
+                           FROM teams t
+                           JOIN players p ON t.team_id = p.team_id
+                           WHERE p.contract_expiry = ?
+                           AND t.team_id NOT IN (
+                               SELECT DISTINCT team_id
+                               FROM free_agency_resigns
+                               WHERE period_id = ? AND confirmed = 1
+                           )
+                           AND (
+                               SELECT COUNT(*)
+                               FROM players p2
+                               WHERE p2.team_id = t.team_id
+                               AND p2.contract_expiry = ?
+                           ) > 0""",
+                        (current_season, period_id, current_season)
+                    )
+                    unconfirmed_teams_raw = await cursor.fetchall()
+
+                    # Filter to only teams with allowance > 0
+                    unconfirmed_teams = []
+                    for (team_name,) in unconfirmed_teams_raw:
+                        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
+                        team_result = await cursor.fetchone()
+                        if team_result:
+                            team_id = team_result[0]
+                            allowance = await self.calculate_free_resign_allowance(db, team_id, current_season)
+                            if allowance > 0:
+                                unconfirmed_teams.append(team_name)
+
+                    if unconfirmed_teams:
+                        teams_list = "\n• ".join(unconfirmed_teams)
+                        await interaction.followup.send(
+                            f"📊 **Free Agency Status - Season {current_season}**\n\n"
+                            f"**Status:** Free Re-Sign Period (Active)\n\n"
+                            f"**Teams awaiting confirmation ({len(unconfirmed_teams)}):**\n• {teams_list}\n\n"
+                            f"Once all teams confirm, you can start the bidding period."
+                        )
+                    else:
+                        await interaction.followup.send(
+                            f"📊 **Free Agency Status - Season {current_season}**\n\n"
+                            f"**Status:** Free Re-Sign Period (Active)\n\n"
+                            f"✅ All eligible teams have confirmed their free re-signs!\n\n"
+                            f"You can now start the bidding period."
+                        )
+
+                elif status == "bidding":
+                    # Get total bids
+                    cursor = await db.execute(
+                        "SELECT COUNT(*) FROM free_agency_bids WHERE period_id = ?",
+                        (period_id,)
+                    )
+                    bid_count = (await cursor.fetchone())[0]
+
+                    await interaction.followup.send(
+                        f"📊 **Free Agency Status - Season {current_season}**\n\n"
+                        f"**Status:** Bidding Period (Active)\n\n"
+                        f"**Total Bids:** {bid_count}\n\n"
+                        f"Teams can use `/placebid` to bid on opposition free agents.\n"
+                        f"When ready, start the matching period."
+                    )
+
+                elif status == "matching":
+                    # Get teams that haven't confirmed
+                    cursor = await db.execute(
+                        """SELECT DISTINCT t.team_name
+                           FROM free_agency_results r
+                           JOIN teams t ON r.original_team_id = t.team_id
+                           WHERE r.period_id = ? AND r.winning_team_id IS NOT NULL
+                           AND r.confirmed_at IS NULL""",
+                        (period_id,)
+                    )
+                    unconfirmed_teams = [row[0] for row in await cursor.fetchall()]
+
+                    if unconfirmed_teams:
+                        teams_list = "\n• ".join(unconfirmed_teams)
+                        await interaction.followup.send(
+                            f"📊 **Free Agency Status - Season {current_season}**\n\n"
+                            f"**Status:** Matching Period (Active)\n\n"
+                            f"**Teams awaiting confirmation ({len(unconfirmed_teams)}):**\n• {teams_list}\n\n"
+                            f"Once all teams confirm, you can end the matching period."
+                        )
+                    else:
+                        await interaction.followup.send(
+                            f"📊 **Free Agency Status - Season {current_season}**\n\n"
+                            f"**Status:** Matching Period (Active)\n\n"
+                            f"✅ All teams have confirmed their matching decisions!\n\n"
+                            f"You can now end the matching period to finalize player movements."
+                        )
+
+                elif status == "completed":
+                    await interaction.followup.send(
+                        f"📊 **Free Agency Status - Season {current_season}**\n\n"
+                        f"**Status:** Completed\n\n"
+                        f"Free agency for this season has been completed."
+                    )
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {e}")
 
     async def start_resign_period(self, interaction: discord.Interaction):
         """Start the free re-sign period for free agency"""
