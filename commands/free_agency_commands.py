@@ -2798,13 +2798,13 @@ class AuctionsMenuView(discord.ui.View):
 class FreeResignButtonView(discord.ui.View):
     """Simple view with a button to open the free re-sign selection interface"""
     def __init__(self, bot, period_id, team_id, allowance):
-        super().__init__(timeout=None)
+        super().__init__(timeout=604800)  # 7 days
         self.bot = bot
         self.period_id = period_id
         self.team_id = team_id
         self.allowance = allowance
 
-    @discord.ui.button(label="Select Free Re-Signs", style=discord.ButtonStyle.primary, custom_id="open_resign_ui")
+    @discord.ui.button(label="Select Free Re-Signs", style=discord.ButtonStyle.primary)
     async def open_resign_ui(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Open the free re-sign selection interface"""
         try:
