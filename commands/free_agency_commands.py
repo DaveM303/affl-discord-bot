@@ -886,6 +886,7 @@ class FreeAgencyCommands(commands.Cog):
                 else:
                     status = period[0]
                     if status == "resign":
+                        choices.append(app_commands.Choice(name="Resend Free Re-Sign Notifications", value="resend_resigns"))
                         choices.append(app_commands.Choice(name="Start Bidding Period", value="start_bidding"))
                     elif status == "bidding":
                         choices.append(app_commands.Choice(name="Start Matching Period", value="start_matching"))
@@ -909,6 +910,8 @@ class FreeAgencyCommands(commands.Cog):
 
         if action == "check_status":
             await self.check_period_status(interaction)
+        elif action == "resend_resigns":
+            await self.resend_free_resigns(interaction)
         elif action == "start_resign":
             await self.start_resign_period(interaction)
         elif action == "start_bidding":
@@ -1057,6 +1060,100 @@ class FreeAgencyCommands(commands.Cog):
                         f"**Status:** Completed\n\n"
                         f"Free agency for this season has been completed."
                     )
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {e}")
+
+    async def resend_free_resigns(self, interaction: discord.Interaction):
+        """Resend free re-sign notifications without affecting existing data"""
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get current season
+                cursor = await db.execute(
+                    """SELECT season_number FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
+                )
+                season_result = await cursor.fetchone()
+                if not season_result:
+                    await interaction.followup.send("❌ No active season found!")
+                    return
+                current_season = season_result[0]
+
+                # Check if there's an active resign period
+                cursor = await db.execute(
+                    "SELECT period_id FROM free_agency_periods WHERE season_number = ? AND status = 'resign'",
+                    (current_season,)
+                )
+                period = await cursor.fetchone()
+                if not period:
+                    await interaction.followup.send("❌ No active free re-sign period!")
+                    return
+
+                period_id = period[0]
+
+                # Get all teams with free agents and calculate their allowances
+                cursor = await db.execute(
+                    """SELECT DISTINCT t.team_id, t.team_name, t.channel_id
+                       FROM teams t
+                       JOIN players p ON t.team_id = p.team_id
+                       WHERE p.contract_expiry = ?""",
+                    (current_season,)
+                )
+                teams_with_fas = await cursor.fetchall()
+
+                # Resend notifications to eligible teams
+                notifications_sent = 0
+
+                for team_id, team_name, channel_id in teams_with_fas:
+                    # Calculate how many free re-signs this team gets
+                    allowance = await self.calculate_free_resign_allowance(db, team_id, current_season)
+
+                    if allowance > 0 and channel_id:
+                        # Get the team's free agents
+                        cursor = await db.execute(
+                            """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating
+                               FROM players p
+                               WHERE p.team_id = ? AND p.contract_expiry = ?
+                               ORDER BY p.overall_rating DESC, p.name""",
+                            (team_id, current_season)
+                        )
+                        free_agents = await cursor.fetchall()
+
+                        # Build embed
+                        embed = discord.Embed(
+                            title=f"🔄 Free Re-Signs Available - {team_name}",
+                            description=f"You have **{allowance}** free re-sign(s) available based on your free agents.",
+                            color=discord.Color.blue()
+                        )
+
+                        fa_list = [f"{name} ({pos}, {age}, {ovr})" for _, name, pos, age, ovr in free_agents]
+                        embed.add_field(
+                            name=f"Your Free Agents ({len(free_agents)})",
+                            value="\n".join(fa_list) if fa_list else "None",
+                            inline=False
+                        )
+
+                        embed.set_footer(text="Use the button below to select which players to re-sign for free.")
+
+                        # Create view with button to open selection UI
+                        view = FreeResignButtonView(self.bot, period_id, team_id, allowance)
+
+                        try:
+                            channel = self.bot.get_channel(int(channel_id))
+                            if channel:
+                                await channel.send(embed=embed, view=view)
+                                notifications_sent += 1
+                        except Exception as e:
+                            print(f"Error resending notification to {team_name}: {e}")
+
+                await interaction.followup.send(f"✅ Resent free re-sign notifications to {notifications_sent} teams.")
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
