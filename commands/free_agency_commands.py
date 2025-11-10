@@ -2685,6 +2685,22 @@ class FreeResignButtonView(discord.ui.View):
                 season_result = await cursor.fetchone()
                 current_season = season_result[0] if season_result else None
 
+                # Get current period_id dynamically (don't rely on stored value)
+                cursor = await db.execute(
+                    "SELECT period_id FROM free_agency_periods WHERE season_number = ? AND status = 'resign'",
+                    (current_season,)
+                )
+                period_result = await cursor.fetchone()
+                if not period_result:
+                    await interaction.response.send_message("❌ No active free re-sign period!", ephemeral=True)
+                    return
+
+                current_period_id = period_result[0]
+
+                # Calculate allowance dynamically
+                free_agency_cog = self.bot.get_cog('FreeAgencyCommands')
+                current_allowance = await free_agency_cog.calculate_free_resign_allowance(db, self.team_id, current_season)
+
                 # Get team's free agents
                 cursor = await db.execute(
                     """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating
@@ -2695,19 +2711,19 @@ class FreeResignButtonView(discord.ui.View):
                 )
                 free_agents = await cursor.fetchall()
 
-                # Get existing selections (if any)
+                # Get existing selections (if any) - use current period_id
                 cursor = await db.execute(
                     """SELECT player_id, confirmed FROM free_agency_resigns
                        WHERE period_id = ? AND team_id = ?""",
-                    (self.period_id, self.team_id)
+                    (current_period_id, self.team_id)
                 )
                 existing_selections = await cursor.fetchall()
                 selected_players = [p[0] for p in existing_selections]
                 is_confirmed = any(p[1] for p in existing_selections) if existing_selections else False
 
-                # Create the selection view
+                # Create the selection view with current period_id
                 view = FreeResignSelectionView(
-                    self.bot, self.period_id, self.team_id, self.allowance,
+                    self.bot, current_period_id, self.team_id, current_allowance,
                     free_agents, selected_players, is_confirmed, current_season
                 )
                 embed = view.create_embed()
