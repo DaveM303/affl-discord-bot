@@ -192,7 +192,7 @@ class FreeAgencyCommands(commands.Cog):
 
         # Get all confirmed free re-signs
         cursor = await db.execute(
-            """SELECT p.name, p.position, p.age, p.overall_rating, t.team_name, t.emoji_id, p.contract_expiry
+            """SELECT p.name, p.position, p.age, p.overall_rating, t.emoji_id, p.contract_expiry
                FROM free_agency_resigns r
                JOIN players p ON r.player_id = p.player_id
                JOIN teams t ON p.team_id = t.team_id
@@ -207,45 +207,44 @@ class FreeAgencyCommands(commands.Cog):
 
         # Build embed
         embed = discord.Embed(
-            title="📝 Free Re-Signs Completed",
-            description=f"**Season {current_season}** - {len(resigns)} player{'s' if len(resigns) != 1 else ''} re-signed for free",
+            title=f"Season {current_season} Auctions - Free Re-Signs",
             color=discord.Color.blue()
         )
 
-        # Group by team
-        teams_dict = {}
-        for name, pos, age, ovr, team_name, emoji_id, contract_expiry in resigns:
-            if team_name not in teams_dict:
-                teams_dict[team_name] = {
-                    'emoji_id': emoji_id,
-                    'players': []
-                }
-            teams_dict[team_name]['players'].append((name, pos, age, ovr, contract_expiry))
-
-        # Add field for each team
-        for team_name in sorted(teams_dict.keys()):
-            team_data = teams_dict[team_name]
-
+        # Build list of all re-signs with emoji in front of player name
+        player_lines = []
+        for name, pos, age, ovr, emoji_id, contract_expiry in resigns:
             # Get emoji
             emoji_str = ""
-            if team_data['emoji_id']:
+            if emoji_id:
                 try:
-                    emoji = self.bot.get_emoji(int(team_data['emoji_id']))
+                    emoji = self.bot.get_emoji(int(emoji_id))
                     if emoji:
                         emoji_str = f"{emoji} "
                 except:
                     pass
 
-            player_lines = []
-            for name, pos, age, ovr, contract_expiry in team_data['players']:
-                contract_years = contract_expiry - current_season
-                player_lines.append(f"**{name}** ({pos}, {age}, {ovr}) - {contract_years}yr contract")
+            contract_years = contract_expiry - current_season
+            player_lines.append(f"{emoji_str}**{name}** ({pos}, {age}, {ovr}) - **{contract_years} years**")
 
-            embed.add_field(
-                name=f"{emoji_str}{team_name}",
-                value="\n".join(player_lines),
-                inline=False
-            )
+        # Split into fields if needed (max 1024 chars per field)
+        if player_lines:
+            current_field = []
+            current_length = 0
+            for line in player_lines:
+                line_length = len(line) + 1  # +1 for newline
+                if current_length + line_length > 1024:
+                    # Add current field and start new one
+                    embed.add_field(name="\u200b", value="\n".join(current_field), inline=False)
+                    current_field = [line]
+                    current_length = line_length
+                else:
+                    current_field.append(line)
+                    current_length += line_length
+
+            # Add final field
+            if current_field:
+                embed.add_field(name="\u200b", value="\n".join(current_field), inline=False)
 
         try:
             await log_channel.send(embed=embed)
@@ -1888,25 +1887,46 @@ class FreeAgencyCommands(commands.Cog):
             await interaction.followup.send(f"❌ Error: {e}")
 
     @app_commands.command(name="contractstatus", description="View contract expiry years for all players on a team")
-    @app_commands.describe(team="The team to view contracts for")
+    @app_commands.describe(team="The team to view contracts for (defaults to your team)")
     @app_commands.autocomplete(team=team_autocomplete)
-    async def contract_status(self, interaction: discord.Interaction, team: str):
+    async def contract_status(self, interaction: discord.Interaction, team: str = None):
         """Display contract expiry years for all players on a team"""
         await interaction.response.defer(ephemeral=True)
 
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Get team info
-                cursor = await db.execute(
-                    "SELECT team_id, team_name FROM teams WHERE team_name = ?",
-                    (team,)
-                )
-                team_result = await cursor.fetchone()
-                if not team_result:
-                    await interaction.followup.send(f"❌ Team '{team}' not found!")
-                    return
+                # If no team specified, get user's team
+                if team is None:
+                    # Get user's team from roles
+                    user_team_id = None
+                    user_team_name = None
+                    for role in interaction.user.roles:
+                        cursor = await db.execute(
+                            "SELECT team_id, team_name FROM teams WHERE role_id = ?",
+                            (str(role.id),)
+                        )
+                        team_result = await cursor.fetchone()
+                        if team_result:
+                            user_team_id, user_team_name = team_result
+                            break
 
-                team_id, team_name = team_result
+                    if not user_team_id:
+                        await interaction.followup.send("❌ You don't have a team role! Please specify a team.")
+                        return
+
+                    team_id, team_name = user_team_id, user_team_name
+                else:
+                    # Get specified team info
+                    cursor = await db.execute(
+                        "SELECT team_id, team_name FROM teams WHERE team_name = ?",
+                        (team,)
+                    )
+                    team_result = await cursor.fetchone()
+                    if not team_result:
+                        await interaction.followup.send(f"❌ Team '{team}' not found!")
+                        return
+
+                    team_id, team_name = team_result
 
                 # Get all players grouped by contract expiry year
                 cursor = await db.execute(
