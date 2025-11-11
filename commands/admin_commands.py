@@ -2026,14 +2026,38 @@ class AdminCommands(commands.Cog):
 
                     for _, row in free_agency_bids_df.iterrows():
                         try:
-                            # This is read-only historical data, so we'll skip if sheet is empty
                             if pd.isna(row['Bid_ID']) or not row['Bid_ID']:
                                 continue
 
-                            # Free agency bids are typically regenerated each period
-                            # This import is mainly for testing/debugging purposes
-                            # We won't import this data as it's transient
-                            pass
+                            bid_id = int(row['Bid_ID'])
+                            period_id = int(row['Period_ID'])
+                            team_name = str(row['Team'])
+                            player_name = str(row['Player'])
+                            bid_amount = int(row['Bid_Amount'])
+                            status = str(row['Status'])
+                            placed_at = str(row['Placed_At']) if pd.notna(row['Placed_At']) and row['Placed_At'] else None
+
+                            # Get team_id and player_id from names
+                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
+                            team = await cursor.fetchone()
+                            if not team:
+                                errors.append(f"Free Agency Bids: Team '{team_name}' not found")
+                                continue
+                            team_id = team[0]
+
+                            cursor = await db.execute("SELECT player_id FROM players WHERE name = ?", (player_name,))
+                            player = await cursor.fetchone()
+                            if not player:
+                                errors.append(f"Free Agency Bids: Player '{player_name}' not found")
+                                continue
+                            player_id = player[0]
+
+                            await db.execute(
+                                """INSERT INTO free_agency_bids (bid_id, period_id, team_id, player_id, bid_amount, status, placed_at)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                (bid_id, period_id, team_id, player_id, bid_amount, status, placed_at)
+                            )
+                            free_agency_bids_imported += 1
 
                         except Exception as e:
                             errors.append(f"Free Agency Bids row: {str(e)}")
