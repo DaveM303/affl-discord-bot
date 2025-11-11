@@ -2495,6 +2495,7 @@ class AuctionsMenuView(discord.ui.View):
         self.max_points = max_points
         self.season_number = season_number
         self.period_status = period_status
+        self.selected_bid_ids = []  # Store selected bids for withdrawal
 
         self.update_buttons()
 
@@ -2522,16 +2523,29 @@ class AuctionsMenuView(discord.ui.View):
                 custom_id="withdraw_select",
                 row=0
             )
-            select.callback = self.withdraw_callback
+            select.callback = self.select_bids_callback
             self.add_item(select)
 
+            # Add withdraw button (disabled if nothing selected)
+            withdraw_button = discord.ui.Button(
+                label="Withdraw Selected Bids",
+                style=discord.ButtonStyle.danger,
+                custom_id="withdraw_confirm",
+                disabled=len(self.selected_bid_ids) == 0,
+                row=1
+            )
+            withdraw_button.callback = self.withdraw_callback
+            self.add_item(withdraw_button)
+
         # Add free re-signs button (only during resign period)
+        # Adjust row based on whether we have withdraw button
+        resign_row = 2 if self.period_status == 'bidding' and self.bids else 1
         if self.period_status == 'resign':
             resign_button = discord.ui.Button(
                 label="Free Re-Signs",
                 style=discord.ButtonStyle.primary,
                 custom_id="free_resigns",
-                row=1
+                row=resign_row
             )
             resign_button.callback = self.free_resigns_callback
             self.add_item(resign_button)
@@ -2542,17 +2556,18 @@ class AuctionsMenuView(discord.ui.View):
                 style=discord.ButtonStyle.secondary,
                 custom_id="free_resigns_disabled",
                 disabled=True,
-                row=1
+                row=resign_row
             )
             self.add_item(resign_button)
 
         # Add matching button (only during matching period)
+        matching_row = 3 if self.period_status == 'bidding' and self.bids else 2
         if self.period_status == 'matching':
             matching_button = discord.ui.Button(
                 label="Manage Bid Matches",
                 style=discord.ButtonStyle.primary,
                 custom_id="manage_matches",
-                row=2
+                row=matching_row
             )
             matching_button.callback = self.manage_matches_callback
             self.add_item(matching_button)
@@ -2563,16 +2578,17 @@ class AuctionsMenuView(discord.ui.View):
                 style=discord.ButtonStyle.secondary,
                 custom_id="manage_matches_disabled",
                 disabled=True,
-                row=2
+                row=matching_row
             )
             self.add_item(matching_button)
 
         # Add refresh button on last row
+        refresh_row = 4 if self.period_status == 'bidding' and self.bids else 3
         refresh_button = discord.ui.Button(
             label="Refresh",
             style=discord.ButtonStyle.secondary,
             custom_id="refresh",
-            row=3
+            row=refresh_row
         )
         refresh_button.callback = self.refresh_callback
         self.add_item(refresh_button)
@@ -2618,17 +2634,34 @@ class AuctionsMenuView(discord.ui.View):
             )
 
         if self.period_status == 'bidding':
-            footer_text = "Use the dropdown to withdraw bids • Click Refresh to update"
+            footer_text = "Select bids from dropdown, then click 'Withdraw Selected Bids' • Click Refresh to update"
         else:
             footer_text = "Click 'Manage Bid Matches' to respond to bids on your players • Click Refresh to update"
 
         embed.set_footer(text=footer_text)
         return embed
 
-    async def withdraw_callback(self, interaction: discord.Interaction):
-        """Handle withdrawing multiple bids from dropdown"""
+    async def select_bids_callback(self, interaction: discord.Interaction):
+        """Handle bid selection from dropdown"""
         try:
-            selected_bid_ids = [int(value) for value in interaction.data['values']]
+            self.selected_bid_ids = [int(value) for value in interaction.data['values']]
+
+            # Update the view to enable the withdraw button
+            self.update_buttons()
+            embed = self.create_embed()
+            await interaction.response.edit_message(embed=embed, view=self)
+
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+
+    async def withdraw_callback(self, interaction: discord.Interaction):
+        """Handle withdrawing selected bids after confirmation"""
+        try:
+            if not self.selected_bid_ids:
+                await interaction.response.send_message("❌ No bids selected!", ephemeral=True)
+                return
+
+            selected_bid_ids = self.selected_bid_ids
 
             async with aiosqlite.connect(DB_PATH) as db:
                 # Delete the selected bids
@@ -2668,6 +2701,7 @@ class AuctionsMenuView(discord.ui.View):
             refund_amount = sum(b[2] for b in withdrawn_bids)
             self.bids = [b for b in self.bids if b[0] not in selected_bid_ids]
             self.remaining_points += refund_amount
+            self.selected_bid_ids = []  # Clear selection after withdrawal
 
             self.update_buttons()
             embed = self.create_embed()
