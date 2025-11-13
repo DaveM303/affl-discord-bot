@@ -304,7 +304,7 @@ class PlayerCommands(commands.Cog):
                 embed.description = "No players on this team"
                 embed.set_footer(text="0 players")
 
-            await interaction.response.send_message(embed=embed)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="filterplayers", description="Search for players with filters")
     @app_commands.describe(
@@ -446,7 +446,8 @@ class PlayerCommands(commands.Cog):
                 positions_display = ", ".join(positions_to_filter)
                 filters.append(f"Positions: {positions_display}")
             if team_name: filters.append(f"Team: {team_name}")
-            
+            if contract_expiry is not None: filters.append(f"Contract Expiry: {contract_expiry}")
+
             filter_text = " | ".join(filters) if filters else "No filters"
             
             # Create paginated view
