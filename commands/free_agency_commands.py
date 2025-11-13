@@ -65,10 +65,10 @@ class FreeAgencyCommands(commands.Cog):
 
                         print(f"Re-registered {len(teams_with_free_agents)} free re-sign button views")
 
-                    # Re-register matching views
+                    # Re-register matching notification views
                     elif status == 'matching':
                         cursor = await db.execute(
-                            """SELECT DISTINCT t.team_id, t.team_name
+                            """SELECT DISTINCT t.team_id
                                FROM free_agency_results r
                                JOIN teams t ON r.original_team_id = t.team_id
                                WHERE r.period_id = ? AND r.winning_team_id IS NOT NULL""",
@@ -76,36 +76,11 @@ class FreeAgencyCommands(commands.Cog):
                         )
                         teams_with_losses = await cursor.fetchall()
 
-                        for team_id, team_name in teams_with_losses:
-                            # Get this team's players with bids
-                            cursor = await db.execute(
-                                """SELECT r.player_id, p.name, p.position, p.age, p.overall_rating,
-                                          r.winning_team_id, t.team_name, t.emoji_id, r.winning_bid
-                                   FROM free_agency_results r
-                                   JOIN players p ON r.player_id = p.player_id
-                                   JOIN teams t ON r.winning_team_id = t.team_id
-                                   WHERE r.period_id = ? AND r.original_team_id = ?""",
-                                (period_id, team_id)
-                            )
-                            player_bids = await cursor.fetchall()
+                        for (team_id,) in teams_with_losses:
+                            view = MatchingNotificationView(self.bot, period_id, team_id)
+                            self.bot.add_view(view)
 
-                            if player_bids:
-                                # Calculate remaining points
-                                cursor = await db.execute(
-                                    """SELECT COALESCE(SUM(b.bid_amount), 0)
-                                       FROM free_agency_bids b
-                                       JOIN players p ON b.player_id = p.player_id
-                                       WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
-                                       AND p.team_id != ?""",
-                                    (period_id, team_id, team_id)
-                                )
-                                winning_bid_total = (await cursor.fetchone())[0]
-                                remaining_points = 300 - winning_bid_total
-
-                                view = MatchingView(self.bot, period_id, team_id, team_name, player_bids, current_season, remaining_points)
-                                self.bot.add_view(view)
-
-                        print(f"Re-registered {len(teams_with_losses)} matching views")
+                        print(f"Re-registered {len(teams_with_losses)} matching notification views")
 
         except Exception as e:
             print(f"Error registering persistent views: {e}")
@@ -1740,8 +1715,11 @@ class FreeAgencyCommands(commands.Cog):
 
                             channel = self.bot.get_channel(int(channel_id))
                             if channel:
-                                view = MatchingView(self.bot, period_id, team_id, team_name, player_bids, current_season, remaining_points)
-                                embed = await view.create_embed()
+                                # Create static notification view with button
+                                view = MatchingNotificationView(self.bot, period_id, team_id)
+                                embed = await MatchingNotificationView.create_notification_embed(
+                                    self.bot, period_id, team_id, team_name, player_bids, remaining_points
+                                )
                                 await channel.send(embed=embed, view=view)
                                 matching_messages_sent += 1
                     except Exception as e:
@@ -1880,8 +1858,11 @@ class FreeAgencyCommands(commands.Cog):
 
                             channel = self.bot.get_channel(int(channel_id))
                             if channel:
-                                view = MatchingView(self.bot, period_id, team_id, team_name, player_bids, current_season, remaining_points)
-                                embed = await view.create_embed()
+                                # Create static notification view with button
+                                view = MatchingNotificationView(self.bot, period_id, team_id)
+                                embed = await MatchingNotificationView.create_notification_embed(
+                                    self.bot, period_id, team_id, team_name, player_bids, remaining_points
+                                )
                                 await channel.send(embed=embed, view=view)
                                 matching_messages_sent += 1
                     except Exception as e:
@@ -2474,10 +2455,155 @@ class FreeAgentsView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=self)
 
 
+class MatchingNotificationView(discord.ui.View):
+    """Static notification view with button to open matching interface"""
+    def __init__(self, bot, period_id, team_id):
+        super().__init__(timeout=None)  # Persistent view
+        self.bot = bot
+        self.period_id = period_id
+        self.team_id = team_id
+
+    @discord.ui.button(label="Choose which bids to match", style=discord.ButtonStyle.primary)
+    async def open_matching(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Open the matching interface"""
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get current season
+                cursor = await db.execute(
+                    """SELECT season_number FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
+                )
+                season_result = await cursor.fetchone()
+                current_season = season_result[0] if season_result else None
+
+                # Check if period is still active
+                cursor = await db.execute(
+                    "SELECT status FROM free_agency_periods WHERE period_id = ?",
+                    (self.period_id,)
+                )
+                period_result = await cursor.fetchone()
+                if not period_result or period_result[0] != 'matching':
+                    await interaction.response.send_message(
+                        "❌ The matching period has ended! Matches are no longer editable.",
+                        ephemeral=True
+                    )
+                    return
+
+                # Get team info
+                cursor = await db.execute(
+                    "SELECT team_name FROM teams WHERE team_id = ?",
+                    (self.team_id,)
+                )
+                team_result = await cursor.fetchone()
+                if not team_result:
+                    await interaction.response.send_message("❌ Team not found!", ephemeral=True)
+                    return
+                team_name = team_result[0]
+
+                # Get winning bids on this team's players
+                cursor = await db.execute(
+                    """SELECT r.player_id, p.name, p.position, p.age, p.overall_rating,
+                              r.winning_team_id, t.team_name, t.emoji_id, r.winning_bid
+                       FROM free_agency_results r
+                       JOIN players p ON r.player_id = p.player_id
+                       JOIN teams t ON r.winning_team_id = t.team_id
+                       WHERE r.period_id = ? AND r.original_team_id = ?""",
+                    (self.period_id, self.team_id)
+                )
+                player_bids = await cursor.fetchall()
+
+                if not player_bids:
+                    await interaction.response.send_message(
+                        "❌ No winning bids on your players to match!",
+                        ephemeral=True
+                    )
+                    return
+
+                # Calculate remaining points
+                cursor = await db.execute(
+                    """SELECT COALESCE(SUM(b.bid_amount), 0)
+                       FROM free_agency_bids b
+                       JOIN players p ON b.player_id = p.player_id
+                       WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
+                       AND p.team_id != ?""",
+                    (self.period_id, self.team_id, self.team_id)
+                )
+                winning_bid_total = (await cursor.fetchone())[0]
+                remaining_points = 300 - winning_bid_total
+
+                # Create matching view
+                matching_view = MatchingView(self.bot, self.period_id, self.team_id, team_name, player_bids, current_season, remaining_points)
+                embed = await matching_view.create_embed()
+                await interaction.response.send_message(embed=embed, view=matching_view, ephemeral=True)
+
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+
+    @staticmethod
+    async def create_notification_embed(bot, period_id, team_id, team_name, player_bids, max_points):
+        """Create static notification embed"""
+        embed = discord.Embed(
+            title=f"🤝 Free Agency Matching - {team_name}",
+            description="Your free agents have received bids. Choose which to match:",
+            color=discord.Color.orange()
+        )
+
+        embed.add_field(
+            name="Remaining Points:",
+            value=f"**{max_points} pts**",
+            inline=False
+        )
+
+        # List each player with bid info (no status or compensation)
+        player_lines = []
+        for player_id, name, pos, age, ovr, winning_team_id, bidding_team, emoji_id, bid in player_bids:
+            # Get emoji
+            emoji_str = ""
+            if emoji_id:
+                try:
+                    emoji = bot.get_emoji(int(emoji_id))
+                    if emoji:
+                        emoji_str = f"{emoji} "
+                except:
+                    pass
+
+            # Check if RFA (age <= 25) and calculate match cost
+            is_rfa = age <= 25
+            if is_rfa:
+                match_cost = round(bid * 0.8)  # 20% discount
+                rfa_label = " [RFA]"
+                cost_display = f"**{match_cost} pts** (20% discount from {bid} pts)"
+            else:
+                match_cost = bid
+                rfa_label = ""
+                cost_display = f"**{bid} pts**"
+
+            player_lines.append(
+                f"**{name}**{rfa_label} ({pos}, {age}, {ovr})\n"
+                f"    └─ {emoji_str}{bidding_team} bid {cost_display}"
+            )
+
+        embed.add_field(
+            name="\u200b",  # Zero-width space
+            value="\n\n".join(player_lines),
+            inline=False
+        )
+
+        embed.set_footer(text="Use /auctionsmenu if the below button doesn't work")
+        return embed
+
+
 class MatchingView(discord.ui.View):
     """Interactive UI for teams to match winning bids on their players"""
     def __init__(self, bot, period_id, team_id, team_name, player_bids, season_number, max_points=300):
-        super().__init__(timeout=None)  # No timeout for matching
+        super().__init__(timeout=180)  # 3 minute timeout for ephemeral view
         self.bot = bot
         self.period_id = period_id
         self.team_id = team_id
