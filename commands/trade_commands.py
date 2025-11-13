@@ -9,6 +9,31 @@ class TradeCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+    async def cog_load(self):
+        """Called when the cog is loaded - re-register persistent views"""
+        await self.register_persistent_views()
+
+    async def register_persistent_views(self):
+        """Re-register all persistent trade response views on bot startup"""
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Re-register trade response views for pending trades
+                cursor = await db.execute(
+                    "SELECT trade_id FROM trades WHERE status = 'pending'"
+                )
+                pending_trades = await cursor.fetchall()
+
+                for (trade_id,) in pending_trades:
+                    view = TradeResponseView(trade_id, self.bot)
+                    self.bot.add_view(view)
+
+                print(f"Re-registered {len(pending_trades)} trade response views")
+
+        except Exception as e:
+            print(f"Error registering trade persistent views: {e}")
+            import traceback
+            traceback.print_exc()
+
     async def is_admin(self, interaction: discord.Interaction) -> bool:
         """Check if user has admin permissions"""
         if interaction.guild.owner_id == interaction.user.id:

@@ -10,6 +10,108 @@ class FreeAgencyCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+    async def cog_load(self):
+        """Called when the cog is loaded - re-register persistent views"""
+        await self.register_persistent_views()
+
+    async def register_persistent_views(self):
+        """Re-register all persistent views on bot startup"""
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get current season
+                cursor = await db.execute(
+                    """SELECT season_number FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
+                )
+                season_result = await cursor.fetchone()
+                if not season_result:
+                    print("No active season found for view registration")
+                    return
+                current_season = season_result[0]
+
+                # Check for active free agency period
+                cursor = await db.execute(
+                    "SELECT period_id, status FROM free_agency_periods WHERE season_number = ?",
+                    (current_season,)
+                )
+                period_result = await cursor.fetchone()
+
+                if period_result:
+                    period_id, status = period_result
+
+                    # Re-register free re-sign button views
+                    if status == 'resign':
+                        cursor = await db.execute(
+                            """SELECT DISTINCT t.team_id
+                               FROM teams t
+                               JOIN players p ON t.team_id = p.team_id
+                               WHERE p.contract_expiry = ?""",
+                            (current_season,)
+                        )
+                        teams_with_free_agents = await cursor.fetchall()
+
+                        for (team_id,) in teams_with_free_agents:
+                            allowance = await self.calculate_free_resign_allowance(db, team_id, current_season)
+                            if allowance > 0:
+                                view = FreeResignButtonView(self.bot, period_id, team_id, allowance)
+                                self.bot.add_view(view)
+
+                        print(f"Re-registered {len(teams_with_free_agents)} free re-sign button views")
+
+                    # Re-register matching views
+                    elif status == 'matching':
+                        cursor = await db.execute(
+                            """SELECT DISTINCT t.team_id, t.team_name
+                               FROM free_agency_results r
+                               JOIN teams t ON r.original_team_id = t.team_id
+                               WHERE r.period_id = ? AND r.winning_team_id IS NOT NULL""",
+                            (period_id,)
+                        )
+                        teams_with_losses = await cursor.fetchall()
+
+                        for team_id, team_name in teams_with_losses:
+                            # Get this team's players with bids
+                            cursor = await db.execute(
+                                """SELECT r.player_id, p.name, p.position, p.age, p.overall_rating,
+                                          r.winning_team_id, t.team_name, t.emoji_id, r.winning_bid
+                                   FROM free_agency_results r
+                                   JOIN players p ON r.player_id = p.player_id
+                                   JOIN teams t ON r.winning_team_id = t.team_id
+                                   WHERE r.period_id = ? AND r.original_team_id = ?""",
+                                (period_id, team_id)
+                            )
+                            player_bids = await cursor.fetchall()
+
+                            if player_bids:
+                                # Calculate remaining points
+                                cursor = await db.execute(
+                                    """SELECT COALESCE(SUM(b.bid_amount), 0)
+                                       FROM free_agency_bids b
+                                       JOIN players p ON b.player_id = p.player_id
+                                       WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
+                                       AND p.team_id != ?""",
+                                    (period_id, team_id, team_id)
+                                )
+                                winning_bid_total = (await cursor.fetchone())[0]
+                                remaining_points = 300 - winning_bid_total
+
+                                view = MatchingView(self.bot, period_id, team_id, team_name, player_bids, current_season, remaining_points)
+                                self.bot.add_view(view)
+
+                        print(f"Re-registered {len(teams_with_losses)} matching views")
+
+        except Exception as e:
+            print(f"Error registering persistent views: {e}")
+            import traceback
+            traceback.print_exc()
+
     async def team_autocomplete(
         self,
         interaction: discord.Interaction,
@@ -348,7 +450,7 @@ class FreeAgencyCommands(commands.Cog):
                 f"Winning bid: {bid_emoji_str}{winning_bid}pts {match_text}"
             )
 
-        # Split into multiple embeds if needed to avoid 6000 character limit
+        # Split into multiple embeds if needed to avoid description 4096 character limit
         if player_lines:
             embeds = []
             current_embed = discord.Embed(
@@ -360,10 +462,10 @@ class FreeAgencyCommands(commands.Cog):
             base_description = "**Winning bids:**"
 
             for line in player_lines:
-                # Check if adding this line would exceed the limit
-                # Each embed has ~5800 char limit to be safe, accounting for description header
+                # Check if adding this line would exceed the description limit (4096 chars)
+                # Use 3900 to be safe and account for formatting
                 test_content = base_description + "\n\n" + "\n\n".join(current_lines + [line])
-                if len(test_content) > 5800 and current_lines:
+                if len(test_content) > 3900 and current_lines:
                     # Finalize current embed
                     current_embed.description = base_description + "\n\n" + "\n\n".join(current_lines)
                     embeds.append(current_embed)
@@ -2425,7 +2527,7 @@ class MatchingView(discord.ui.View):
                 options=options,
                 min_values=0,
                 max_values=len(options),
-                custom_id="player_select",
+                custom_id=f"match_select_{self.team_id}",
                 row=0
             )
             select.callback = self.select_callback
@@ -2435,7 +2537,7 @@ class MatchingView(discord.ui.View):
         confirm_button = discord.ui.Button(
             label="Confirm Matches",
             style=discord.ButtonStyle.primary,
-            custom_id="confirm",
+            custom_id=f"match_confirm_{self.team_id}",
             row=1
         )
         confirm_button.callback = self.confirm_callback
@@ -3072,13 +3174,13 @@ class AuctionsMenuView(discord.ui.View):
 class FreeResignButtonView(discord.ui.View):
     """Simple view with a button to open the free re-sign selection interface"""
     def __init__(self, bot, period_id, team_id, allowance):
-        super().__init__(timeout=604800)  # 7 days
+        super().__init__(timeout=None)  # Persistent view
         self.bot = bot
         self.period_id = period_id
         self.team_id = team_id
         self.allowance = allowance
 
-    @discord.ui.button(label="Select Free Re-Signs", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Select Free Re-Signs", style=discord.ButtonStyle.primary, custom_id="free_resign_button")
     async def open_resign_ui(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Open the free re-sign selection interface"""
         try:
