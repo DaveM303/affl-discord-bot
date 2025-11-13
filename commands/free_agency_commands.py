@@ -1578,9 +1578,21 @@ class FreeAgencyCommands(commands.Cog):
                         player_bids = await cursor.fetchall()
 
                         if player_bids:
+                            # Calculate remaining points for this team (300 - winning bids on other teams' players)
+                            cursor = await db.execute(
+                                """SELECT COALESCE(SUM(b.bid_amount), 0)
+                                   FROM free_agency_bids b
+                                   JOIN players p ON b.player_id = p.player_id
+                                   WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
+                                   AND p.team_id != ?""",
+                                (period_id, team_id, team_id)
+                            )
+                            winning_bid_total = (await cursor.fetchone())[0]
+                            remaining_points = 300 - winning_bid_total
+
                             channel = self.bot.get_channel(int(channel_id))
                             if channel:
-                                view = MatchingView(self.bot, period_id, team_id, team_name, player_bids, current_season)
+                                view = MatchingView(self.bot, period_id, team_id, team_name, player_bids, current_season, remaining_points)
                                 embed = await view.create_embed()
                                 await channel.send(embed=embed, view=view)
                                 matching_messages_sent += 1
@@ -2179,7 +2191,7 @@ class FreeAgentsView(discord.ui.View):
 
 class MatchingView(discord.ui.View):
     """Interactive UI for teams to match winning bids on their players"""
-    def __init__(self, bot, period_id, team_id, team_name, player_bids, season_number):
+    def __init__(self, bot, period_id, team_id, team_name, player_bids, season_number, max_points=300):
         super().__init__(timeout=None)  # No timeout for matching
         self.bot = bot
         self.period_id = period_id
@@ -2190,8 +2202,8 @@ class MatchingView(discord.ui.View):
         self.matches = {}  # player_id -> bool (True = match, False = don't match)
         self.confirmed = False  # Track if matches have been confirmed
 
-        # Calculate max points (300)
-        self.max_points = 300
+        # Store max points (remaining after winning bids on other teams' players)
+        self.max_points = max_points
 
         # Add toggle buttons for each player
         for player_id, name, pos, age, ovr, winning_team_id, bidding_team, emoji_id, bid in player_bids:
@@ -2796,7 +2808,7 @@ class AuctionsMenuView(discord.ui.View):
                 # Get winning bids on this team's players
                 cursor = await db.execute(
                     """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating,
-                              t.team_id, t.name, t.emoji_id, b.bid_amount
+                              t.team_id, t.team_name, t.emoji_id, b.bid_amount
                        FROM players p
                        JOIN free_agency_bids b ON p.player_id = b.player_id
                        JOIN teams t ON b.team_id = t.team_id
@@ -2813,8 +2825,20 @@ class AuctionsMenuView(discord.ui.View):
                     )
                     return
 
+                # Calculate remaining points for this team (300 - winning bids on other teams' players)
+                cursor = await db.execute(
+                    """SELECT COALESCE(SUM(b.bid_amount), 0)
+                       FROM free_agency_bids b
+                       JOIN players p ON b.player_id = p.player_id
+                       WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
+                       AND p.team_id != ?""",
+                    (self.period_id, self.team_id, self.team_id)
+                )
+                winning_bid_total = (await cursor.fetchone())[0]
+                remaining_points = 300 - winning_bid_total
+
                 # Create matching view
-                matching_view = MatchingView(self.bot, self.period_id, self.team_id, self.team_name, player_bids, self.season_number)
+                matching_view = MatchingView(self.bot, self.period_id, self.team_id, self.team_name, player_bids, self.season_number, remaining_points)
                 embed = await matching_view.create_embed()
                 await interaction.response.send_message(embed=embed, view=matching_view, ephemeral=True)
 
