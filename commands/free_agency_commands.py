@@ -284,13 +284,6 @@ class FreeAgencyCommands(commands.Cog):
             print("log_winning_bids: No winning bids found, returning early")
             return
 
-        # Build embed
-        embed = discord.Embed(
-            title=f"Season {current_season} Auctions - Matching Period",
-            description="**Winning bids:**",
-            color=discord.Color.gold()
-        )
-
         # Calculate team points for match checking
         cursor = await db.execute(
             """SELECT team_id FROM teams"""
@@ -355,17 +348,51 @@ class FreeAgencyCommands(commands.Cog):
                 f"Winning bid: {bid_emoji_str}{winning_bid}pts {match_text}"
             )
 
-        # Add all bids as one long field (no splitting needed - much more compact now)
+        # Split into multiple embeds if needed to avoid 6000 character limit
         if player_lines:
-            embed.description += "\n\n" + "\n\n".join(player_lines)
+            embeds = []
+            current_embed = discord.Embed(
+                title=f"Season {current_season} Auctions - Matching Period",
+                description="**Winning bids:**",
+                color=discord.Color.gold()
+            )
+            current_lines = []
+            base_description = "**Winning bids:**"
 
-        try:
-            await log_channel.send(embed=embed)
-            print(f"Successfully sent matching period notification to auctions log channel")
-        except Exception as e:
-            print(f"Error logging winning bids: {e}")
-            import traceback
-            traceback.print_exc()
+            for line in player_lines:
+                # Check if adding this line would exceed the limit
+                # Each embed has ~5800 char limit to be safe, accounting for description header
+                test_content = base_description + "\n\n" + "\n\n".join(current_lines + [line])
+                if len(test_content) > 5800 and current_lines:
+                    # Finalize current embed
+                    current_embed.description = base_description + "\n\n" + "\n\n".join(current_lines)
+                    embeds.append(current_embed)
+
+                    # Start new embed
+                    current_embed = discord.Embed(
+                        title=f"Season {current_season} Auctions - Matching Period (cont.)",
+                        description="**Winning bids (continued):**",
+                        color=discord.Color.gold()
+                    )
+                    current_lines = [line]
+                    base_description = "**Winning bids (continued):**"
+                else:
+                    current_lines.append(line)
+
+            # Add the last embed
+            if current_lines:
+                current_embed.description = base_description + "\n\n" + "\n\n".join(current_lines)
+                embeds.append(current_embed)
+
+            # Send all embeds
+            try:
+                for embed in embeds:
+                    await log_channel.send(embed=embed)
+                print(f"Successfully sent {len(embeds)} matching period notification(s) to auctions log channel")
+            except Exception as e:
+                print(f"Error logging winning bids: {e}")
+                import traceback
+                traceback.print_exc()
 
     async def log_final_movements(self, db, period_id, current_season):
         """Log final player movements and compensation picks to auctions channel"""
@@ -916,6 +943,8 @@ class FreeAgencyCommands(commands.Cog):
                     elif status == "bidding":
                         choices.append(app_commands.Choice(name="Start Matching Period", value="start_matching"))
                     elif status == "matching":
+                        choices.append(app_commands.Choice(name="Resend Winning Bids Summary", value="resend_winning_bids"))
+                        choices.append(app_commands.Choice(name="Resend Matching Notifications", value="resend_matching_notifications"))
                         choices.append(app_commands.Choice(name="End Matching Period", value="end_matching"))
 
                 return choices
@@ -943,6 +972,10 @@ class FreeAgencyCommands(commands.Cog):
             await self.start_bidding_period(interaction)
         elif action == "start_matching":
             await self.start_matching_period(interaction)
+        elif action == "resend_winning_bids":
+            await self.resend_winning_bids_summary(interaction)
+        elif action == "resend_matching_notifications":
+            await self.resend_matching_notifications(interaction)
         elif action == "end_matching":
             await self.end_matching_period(interaction)
 
@@ -1617,6 +1650,143 @@ class FreeAgencyCommands(commands.Cog):
                     f"Winning bids calculated: {results_created}\n"
                     f"Matching interfaces sent: {matching_messages_sent} teams\n\n"
                     f"Teams can now match bids on their players."
+                )
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {e}")
+
+    async def resend_winning_bids_summary(self, interaction: discord.Interaction):
+        """Resend the winning bids summary to auctions log channel"""
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get current season
+                cursor = await db.execute(
+                    """SELECT season_number FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
+                )
+                season_result = await cursor.fetchone()
+                if not season_result:
+                    await interaction.followup.send("❌ No active season found!")
+                    return
+                current_season = season_result[0]
+
+                # Get period
+                cursor = await db.execute(
+                    "SELECT period_id, status FROM free_agency_periods WHERE season_number = ?",
+                    (current_season,)
+                )
+                period_result = await cursor.fetchone()
+                if not period_result:
+                    await interaction.followup.send("❌ No free agency period found!")
+                    return
+
+                period_id, status = period_result
+                if status != 'matching':
+                    await interaction.followup.send(f"❌ Period is not in matching status (current: {status})")
+                    return
+
+                # Resend winning bids summary
+                await self.log_winning_bids(db, period_id, current_season)
+
+                await interaction.followup.send("✅ Winning bids summary resent to auctions log channel!")
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {e}")
+
+    async def resend_matching_notifications(self, interaction: discord.Interaction):
+        """Resend matching notifications to all teams with winning bids on their players"""
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get current season
+                cursor = await db.execute(
+                    """SELECT season_number FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
+                )
+                season_result = await cursor.fetchone()
+                if not season_result:
+                    await interaction.followup.send("❌ No active season found!")
+                    return
+                current_season = season_result[0]
+
+                # Get period
+                cursor = await db.execute(
+                    "SELECT period_id, status FROM free_agency_periods WHERE season_number = ?",
+                    (current_season,)
+                )
+                period_result = await cursor.fetchone()
+                if not period_result:
+                    await interaction.followup.send("❌ No free agency period found!")
+                    return
+
+                period_id, status = period_result
+                if status != 'matching':
+                    await interaction.followup.send(f"❌ Period is not in matching status (current: {status})")
+                    return
+
+                # Get teams with winning bids on their players
+                cursor = await db.execute(
+                    """SELECT DISTINCT t.team_id, t.team_name, t.channel_id
+                       FROM free_agency_results r
+                       JOIN teams t ON r.original_team_id = t.team_id
+                       WHERE r.period_id = ? AND r.winning_team_id IS NOT NULL
+                       AND t.channel_id IS NOT NULL""",
+                    (period_id,)
+                )
+                teams_with_losses = await cursor.fetchall()
+
+                matching_messages_sent = 0
+                for team_id, team_name, channel_id in teams_with_losses:
+                    try:
+                        # Get this team's players with bids
+                        cursor = await db.execute(
+                            """SELECT r.player_id, p.name, p.position, p.age, p.overall_rating,
+                                      r.winning_team_id, t.team_name, t.emoji_id, r.winning_bid
+                               FROM free_agency_results r
+                               JOIN players p ON r.player_id = p.player_id
+                               JOIN teams t ON r.winning_team_id = t.team_id
+                               WHERE r.period_id = ? AND r.original_team_id = ?""",
+                            (period_id, team_id)
+                        )
+                        player_bids = await cursor.fetchall()
+
+                        if player_bids:
+                            # Calculate remaining points for this team (300 - winning bids on other teams' players)
+                            cursor = await db.execute(
+                                """SELECT COALESCE(SUM(b.bid_amount), 0)
+                                   FROM free_agency_bids b
+                                   JOIN players p ON b.player_id = p.player_id
+                                   WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
+                                   AND p.team_id != ?""",
+                                (period_id, team_id, team_id)
+                            )
+                            winning_bid_total = (await cursor.fetchone())[0]
+                            remaining_points = 300 - winning_bid_total
+
+                            channel = self.bot.get_channel(int(channel_id))
+                            if channel:
+                                view = MatchingView(self.bot, period_id, team_id, team_name, player_bids, current_season, remaining_points)
+                                embed = await view.create_embed()
+                                await channel.send(embed=embed, view=view)
+                                matching_messages_sent += 1
+                    except Exception as e:
+                        print(f"Error sending matching message to {team_name}: {e}")
+
+                await interaction.followup.send(
+                    f"✅ Matching notifications resent to {matching_messages_sent} teams!"
                 )
 
         except Exception as e:
@@ -2358,7 +2528,7 @@ class MatchingView(discord.ui.View):
             inline=False
         )
 
-        embed.set_footer(text="Use the dropdown to select players to match, then click Confirm")
+        embed.set_footer(text="Use /auctionsmenu if the below button doesn't work")
         return embed
 
     async def select_callback(self, interaction: discord.Interaction):
@@ -3181,9 +3351,9 @@ class FreeResignSelectionView(discord.ui.View):
             )
 
         if self.is_confirmed:
-            embed.set_footer(text="✓ Confirmed - Use 'Edit Selections' to make changes")
+            embed.set_footer(text="✓ Confirmed - Use 'Edit Selections' to make changes | Use /auctionsmenu if the below button doesn't work")
         else:
-            embed.set_footer(text="Select players from the dropdown, then click 'Confirm Re-Signs'")
+            embed.set_footer(text="Use /auctionsmenu if the below button doesn't work")
 
         return embed
 
