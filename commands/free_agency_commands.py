@@ -823,16 +823,29 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Get user's bids
-                cursor = await db.execute(
-                    """SELECT b.bid_id, b.player_id, b.bid_amount, p.name, p.position, p.age, p.overall_rating,
-                              t.team_name, t.emoji_id
-                       FROM free_agency_bids b
-                       JOIN players p ON b.player_id = p.player_id
-                       JOIN teams t ON p.team_id = t.team_id
-                       WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'active'
-                       ORDER BY b.bid_amount DESC, p.name""",
-                    (period_id, user_team_id)
-                )
+                # During matching period, include 'winning' bids; during bidding, only 'active' bids
+                if period_status == 'matching':
+                    cursor = await db.execute(
+                        """SELECT b.bid_id, b.player_id, b.bid_amount, p.name, p.position, p.age, p.overall_rating,
+                                  t.team_name, t.emoji_id
+                           FROM free_agency_bids b
+                           JOIN players p ON b.player_id = p.player_id
+                           JOIN teams t ON p.team_id = t.team_id
+                           WHERE b.period_id = ? AND b.team_id = ? AND b.status IN ('active', 'winning')
+                           ORDER BY b.bid_amount DESC, p.name""",
+                        (period_id, user_team_id)
+                    )
+                else:
+                    cursor = await db.execute(
+                        """SELECT b.bid_id, b.player_id, b.bid_amount, p.name, p.position, p.age, p.overall_rating,
+                                  t.team_name, t.emoji_id
+                           FROM free_agency_bids b
+                           JOIN players p ON b.player_id = p.player_id
+                           JOIN teams t ON p.team_id = t.team_id
+                           WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'active'
+                           ORDER BY b.bid_amount DESC, p.name""",
+                        (period_id, user_team_id)
+                    )
                 bids = await cursor.fetchall()
 
                 # Calculate remaining points
