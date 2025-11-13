@@ -253,9 +253,13 @@ class FreeAgencyCommands(commands.Cog):
 
     async def log_winning_bids(self, db, period_id, current_season):
         """Log winning bids to auctions channel"""
-        log_channel = await self.get_auctions_log_channel(db)
-        if not log_channel:
-            print("No auctions log channel configured")
+        try:
+            log_channel = await self.get_auctions_log_channel(db)
+            if not log_channel:
+                print("No auctions log channel configured")
+                return
+        except Exception as e:
+            print(f"Error getting auctions log channel: {e}")
             return
 
         # Get all winning bids
@@ -274,7 +278,10 @@ class FreeAgencyCommands(commands.Cog):
         )
         winning_bids = await cursor.fetchall()
 
+        print(f"log_winning_bids: Found {len(winning_bids)} winning bids")
+
         if not winning_bids:
+            print("log_winning_bids: No winning bids found, returning early")
             return
 
         # Build embed
@@ -292,11 +299,14 @@ class FreeAgencyCommands(commands.Cog):
 
         team_points = {}
         for (team_id,) in all_teams:
-            # Calculate spent points
+            # Calculate spent points (winning bids on OTHER teams' players only)
             cursor = await db.execute(
-                """SELECT COALESCE(SUM(bid_amount), 0) FROM free_agency_bids
-                   WHERE period_id = ? AND team_id = ? AND status = 'active'""",
-                (period_id, team_id)
+                """SELECT COALESCE(SUM(b.bid_amount), 0)
+                   FROM free_agency_bids b
+                   JOIN players p ON b.player_id = p.player_id
+                   WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
+                   AND p.team_id != ?""",
+                (period_id, team_id, team_id)
             )
             spent = (await cursor.fetchone())[0]
             team_points[team_id] = 300 - spent
@@ -351,8 +361,11 @@ class FreeAgencyCommands(commands.Cog):
 
         try:
             await log_channel.send(embed=embed)
+            print(f"Successfully sent matching period notification to auctions log channel")
         except Exception as e:
             print(f"Error logging winning bids: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def log_final_movements(self, db, period_id, current_season):
         """Log final player movements and compensation picks to auctions channel"""
