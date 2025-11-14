@@ -1968,6 +1968,9 @@ class FreeAgencyCommands(commands.Cog):
 
                 embed.add_field(name=":green_circle: Players Gained", value=gained_text, inline=False)
 
+                # Add blank field for spacing
+                embed.add_field(name="\u200b", value="\u200b", inline=False)
+
                 # Players Lost
                 lost_text = ""
                 has_lost = False
@@ -2003,9 +2006,8 @@ class FreeAgencyCommands(commands.Cog):
 
                 embed.add_field(name=":red_circle: Players Lost", value=lost_text, inline=False)
 
-                # Footer for auto re-signed players
-                if auto_resigned_count > 0:
-                    embed.set_footer(text="All other free agents have been re-signed")
+                # Footer - always show for all teams
+                embed.set_footer(text="All other free agents have been re-signed")
 
                 # Send to team channel
                 if channel_id:
@@ -2181,13 +2183,21 @@ class FreeAgencyCommands(commands.Cog):
                     if draft:
                         draft_id, draft_name, draft_season = draft
 
-                        # Get all compensation results for this period
+                        # Get all compensation results for this period, ordered by band and ladder position
+                        # For bands 1,3,5: order doesn't matter as much (inserted after natural pick)
+                        # For bands 2,4: MUST be in reverse ladder order (worst team = highest position number = pick first)
                         cursor = await db.execute(
-                            """SELECT result_id, original_team_id, compensation_band, player_id
-                               FROM free_agency_results
-                               WHERE period_id = ? AND compensation_band IS NOT NULL
-                               ORDER BY compensation_band, original_team_id""",
-                            (period_id,)
+                            """SELECT r.result_id, r.original_team_id, r.compensation_band, r.player_id
+                               FROM free_agency_results r
+                               LEFT JOIN ladder_positions lp ON r.original_team_id = lp.team_id
+                               LEFT JOIN seasons s ON lp.season_id = s.season_id AND s.season_number = ?
+                               WHERE r.period_id = ? AND r.compensation_band IS NOT NULL
+                               ORDER BY r.compensation_band,
+                                        CASE
+                                            WHEN r.compensation_band IN (2, 4) THEN lp.position
+                                            ELSE r.original_team_id
+                                        END DESC""",
+                            (current_season, period_id)
                         )
                         comp_results = await cursor.fetchall()
 
