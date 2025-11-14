@@ -1875,6 +1875,134 @@ class FreeAgencyCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
 
+    async def send_auction_summaries(self, db, period_id):
+        """Send auction summary to each team's channel"""
+        try:
+            # Get all teams
+            cursor = await db.execute("SELECT team_id, team_name, emoji_id, channel_id FROM teams")
+            teams = await cursor.fetchall()
+
+            for team_id, team_name, emoji_id, channel_id in teams:
+                # Skip Draft Pool
+                if team_name == "Draft Pool":
+                    continue
+
+                # Get team emoji
+                team_emoji = ""
+                if emoji_id:
+                    try:
+                        emoji = self.bot.get_emoji(int(emoji_id))
+                        team_emoji = str(emoji) + " " if emoji else ""
+                    except:
+                        pass
+
+                # Get players gained (won bids)
+                cursor = await db.execute(
+                    """SELECT p.name, p.position, p.age, p.overall_rating, ot.emoji_id
+                       FROM free_agency_results r
+                       JOIN players p ON r.player_id = p.player_id
+                       JOIN teams ot ON r.original_team_id = ot.team_id
+                       WHERE r.period_id = ? AND r.winning_team_id = ? AND r.matched = 0
+                       ORDER BY p.overall_rating DESC, p.name""",
+                    (period_id, team_id)
+                )
+                players_gained = await cursor.fetchall()
+
+                # Get players lost (original team, lost to winning bids)
+                cursor = await db.execute(
+                    """SELECT p.name, p.position, p.age, p.overall_rating, r.compensation_band,
+                              dp.pick_number, r.matched, wt.emoji_id
+                       FROM free_agency_results r
+                       JOIN players p ON r.player_id = p.player_id
+                       LEFT JOIN draft_picks dp ON r.compensation_pick_id = dp.pick_id
+                       LEFT JOIN teams wt ON r.winning_team_id = wt.team_id
+                       WHERE r.period_id = ? AND r.original_team_id = ? AND (r.winning_team_id IS NOT NULL OR r.matched = 1)
+                       ORDER BY p.overall_rating DESC, p.name""",
+                    (period_id, team_id)
+                )
+                players_lost = await cursor.fetchall()
+
+                # Check if there are any auto re-signed players who had no bids
+                cursor = await db.execute(
+                    """SELECT COUNT(*)
+                       FROM free_agency_resigns fr
+                       JOIN players p ON fr.player_id = p.player_id
+                       WHERE fr.period_id = ? AND fr.team_id = ? AND fr.confirmed = 1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM free_agency_results r
+                           WHERE r.period_id = ? AND r.player_id = p.player_id
+                       )""",
+                    (period_id, team_id, period_id)
+                )
+                auto_resigned_count = (await cursor.fetchone())[0]
+
+                # Skip if no activity for this team
+                if not players_gained and not players_lost and auto_resigned_count == 0:
+                    continue
+
+                # Build summary message
+                summary = f"**Free Agency Period Summary - {team_emoji}{team_name}**\n\n"
+
+                # Players Gained
+                if players_gained:
+                    summary += ":green_circle: **Players Gained:**\n"
+                    for player_name, pos, age, ovr, prev_emoji_id in players_gained:
+                        prev_emoji = ""
+                        if prev_emoji_id:
+                            try:
+                                emoji = self.bot.get_emoji(int(prev_emoji_id))
+                                prev_emoji = str(emoji) + " " if emoji else ""
+                            except:
+                                pass
+                        summary += f"{prev_emoji}**{player_name}** ({pos}, {age}, {ovr})\n"
+                    summary += "\n"
+
+                # Players Lost
+                if players_lost:
+                    summary += ":red_circle: **Players Lost:**\n"
+                    for player_name, pos, age, ovr, comp_band, pick_num, matched, new_team_emoji_id in players_lost:
+                        if matched:
+                            # Player was matched - stayed with original team
+                            continue
+
+                        # Get new team emoji
+                        new_team_emoji = ""
+                        if new_team_emoji_id:
+                            try:
+                                emoji = self.bot.get_emoji(int(new_team_emoji_id))
+                                new_team_emoji = " → " + str(emoji) if emoji else ""
+                            except:
+                                pass
+
+                        summary += f"**{player_name}** ({pos}, {age}, {ovr}){new_team_emoji}\n"
+                        if comp_band and pick_num:
+                            summary += f"└─ Compensation: **Pick {pick_num}** (Band {comp_band})\n"
+                        elif comp_band:
+                            # Band exists but no pick number (shouldn't happen, but handle it)
+                            summary += f"└─ Compensation: **Band {comp_band}**\n"
+                        else:
+                            # No compensation granted
+                            summary += f"└─ No compensation granted\n"
+                    summary += "\n"
+
+                # Footer for auto re-signed players
+                if auto_resigned_count > 0:
+                    summary += "*All other free agents have been re-signed*"
+
+                # Send to team channel
+                if channel_id:
+                    try:
+                        channel = self.bot.get_channel(int(channel_id))
+                        if channel:
+                            await channel.send(summary.strip())
+                    except Exception as e:
+                        print(f"Error sending auction summary to {team_name}: {e}")
+
+        except Exception as e:
+            print(f"Error sending auction summaries: {e}")
+            import traceback
+            traceback.print_exc()
+
     async def end_matching_period(self, interaction: discord.Interaction):
         """Process matches, assign players, calculate compensation"""
         try:
@@ -2171,6 +2299,9 @@ class FreeAgencyCommands(commands.Cog):
 
                     for team_name, band, player_name in comp_picks:
                         message += f"\n• **{team_name}**: Band {band} pick (lost {player_name})"
+
+                # Send auction summaries to all team channels
+                await self.send_auction_summaries(db, period_id)
 
                 await interaction.followup.send(message)
 
