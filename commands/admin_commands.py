@@ -1000,19 +1000,28 @@ class AdminCommands(commands.Cog):
                 matches = await cursor.fetchall()
                 matches_df = pd.DataFrame(matches, columns=['Match_ID', 'Season', 'Round', 'Home_Team', 'Away_Team', 'Home_Score', 'Away_Score', 'Simulated'])
 
-                # Export Drafts
-                cursor = await db.execute(
-                    """SELECT draft_id as Draft_ID, draft_name as Draft_Name,
-                              season_number as Season_Number, status as Status,
-                              rounds as Rounds, rookie_contract_years as Rookie_Contract_Years,
-                              created_at as Created_At, ladder_set_at as Ladder_Set_At,
-                              started_at as Started_At, completed_at as Completed_At,
-                              current_pick_number as Current_Pick_Number
-                       FROM drafts
-                       ORDER BY draft_id"""
-                )
+                # Export Drafts (check which columns exist for backwards compatibility)
+                cursor = await db.execute("PRAGMA table_info(drafts)")
+                draft_columns = await cursor.fetchall()
+                draft_column_names = [col[1] for col in draft_columns]
+
+                # Build SELECT query based on available columns
+                draft_select = "draft_id as Draft_ID, draft_name as Draft_Name, season_number as Season_Number, status as Status, rounds as Rounds, rookie_contract_years as Rookie_Contract_Years, created_at as Created_At, ladder_set_at as Ladder_Set_At"
+                draft_col_list = ['Draft_ID', 'Draft_Name', 'Season_Number', 'Status', 'Rounds', 'Rookie_Contract_Years', 'Created_At', 'Ladder_Set_At']
+
+                if 'started_at' in draft_column_names:
+                    draft_select += ", started_at as Started_At"
+                    draft_col_list.append('Started_At')
+                if 'completed_at' in draft_column_names:
+                    draft_select += ", completed_at as Completed_At"
+                    draft_col_list.append('Completed_At')
+                if 'current_pick_number' in draft_column_names:
+                    draft_select += ", current_pick_number as Current_Pick_Number"
+                    draft_col_list.append('Current_Pick_Number')
+
+                cursor = await db.execute(f"SELECT {draft_select} FROM drafts ORDER BY draft_id")
                 drafts = await cursor.fetchall()
-                drafts_df = pd.DataFrame(drafts, columns=['Draft_ID', 'Draft_Name', 'Season_Number', 'Status', 'Rounds', 'Rookie_Contract_Years', 'Created_At', 'Ladder_Set_At', 'Started_At', 'Completed_At', 'Current_Pick_Number'])
+                drafts_df = pd.DataFrame(drafts, columns=draft_col_list)
                 drafts_df = drafts_df.fillna('')
 
                 # Export Draft Picks

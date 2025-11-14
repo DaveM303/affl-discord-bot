@@ -497,6 +497,28 @@ class SeasonCommands(commands.Cog):
                 if 'confirmed_at' not in column_names:
                     await db.execute("ALTER TABLE free_agency_results ADD COLUMN confirmed_at TIMESTAMP")
 
+                # Add live draft columns to drafts table if they don't exist
+                cursor = await db.execute("PRAGMA table_info(drafts)")
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+
+                if 'started_at' not in column_names:
+                    await db.execute("ALTER TABLE drafts ADD COLUMN started_at TIMESTAMP")
+                if 'completed_at' not in column_names:
+                    await db.execute("ALTER TABLE drafts ADD COLUMN completed_at TIMESTAMP")
+                if 'current_pick_number' not in column_names:
+                    await db.execute("ALTER TABLE drafts ADD COLUMN current_pick_number INTEGER DEFAULT 0")
+
+                # Add live draft columns to draft_picks table if they don't exist
+                cursor = await db.execute("PRAGMA table_info(draft_picks)")
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+
+                if 'passed' not in column_names:
+                    await db.execute("ALTER TABLE draft_picks ADD COLUMN passed INTEGER DEFAULT 0")
+                if 'picked_at' not in column_names:
+                    await db.execute("ALTER TABLE draft_picks ADD COLUMN picked_at TIMESTAMP")
+
                 await db.commit()
 
                 await interaction.followup.send(
