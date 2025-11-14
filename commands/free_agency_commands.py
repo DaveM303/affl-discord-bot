@@ -2463,7 +2463,7 @@ class MatchingNotificationView(discord.ui.View):
         self.period_id = period_id
         self.team_id = team_id
 
-    @discord.ui.button(label="Choose which bids to match", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Choose which bids to match", style=discord.ButtonStyle.primary, custom_id="matching_button")
     async def open_matching(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Open the matching interface"""
         try:
