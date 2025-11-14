@@ -1307,6 +1307,22 @@ class SetLadderModal(discord.ui.Modal):
                 # Delete all existing picks for this draft
                 await db.execute("DELETE FROM draft_picks WHERE draft_id = ?", (self.draft_id,))
 
+                # Save ladder positions if this draft is linked to a season
+                if self.season_number is not None:
+                    cursor = await db.execute("SELECT season_id FROM seasons WHERE season_number = ?", (self.season_number,))
+                    season_data = await cursor.fetchone()
+                    if season_data:
+                        season_id = season_data[0]
+                        # Delete existing ladder for this season
+                        await db.execute("DELETE FROM ladder_positions WHERE season_id = ?", (season_id,))
+
+                        # Insert new ladder positions
+                        for team_id, team_name, position in team_order:
+                            await db.execute(
+                                "INSERT INTO ladder_positions (season_id, team_id, position) VALUES (?, ?, ?)",
+                                (season_id, team_id, position)
+                            )
+
                 # Generate new picks with pick_number set, in reverse order (last place picks first)
                 pick_counter = 1
                 for round_num in range(1, self.rounds + 1):

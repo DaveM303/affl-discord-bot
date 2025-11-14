@@ -481,8 +481,8 @@ class FreeAgencyCommands(commands.Cog):
         # Get only players who moved clubs (not matched, has new team)
         cursor = await db.execute(
             """SELECT p.name, p.position, p.age, p.overall_rating,
-                      orig_team.team_name as original_team, orig_team.emoji_id as orig_emoji,
-                      new_team.team_name as new_team, new_team.emoji_id as new_emoji,
+                      orig_team.emoji_id as orig_emoji,
+                      new_team.emoji_id as new_emoji,
                       r.compensation_band, r.compensation_pick_id
                FROM free_agency_results r
                JOIN players p ON r.player_id = p.player_id
@@ -506,7 +506,7 @@ class FreeAgencyCommands(commands.Cog):
 
         # Build movement lines
         movement_lines = []
-        for name, pos, age, ovr, orig_team, orig_emoji, new_team, new_emoji, comp_band, comp_pick_id in transfers:
+        for name, pos, age, ovr, orig_emoji, new_emoji, comp_band, comp_pick_id in transfers:
             # Get emojis
             orig_emoji_str = ""
             if orig_emoji:
@@ -522,12 +522,12 @@ class FreeAgencyCommands(commands.Cog):
                 try:
                     emoji = self.bot.get_emoji(int(new_emoji))
                     if emoji:
-                        new_emoji_str = f"{emoji} "
+                        new_emoji_str = f" → {emoji}"
                 except:
                     pass
 
-            # Build player line
-            player_line = f"{orig_emoji_str}**{name}** ({pos}, {age}, {ovr}) → {new_emoji_str}{new_team}"
+            # Build player line (no team names)
+            player_line = f"{orig_emoji_str}**{name}** ({pos}, {age}, {ovr}){new_emoji_str}"
 
             # Add compensation line if applicable
             if comp_band and comp_pick_id:
@@ -539,10 +539,15 @@ class FreeAgencyCommands(commands.Cog):
                 pick_result = await cursor.fetchone()
                 if pick_result:
                     pick_num = pick_result[0]
-                    comp_line = f"└ {orig_emoji_str}receive Band {comp_band} compensation (pick {pick_num})"
+                    comp_line = f"└─ {orig_emoji_str}Compensation: **Pick {pick_num}** (Band {comp_band})"
                     player_line += f"\n{comp_line}"
+            elif comp_band:
+                # Has band but no pick (shouldn't happen)
+                comp_line = f"└─ {orig_emoji_str}Compensation: **Band {comp_band}**"
+                player_line += f"\n{comp_line}"
 
             movement_lines.append(player_line)
+            movement_lines.append("")  # Add blank line between players
 
         # Split into fields if needed
         if movement_lines:
@@ -1940,12 +1945,15 @@ class FreeAgencyCommands(commands.Cog):
                 if not players_gained and not players_lost and auto_resigned_count == 0:
                     continue
 
-                # Build summary message
-                summary = f"**Free Agency Period Summary - {team_emoji}{team_name}**\n\n"
+                # Build summary embed
+                embed = discord.Embed(
+                    title=f"Free Agency Period Summary - {team_emoji}{team_name}",
+                    color=discord.Color.blue()
+                )
 
                 # Players Gained
+                gained_text = ""
                 if players_gained:
-                    summary += ":green_circle: **Players Gained:**\n"
                     for player_name, pos, age, ovr, prev_emoji_id in players_gained:
                         prev_emoji = ""
                         if prev_emoji_id:
@@ -1954,16 +1962,22 @@ class FreeAgencyCommands(commands.Cog):
                                 prev_emoji = str(emoji) + " " if emoji else ""
                             except:
                                 pass
-                        summary += f"{prev_emoji}**{player_name}** ({pos}, {age}, {ovr})\n"
-                    summary += "\n"
+                        gained_text += f"{prev_emoji}**{player_name}** ({pos}, {age}, {ovr})\n"
+                else:
+                    gained_text = "*None*"
+
+                embed.add_field(name=":green_circle: Players Gained", value=gained_text, inline=False)
 
                 # Players Lost
+                lost_text = ""
+                has_lost = False
                 if players_lost:
-                    summary += ":red_circle: **Players Lost:**\n"
                     for player_name, pos, age, ovr, comp_band, pick_num, matched, new_team_emoji_id in players_lost:
                         if matched:
                             # Player was matched - stayed with original team
                             continue
+
+                        has_lost = True
 
                         # Get new team emoji
                         new_team_emoji = ""
@@ -1974,27 +1988,31 @@ class FreeAgencyCommands(commands.Cog):
                             except:
                                 pass
 
-                        summary += f"**{player_name}** ({pos}, {age}, {ovr}){new_team_emoji}\n"
+                        lost_text += f"**{player_name}** ({pos}, {age}, {ovr}){new_team_emoji}\n"
                         if comp_band and pick_num:
-                            summary += f"└─ Compensation: **Pick {pick_num}** (Band {comp_band})\n"
+                            lost_text += f"└─ Compensation: **Pick {pick_num}** (Band {comp_band})\n"
                         elif comp_band:
                             # Band exists but no pick number (shouldn't happen, but handle it)
-                            summary += f"└─ Compensation: **Band {comp_band}**\n"
+                            lost_text += f"└─ Compensation: **Band {comp_band}**\n"
                         else:
                             # No compensation granted
-                            summary += f"└─ No compensation granted\n"
-                    summary += "\n"
+                            lost_text += f"└─ No compensation granted\n"
+
+                if not has_lost:
+                    lost_text = "*None*"
+
+                embed.add_field(name=":red_circle: Players Lost", value=lost_text, inline=False)
 
                 # Footer for auto re-signed players
                 if auto_resigned_count > 0:
-                    summary += "*All other free agents have been re-signed*"
+                    embed.set_footer(text="All other free agents have been re-signed")
 
                 # Send to team channel
                 if channel_id:
                     try:
                         channel = self.bot.get_channel(int(channel_id))
                         if channel:
-                            await channel.send(summary.strip())
+                            await channel.send(embed=embed)
                     except Exception as e:
                         print(f"Error sending auction summary to {team_name}: {e}")
 
