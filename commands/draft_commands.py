@@ -836,6 +836,200 @@ class DraftCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
+    @app_commands.command(name="startdraft", description="[ADMIN] Start a live draft")
+    @app_commands.describe(draft_name="Name of the draft to start")
+    @app_commands.autocomplete(draft_name=draft_name_autocomplete)
+    async def start_draft(self, interaction: discord.Interaction, draft_name: str):
+        await interaction.response.defer(ephemeral=True)
+
+        # Check if user has admin role
+        if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
+            await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get draft info
+                cursor = await db.execute(
+                    "SELECT draft_id, status, rounds, season_number FROM drafts WHERE draft_name = ?",
+                    (draft_name,)
+                )
+                draft_info = await cursor.fetchone()
+
+                if not draft_info:
+                    await interaction.followup.send(f"❌ Draft '{draft_name}' not found!", ephemeral=True)
+                    return
+
+                draft_id, status, rounds, season_number = draft_info
+
+                # Check if draft is current (has ladder set)
+                if status != 'current':
+                    await interaction.followup.send(
+                        f"❌ Draft '{draft_name}' is not ready to start (status: {status})!\n"
+                        f"Use `/setdraftladder` to set the draft order first.",
+                        ephemeral=True
+                    )
+                    return
+
+                # Check if draft has already been started
+                cursor = await db.execute(
+                    "SELECT started_at FROM drafts WHERE draft_id = ?",
+                    (draft_id,)
+                )
+                started_at = (await cursor.fetchone())[0]
+                if started_at:
+                    await interaction.followup.send(
+                        f"❌ Draft '{draft_name}' has already been started!",
+                        ephemeral=True
+                    )
+                    return
+
+                # Get draft channel from settings
+                cursor = await db.execute(
+                    "SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'"
+                )
+                result = await cursor.fetchone()
+                if not result or not result[0]:
+                    await interaction.followup.send(
+                        "❌ No draft channel configured! Use `/config` to set the draft channel.",
+                        ephemeral=True
+                    )
+                    return
+
+                draft_channel_id = int(result[0])
+                draft_channel = self.bot.get_channel(draft_channel_id)
+                if not draft_channel:
+                    await interaction.followup.send(
+                        "❌ Draft channel not found! Please check the configuration.",
+                        ephemeral=True
+                    )
+                    return
+
+                # Check if there are draft-eligible players (in Draft Pool team)
+                cursor = await db.execute(
+                    """SELECT COUNT(*) FROM players p
+                       JOIN teams t ON p.team_id = t.team_id
+                       WHERE t.team_name = 'Draft Pool'"""
+                )
+                draft_pool_count = (await cursor.fetchone())[0]
+
+                if draft_pool_count == 0:
+                    await interaction.followup.send(
+                        "❌ No players in the Draft Pool! Use `/updateplayer` to assign players to the 'Draft Pool' team.",
+                        ephemeral=True
+                    )
+                    return
+
+                # Update draft status to 'in_progress' and set started_at
+                await db.execute(
+                    """UPDATE drafts
+                       SET status = 'in_progress', started_at = CURRENT_TIMESTAMP, current_pick_number = 1
+                       WHERE draft_id = ?""",
+                    (draft_id,)
+                )
+                await db.commit()
+
+                # Post draft start message to draft channel
+                await draft_channel.send(f"# {draft_name}")
+
+                # Send first pick notification
+                await self.send_pick_notification(db, draft_id, draft_name, 1)
+
+                await interaction.followup.send(
+                    f"✅ **Draft Started!**\n\n"
+                    f"**Draft:** {draft_name}\n"
+                    f"**Rounds:** {rounds}\n"
+                    f"**Players Available:** {draft_pool_count}\n\n"
+                    f"Pick notifications have been sent to team channels.",
+                    ephemeral=True
+                )
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+            import traceback
+            traceback.print_exc()
+
+    async def send_pick_notification(self, db, draft_id, draft_name, pick_number):
+        """Send draft pick notification to team's channel"""
+        try:
+            # Get the pick info
+            cursor = await db.execute(
+                """SELECT dp.current_team_id, dp.round_number, dp.pick_number, t.team_name, t.channel_id
+                   FROM draft_picks dp
+                   JOIN teams t ON dp.current_team_id = t.team_id
+                   WHERE dp.draft_id = ? AND dp.pick_number = ? AND dp.player_selected_id IS NULL""",
+                (draft_id, pick_number)
+            )
+            pick_info = await cursor.fetchone()
+
+            if not pick_info:
+                # Draft is complete
+                await self.complete_draft(db, draft_id, draft_name)
+                return
+
+            team_id, round_number, pick_num, team_name, channel_id = pick_info
+
+            if not channel_id:
+                print(f"No channel configured for team {team_name}")
+                return
+
+            team_channel = self.bot.get_channel(int(channel_id))
+            if not team_channel:
+                print(f"Channel not found for team {team_name}")
+                return
+
+            # Get draft channel
+            cursor = await db.execute(
+                "SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'"
+            )
+            result = await cursor.fetchone()
+            draft_channel_id = int(result[0]) if result and result[0] else None
+            draft_channel = self.bot.get_channel(draft_channel_id) if draft_channel_id else None
+
+            # Post "on the clock" message to draft channel
+            if draft_channel:
+                await draft_channel.send(f"**{team_name}** is on the clock (Round {round_number}, Pick {pick_num})")
+
+            # Send interactive notification to team channel
+            view = DraftPickView(self.bot, draft_id, draft_name, team_id, pick_number)
+            embed = await view.create_embed(db)
+            await team_channel.send(embed=embed, view=view)
+
+        except Exception as e:
+            print(f"Error sending pick notification: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def complete_draft(self, db, draft_id, draft_name):
+        """Mark draft as completed and post completion message"""
+        try:
+            # Update draft status
+            await db.execute(
+                """UPDATE drafts
+                   SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                   WHERE draft_id = ?""",
+                (draft_id,)
+            )
+            await db.commit()
+
+            # Get draft channel
+            cursor = await db.execute(
+                "SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'"
+            )
+            result = await cursor.fetchone()
+            draft_channel_id = int(result[0]) if result and result[0] else None
+            draft_channel = self.bot.get_channel(draft_channel_id) if draft_channel_id else None
+
+            if draft_channel:
+                await draft_channel.send(f"# End of Draft")
+
+            print(f"Draft '{draft_name}' completed!")
+
+        except Exception as e:
+            print(f"Error completing draft: {e}")
+            import traceback
+            traceback.print_exc()
+
 
 class LadderEntryStartView(discord.ui.View):
     def __init__(self, teams, draft_name, rounds, rookie_contract_years, save_ladder_for_season, linked_season=None):
@@ -1237,201 +1431,6 @@ class DraftOrderView(discord.ui.View):
             self.update_buttons()
             embed = self.create_embed()
             await interaction.response.edit_message(embed=embed, view=self)
-
-
-    @app_commands.command(name="startdraft", description="[ADMIN] Start a live draft")
-    @app_commands.describe(draft_name="Name of the draft to start")
-    @app_commands.autocomplete(draft_name=draft_name_autocomplete)
-    async def start_draft(self, interaction: discord.Interaction, draft_name: str):
-        await interaction.response.defer(ephemeral=True)
-
-        # Check if user has admin role
-        if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
-            await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
-            return
-
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                # Get draft info
-                cursor = await db.execute(
-                    "SELECT draft_id, status, rounds, season_number FROM drafts WHERE draft_name = ?",
-                    (draft_name,)
-                )
-                draft_info = await cursor.fetchone()
-
-                if not draft_info:
-                    await interaction.followup.send(f"❌ Draft '{draft_name}' not found!", ephemeral=True)
-                    return
-
-                draft_id, status, rounds, season_number = draft_info
-
-                # Check if draft is current (has ladder set)
-                if status != 'current':
-                    await interaction.followup.send(
-                        f"❌ Draft '{draft_name}' is not ready to start (status: {status})!\n"
-                        f"Use `/setdraftladder` to set the draft order first.",
-                        ephemeral=True
-                    )
-                    return
-
-                # Check if draft has already been started
-                cursor = await db.execute(
-                    "SELECT started_at FROM drafts WHERE draft_id = ?",
-                    (draft_id,)
-                )
-                started_at = (await cursor.fetchone())[0]
-                if started_at:
-                    await interaction.followup.send(
-                        f"❌ Draft '{draft_name}' has already been started!",
-                        ephemeral=True
-                    )
-                    return
-
-                # Get draft channel from settings
-                cursor = await db.execute(
-                    "SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'"
-                )
-                result = await cursor.fetchone()
-                if not result or not result[0]:
-                    await interaction.followup.send(
-                        "❌ No draft channel configured! Use `/config` to set the draft channel.",
-                        ephemeral=True
-                    )
-                    return
-
-                draft_channel_id = int(result[0])
-                draft_channel = self.bot.get_channel(draft_channel_id)
-                if not draft_channel:
-                    await interaction.followup.send(
-                        "❌ Draft channel not found! Please check the configuration.",
-                        ephemeral=True
-                    )
-                    return
-
-                # Check if there are draft-eligible players (in Draft Pool team)
-                cursor = await db.execute(
-                    """SELECT COUNT(*) FROM players p
-                       JOIN teams t ON p.team_id = t.team_id
-                       WHERE t.team_name = 'Draft Pool'"""
-                )
-                draft_pool_count = (await cursor.fetchone())[0]
-
-                if draft_pool_count == 0:
-                    await interaction.followup.send(
-                        "❌ No players in the Draft Pool! Use `/updateplayer` to assign players to the 'Draft Pool' team.",
-                        ephemeral=True
-                    )
-                    return
-
-                # Update draft status to 'in_progress' and set started_at
-                await db.execute(
-                    """UPDATE drafts
-                       SET status = 'in_progress', started_at = CURRENT_TIMESTAMP, current_pick_number = 1
-                       WHERE draft_id = ?""",
-                    (draft_id,)
-                )
-                await db.commit()
-
-                # Post draft start message to draft channel
-                await draft_channel.send(f"# {draft_name}")
-
-                # Send first pick notification
-                await self.send_pick_notification(db, draft_id, draft_name, 1)
-
-                await interaction.followup.send(
-                    f"✅ **Draft Started!**\n\n"
-                    f"**Draft:** {draft_name}\n"
-                    f"**Rounds:** {rounds}\n"
-                    f"**Players Available:** {draft_pool_count}\n\n"
-                    f"Pick notifications have been sent to team channels.",
-                    ephemeral=True
-                )
-
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
-            import traceback
-            traceback.print_exc()
-
-    async def send_pick_notification(self, db, draft_id, draft_name, pick_number):
-        """Send draft pick notification to team's channel"""
-        try:
-            # Get the pick info
-            cursor = await db.execute(
-                """SELECT dp.current_team_id, dp.round_number, dp.pick_number, t.team_name, t.channel_id
-                   FROM draft_picks dp
-                   JOIN teams t ON dp.current_team_id = t.team_id
-                   WHERE dp.draft_id = ? AND dp.pick_number = ? AND dp.player_selected_id IS NULL""",
-                (draft_id, pick_number)
-            )
-            pick_info = await cursor.fetchone()
-
-            if not pick_info:
-                # Draft is complete
-                await self.complete_draft(db, draft_id, draft_name)
-                return
-
-            team_id, round_number, pick_num, team_name, channel_id = pick_info
-
-            if not channel_id:
-                print(f"No channel configured for team {team_name}")
-                return
-
-            team_channel = self.bot.get_channel(int(channel_id))
-            if not team_channel:
-                print(f"Channel not found for team {team_name}")
-                return
-
-            # Get draft channel
-            cursor = await db.execute(
-                "SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'"
-            )
-            result = await cursor.fetchone()
-            draft_channel_id = int(result[0]) if result and result[0] else None
-            draft_channel = self.bot.get_channel(draft_channel_id) if draft_channel_id else None
-
-            # Post "on the clock" message to draft channel
-            if draft_channel:
-                await draft_channel.send(f"**{team_name}** is on the clock (Round {round_number}, Pick {pick_num})")
-
-            # Send interactive notification to team channel
-            view = DraftPickView(self.bot, draft_id, draft_name, team_id, pick_number)
-            embed = await view.create_embed(db)
-            await team_channel.send(embed=embed, view=view)
-
-        except Exception as e:
-            print(f"Error sending pick notification: {e}")
-            import traceback
-            traceback.print_exc()
-
-    async def complete_draft(self, db, draft_id, draft_name):
-        """Mark draft as completed and post completion message"""
-        try:
-            # Update draft status
-            await db.execute(
-                """UPDATE drafts
-                   SET status = 'completed', completed_at = CURRENT_TIMESTAMP
-                   WHERE draft_id = ?""",
-                (draft_id,)
-            )
-            await db.commit()
-
-            # Get draft channel
-            cursor = await db.execute(
-                "SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'"
-            )
-            result = await cursor.fetchone()
-            draft_channel_id = int(result[0]) if result and result[0] else None
-            draft_channel = self.bot.get_channel(draft_channel_id) if draft_channel_id else None
-
-            if draft_channel:
-                await draft_channel.send(f"# End of Draft")
-
-            print(f"Draft '{draft_name}' completed!")
-
-        except Exception as e:
-            print(f"Error completing draft: {e}")
-            import traceback
-            traceback.print_exc()
 
 
 class DraftPickView(discord.ui.View):
