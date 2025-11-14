@@ -282,6 +282,7 @@ class AdminCommands(commands.Cog):
         trade_log_channel="Channel where approved trades are announced",
         auctions_log_channel="Channel where free agency auction results are logged",
         bot_logs_channel="Channel where bot actions (bids, re-signs, matches) are logged",
+        draft_channel="Channel where draft picks are announced",
         season_1_year="Calendar year of Season 1 (for player aging)"
     )
     async def config(
@@ -293,16 +294,17 @@ class AdminCommands(commands.Cog):
         trade_log_channel: discord.TextChannel = None,
         auctions_log_channel: discord.TextChannel = None,
         bot_logs_channel: discord.TextChannel = None,
+        draft_channel: discord.TextChannel = None,
         season_1_year: int = None
     ):
         # If no parameters provided, show current settings
-        if all(ch is None for ch in [lineups_channel, delist_log_channel, trade_approval_channel, trade_log_channel, auctions_log_channel, bot_logs_channel, season_1_year]):
+        if all(ch is None for ch in [lineups_channel, delist_log_channel, trade_approval_channel, trade_log_channel, auctions_log_channel, bot_logs_channel, draft_channel, season_1_year]):
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
                     """SELECT setting_key, setting_value FROM settings
                        WHERE setting_key IN ('lineups_channel_id', 'delist_log_channel_id',
                                              'trade_approval_channel_id', 'trade_log_channel_id',
-                                             'auctions_log_channel_id', 'bot_logs_channel_id', 'season_1_year')"""
+                                             'auctions_log_channel_id', 'bot_logs_channel_id', 'draft_channel_id', 'season_1_year')"""
                 )
                 results = await cursor.fetchall()
 
@@ -357,6 +359,14 @@ class AdminCommands(commands.Cog):
             else:
                 channel_display = "*Not set*"
             embed.add_field(name="Bot Logs Channel", value=channel_display, inline=False)
+
+            # Draft Channel
+            if 'draft_channel_id' in settings and settings['draft_channel_id']:
+                channel = interaction.guild.get_channel(int(settings['draft_channel_id']))
+                channel_display = channel.mention if channel else f"<#{settings['draft_channel_id']}> (channel not found)"
+            else:
+                channel_display = "*Not set*"
+            embed.add_field(name="Draft Channel", value=channel_display, inline=False)
 
             # Season 1 Year
             if 'season_1_year' in settings and settings['season_1_year']:
@@ -414,6 +424,13 @@ class AdminCommands(commands.Cog):
                     ("bot_logs_channel_id", str(bot_logs_channel.id))
                 )
                 updates.append(f"Bot Logs Channel → {bot_logs_channel.mention}")
+
+            if draft_channel:
+                await db.execute(
+                    "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
+                    ("draft_channel_id", str(draft_channel.id))
+                )
+                updates.append(f"Draft Channel → {draft_channel.mention}")
 
             if season_1_year is not None:
                 await db.execute(
@@ -983,21 +1000,50 @@ class AdminCommands(commands.Cog):
                 matches = await cursor.fetchall()
                 matches_df = pd.DataFrame(matches, columns=['Match_ID', 'Season', 'Round', 'Home_Team', 'Away_Team', 'Home_Score', 'Away_Score', 'Simulated'])
 
+                # Export Drafts
+                cursor = await db.execute(
+                    """SELECT draft_id as Draft_ID, draft_name as Draft_Name,
+                              season_number as Season_Number, status as Status,
+                              rounds as Rounds, rookie_contract_years as Rookie_Contract_Years,
+                              created_at as Created_At, ladder_set_at as Ladder_Set_At,
+                              started_at as Started_At, completed_at as Completed_At,
+                              current_pick_number as Current_Pick_Number
+                       FROM drafts
+                       ORDER BY draft_id"""
+                )
+                drafts = await cursor.fetchall()
+                drafts_df = pd.DataFrame(drafts, columns=['Draft_ID', 'Draft_Name', 'Season_Number', 'Status', 'Rounds', 'Rookie_Contract_Years', 'Created_At', 'Ladder_Set_At', 'Started_At', 'Completed_At', 'Current_Pick_Number'])
+                drafts_df = drafts_df.fillna('')
+
                 # Export Draft Picks
                 cursor = await db.execute(
                     """SELECT dp.pick_id as Pick_ID, dp.draft_name as Draft_Name,
                               dp.round_number as Round, dp.pick_number as Pick,
                               dp.pick_origin as Pick_Origin, ct.team_name as Current_Team,
-                              p.name as Player_Selected
+                              p.name as Player_Selected, dp.passed as Passed,
+                              dp.picked_at as Picked_At
                        FROM draft_picks dp
                        JOIN teams ct ON dp.current_team_id = ct.team_id
                        LEFT JOIN players p ON dp.player_selected_id = p.player_id
                        ORDER BY dp.draft_name, dp.round_number, dp.pick_number"""
                 )
                 draft_picks = await cursor.fetchall()
-                draft_picks_df = pd.DataFrame(draft_picks, columns=['Pick_ID', 'Draft_Name', 'Round', 'Pick', 'Pick_Origin', 'Current_Team', 'Player_Selected'])
+                draft_picks_df = pd.DataFrame(draft_picks, columns=['Pick_ID', 'Draft_Name', 'Round', 'Pick', 'Pick_Origin', 'Current_Team', 'Player_Selected', 'Passed', 'Picked_At'])
                 draft_picks_df['Pick_Origin'] = draft_picks_df['Pick_Origin'].fillna('')
                 draft_picks_df['Player_Selected'] = draft_picks_df['Player_Selected'].fillna('')
+                draft_picks_df['Picked_At'] = draft_picks_df['Picked_At'].fillna('')
+
+                # Export Ladder Positions
+                cursor = await db.execute(
+                    """SELECT lp.ladder_id as Ladder_ID, s.season_number as Season,
+                              t.team_name as Team, lp.position as Position
+                       FROM ladder_positions lp
+                       JOIN seasons s ON lp.season_id = s.season_id
+                       JOIN teams t ON lp.team_id = t.team_id
+                       ORDER BY s.season_number, lp.position"""
+                )
+                ladder_positions = await cursor.fetchall()
+                ladder_positions_df = pd.DataFrame(ladder_positions, columns=['Ladder_ID', 'Season', 'Team', 'Position'])
 
                 # Export Submitted Lineups
                 cursor = await db.execute(
@@ -1139,7 +1185,9 @@ class AdminCommands(commands.Cog):
                 starting_lineups_df.to_excel(writer, sheet_name='Starting_Lineups', index=False)
                 injuries_df.to_excel(writer, sheet_name='Injuries', index=False)
                 suspensions_df.to_excel(writer, sheet_name='Suspensions', index=False)
+                drafts_df.to_excel(writer, sheet_name='Drafts', index=False)
                 draft_picks_df.to_excel(writer, sheet_name='Draft_Picks', index=False)
+                ladder_positions_df.to_excel(writer, sheet_name='Ladder_Positions', index=False)
                 free_agency_periods_df.to_excel(writer, sheet_name='Free_Agency_Periods', index=False)
                 free_agency_bids_df.to_excel(writer, sheet_name='Free_Agency_Bids', index=False)
                 free_agency_resigns_df.to_excel(writer, sheet_name='Free_Agency_Re-Signs', index=False)
@@ -1735,6 +1783,39 @@ class AdminCommands(commands.Cog):
                     if 'Worksheet Matches' not in str(e):
                         errors.append(f"Matches sheet error: {str(e)}")
 
+                # Import Drafts (optional sheet - new fields for live draft)
+                drafts_imported = 0
+                try:
+                    drafts_df = pd.read_excel(excel_file, sheet_name='Drafts')
+
+                    # Update existing drafts with new fields
+                    for _, row in drafts_df.iterrows():
+                        try:
+                            draft_id = int(row['Draft_ID']) if pd.notna(row['Draft_ID']) else None
+                            if not draft_id:
+                                continue
+
+                            # Get fields (handle NaN)
+                            started_at = str(row['Started_At']) if 'Started_At' in row and pd.notna(row['Started_At']) and row['Started_At'] else None
+                            completed_at = str(row['Completed_At']) if 'Completed_At' in row and pd.notna(row['Completed_At']) and row['Completed_At'] else None
+                            current_pick_number = int(row['Current_Pick_Number']) if 'Current_Pick_Number' in row and pd.notna(row['Current_Pick_Number']) else 0
+
+                            # Update draft with new fields
+                            await db.execute(
+                                """UPDATE drafts
+                                   SET started_at = ?, completed_at = ?, current_pick_number = ?
+                                   WHERE draft_id = ?""",
+                                (started_at, completed_at, current_pick_number, draft_id)
+                            )
+                            drafts_imported += 1
+                        except Exception as e:
+                            errors.append(f"Draft {row.get('Draft_ID', 'Unknown')}: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    # Drafts sheet is optional (for backwards compatibility)
+                    if 'Worksheet Drafts' not in str(e):
+                        errors.append(f"Drafts sheet error: {str(e)}")
+
                 # Import Draft Picks
                 draft_picks_imported = 0
                 try:
@@ -1803,13 +1884,17 @@ class AdminCommands(commands.Cog):
                                     draft_id = cursor.lastrowid
 
                             if current_team and pick_id and draft_id:
+                                # Get passed and picked_at if they exist
+                                passed = int(row['Passed']) if 'Passed' in row and pd.notna(row['Passed']) else 0
+                                picked_at = str(row['Picked_At']) if 'Picked_At' in row and pd.notna(row['Picked_At']) and row['Picked_At'] else None
+
                                 await db.execute(
                                     """INSERT INTO draft_picks
                                        (pick_id, draft_id, draft_name, season_number, round_number, pick_number,
-                                        pick_origin, original_team_id, current_team_id, player_selected_id)
-                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                        pick_origin, original_team_id, current_team_id, player_selected_id, passed, picked_at)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                                     (pick_id, draft_id, draft_name, season_number, round_number, pick_number,
-                                     pick_origin, original_team_id, current_team[0], player_id)
+                                     pick_origin, original_team_id, current_team[0], player_id, passed, picked_at)
                                 )
                                 draft_picks_imported += 1
                         except Exception as e:
@@ -1818,6 +1903,39 @@ class AdminCommands(commands.Cog):
                 except Exception as e:
                     if 'Worksheet Draft_Picks' not in str(e):
                         errors.append(f"Draft Picks sheet error: {str(e)}")
+
+                # Import Ladder Positions
+                ladder_positions_imported = 0
+                try:
+                    ladder_positions_df = pd.read_excel(excel_file, sheet_name='Ladder_Positions')
+
+                    # Clear existing ladder positions
+                    await db.execute("DELETE FROM ladder_positions")
+
+                    for _, row in ladder_positions_df.iterrows():
+                        try:
+                            # Get season ID
+                            cursor = await db.execute("SELECT season_id FROM seasons WHERE season_number = ?", (int(row['Season']),))
+                            season = await cursor.fetchone()
+
+                            # Get team ID
+                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Team']),))
+                            team = await cursor.fetchone()
+
+                            if season and team:
+                                await db.execute(
+                                    """INSERT INTO ladder_positions
+                                       (ladder_id, season_id, team_id, position)
+                                       VALUES (?, ?, ?, ?)""",
+                                    (int(row['Ladder_ID']), season[0], team[0], int(row['Position']))
+                                )
+                                ladder_positions_imported += 1
+                        except Exception as e:
+                            errors.append(f"Ladder Position {row['Ladder_ID']}: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Ladder_Positions' not in str(e):
+                        errors.append(f"Ladder Positions sheet error: {str(e)}")
 
                 # Import Submitted Lineups
                 submitted_lineups_imported = 0
@@ -2189,8 +2307,12 @@ class AdminCommands(commands.Cog):
                 response += f"**Injuries:** {injuries_imported} imported\n"
             if suspensions_imported > 0:
                 response += f"**Suspensions:** {suspensions_imported} imported\n"
+            if drafts_imported > 0:
+                response += f"**Drafts:** {drafts_imported} updated\n"
             if draft_picks_imported > 0:
                 response += f"**Draft Picks:** {draft_picks_imported} imported\n"
+            if ladder_positions_imported > 0:
+                response += f"**Ladder Positions:** {ladder_positions_imported} imported\n"
             if trades_imported > 0:
                 response += f"**Trades:** {trades_imported} imported\n"
             if matches_imported > 0:

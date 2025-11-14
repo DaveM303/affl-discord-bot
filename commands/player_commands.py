@@ -259,6 +259,9 @@ class PlayerCommands(commands.Cog):
             embed = discord.Embed(title=f"{team_title}", color=discord.Color.blue())
 
             if players:
+                # Hide OVR for Draft Pool team
+                is_draft_pool = (t_name == "Draft Pool")
+
                 # Check if we should group by position
                 if sort_by == "position":
                     # Group players by position
@@ -267,7 +270,8 @@ class PlayerCommands(commands.Cog):
                     for name, pos, rating, age in players:
                         if pos not in position_groups:
                             position_groups[pos] = []
-                        position_groups[pos].append(f"**{name}** - {rating} OVR, {age}yo")
+                        ovr_display = "??" if is_draft_pool else str(rating)
+                        position_groups[pos].append(f"**{name}** - {ovr_display} OVR, {age}yo")
 
                     # Add fields in POSITION_DISPLAY_ORDER
                     for pos in POSITION_DISPLAY_ORDER:
@@ -281,7 +285,8 @@ class PlayerCommands(commands.Cog):
                     # Build simple player list
                     player_lines = []
                     for name, pos, rating, age in players:
-                        player_lines.append(f"**{name}** - {pos}, {rating} OVR, {age}yo")
+                        ovr_display = "??" if is_draft_pool else str(rating)
+                        player_lines.append(f"**{name}** - {pos}, {ovr_display} OVR, {age}yo")
 
                     # Split into chunks if needed (Discord embed description limit is 4096 chars)
                     description = "\n".join(player_lines)
@@ -517,7 +522,14 @@ class SearchPlayersView(discord.ui.View):
                 team_prefix = f"{emoji} " if emoji else ""
             else:
                 team_prefix = ""
-            player_lines.append(f"{team_prefix}**{name}** - {pos} ({rating} OVR, {age}yo)")
+
+            # Hide OVR for Draft Pool players
+            if team == "Draft Pool":
+                ovr_display = "??"
+            else:
+                ovr_display = str(rating)
+
+            player_lines.append(f"{team_prefix}**{name}** - {pos} ({ovr_display} OVR, {age}yo)")
         
         player_text = "\n".join(player_lines)
         

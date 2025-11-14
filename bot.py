@@ -88,6 +88,9 @@ async def init_db():
                 rookie_contract_years INTEGER DEFAULT 3,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 ladder_set_at TIMESTAMP NULL,
+                started_at TIMESTAMP NULL,
+                completed_at TIMESTAMP NULL,
+                current_pick_number INTEGER DEFAULT 0,
                 FOREIGN KEY (season_number) REFERENCES seasons(season_number)
             )
         ''')
@@ -105,6 +108,8 @@ async def init_db():
                 original_team_id INTEGER,
                 current_team_id INTEGER,
                 player_selected_id INTEGER,
+                passed INTEGER DEFAULT 0,
+                picked_at TIMESTAMP NULL,
                 FOREIGN KEY (draft_id) REFERENCES drafts(draft_id),
                 FOREIGN KEY (season_number) REFERENCES seasons(season_number),
                 FOREIGN KEY (original_team_id) REFERENCES teams(team_id),
@@ -306,6 +311,15 @@ async def init_db():
                 UNIQUE(period_id, player_id)
             )
         ''')
+
+        # Create Draft Pool team if it doesn't exist
+        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = 'Draft Pool'")
+        if not await cursor.fetchone():
+            await db.execute(
+                """INSERT INTO teams (team_name, role_id, channel_id, emoji_id)
+                   VALUES ('Draft Pool', NULL, NULL, NULL)"""
+            )
+            print("Created 'Draft Pool' team")
 
         await db.commit()
         print("Database initialized successfully!")
