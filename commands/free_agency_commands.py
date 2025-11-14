@@ -1966,10 +1966,10 @@ class FreeAgencyCommands(commands.Cog):
                 else:
                     gained_text = "*None*"
 
-                embed.add_field(name=":green_circle: Players Gained", value=gained_text, inline=False)
+                # Add extra newline for spacing
+                gained_text += "\n"
 
-                # Add blank field for spacing
-                embed.add_field(name="\u200b", value="\u200b", inline=False)
+                embed.add_field(name=":green_circle: Players Gained", value=gained_text, inline=False)
 
                 # Players Lost
                 lost_text = ""
