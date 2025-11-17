@@ -1805,17 +1805,27 @@ class AdminCommands(commands.Cog):
                                 continue
 
                             # Get fields (handle NaN)
+                            status = str(row['Status']) if 'Status' in row and pd.notna(row['Status']) else None
                             started_at = str(row['Started_At']) if 'Started_At' in row and pd.notna(row['Started_At']) and row['Started_At'] else None
                             completed_at = str(row['Completed_At']) if 'Completed_At' in row and pd.notna(row['Completed_At']) and row['Completed_At'] else None
                             current_pick_number = int(row['Current_Pick_Number']) if 'Current_Pick_Number' in row and pd.notna(row['Current_Pick_Number']) else 0
 
-                            # Update draft with new fields
-                            await db.execute(
-                                """UPDATE drafts
-                                   SET started_at = ?, completed_at = ?, current_pick_number = ?
-                                   WHERE draft_id = ?""",
-                                (started_at, completed_at, current_pick_number, draft_id)
-                            )
+                            # Update draft - use the Status from the Excel file
+                            if status:
+                                await db.execute(
+                                    """UPDATE drafts
+                                       SET started_at = ?, completed_at = ?, current_pick_number = ?, status = ?
+                                       WHERE draft_id = ?""",
+                                    (started_at, completed_at, current_pick_number, status, draft_id)
+                                )
+                            else:
+                                # No status in Excel, just update the timestamps
+                                await db.execute(
+                                    """UPDATE drafts
+                                       SET started_at = ?, completed_at = ?, current_pick_number = ?
+                                       WHERE draft_id = ?""",
+                                    (started_at, completed_at, current_pick_number, draft_id)
+                                )
                             drafts_imported += 1
                         except Exception as e:
                             errors.append(f"Draft {row.get('Draft_ID', 'Unknown')}: {str(e)}")

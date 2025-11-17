@@ -978,6 +978,17 @@ class DraftCommands(commands.Cog):
                 print(f"Channel not found for team {team_name}")
                 return
 
+            # Get team emoji
+            cursor = await db.execute("SELECT emoji_id FROM teams WHERE team_id = ?", (team_id,))
+            emoji_result = await cursor.fetchone()
+            team_emoji = ""
+            if emoji_result and emoji_result[0]:
+                try:
+                    emoji = self.bot.get_emoji(int(emoji_result[0]))
+                    team_emoji = str(emoji) + " " if emoji else ""
+                except:
+                    pass
+
             # Get draft channel
             cursor = await db.execute(
                 "SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'"
@@ -988,7 +999,7 @@ class DraftCommands(commands.Cog):
 
             # Post "on the clock" message to draft channel
             if draft_channel:
-                await draft_channel.send(f"**{team_name}** is on the clock (Round {round_number}, Pick {pick_num})")
+                await draft_channel.send(f"{team_emoji}are on the clock...")
 
             # Send interactive notification to team channel
             view = DraftPickView(self.bot, draft_id, draft_name, team_id, pick_number)
@@ -1459,6 +1470,8 @@ class DraftPickView(discord.ui.View):
         self.team_id = team_id
         self.pick_number = pick_number
         self.selected_player_id = None
+        self.current_page = 0
+        self.players_per_page = 25
 
     async def create_embed(self, db):
         """Create the embed for this draft pick"""
@@ -1487,24 +1500,30 @@ class DraftPickView(discord.ui.View):
             except:
                 pass
 
-        # Get available players from Draft Pool
+        # Get ALL available players from Draft Pool
         cursor = await db.execute(
             """SELECT p.player_id, p.name, p.position, p.age
                FROM players p
                JOIN teams t ON p.team_id = t.team_id
                WHERE t.team_name = 'Draft Pool'
-               ORDER BY p.name
-               LIMIT 25"""
+               ORDER BY p.name"""
         )
-        available_players = await cursor.fetchall()
+        all_players = await cursor.fetchall()
 
-        # Populate dropdown
+        # Calculate pagination
+        total_players = len(all_players)
+        total_pages = (total_players + self.players_per_page - 1) // self.players_per_page if total_players > 0 else 1
+        start_idx = self.current_page * self.players_per_page
+        end_idx = min(start_idx + self.players_per_page, total_players)
+        page_players = all_players[start_idx:end_idx]
+
+        # Populate dropdown with current page
         options = []
-        for player_id, name, pos, age in available_players:
-            # Don't show OVR for draft pool players
+        for player_id, name, pos, age in page_players:
+            # Don't show OVR for draft pool players, add "yo" after age
             options.append(
                 discord.SelectOption(
-                    label=f"{name} ({pos}, {age})",
+                    label=f"{name} ({pos}, {age} yo)",
                     value=str(player_id)
                 )
             )
@@ -1516,18 +1535,26 @@ class DraftPickView(discord.ui.View):
         for item in self.children:
             if isinstance(item, discord.ui.Select) and item.custom_id == "player_select":
                 item.options = options
-                item.disabled = len(available_players) == 0
+                item.disabled = len(all_players) == 0
                 break
 
+        # Update pagination buttons
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                if item.custom_id == "draft_prev_page":
+                    item.disabled = (self.current_page == 0)
+                elif item.custom_id == "draft_next_page":
+                    item.disabled = (self.current_page >= total_pages - 1)
+
         embed = discord.Embed(
-            title=f"🎯 {emoji_str}{team_name} - On the Clock",
+            title=f":rotating_light: {emoji_str}{team_name} - On the Clock :rotating_light:",
             description=f"**{self.draft_name}**\nRound {round_number}, Pick {pick_num}",
             color=discord.Color.blue()
         )
 
         embed.add_field(
             name="Available Players",
-            value=f"{len(available_players)} players in draft pool",
+            value=f"{total_players} players in draft pool (Page {self.current_page + 1}/{total_pages})",
             inline=False
         )
 
@@ -1582,6 +1609,25 @@ class DraftPickView(discord.ui.View):
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+    @discord.ui.button(label="◀ Previous Page", style=discord.ButtonStyle.gray, custom_id="draft_prev_page", row=2)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go to previous page"""
+        if self.current_page > 0:
+            self.current_page -= 1
+            async with aiosqlite.connect(DB_PATH) as db:
+                embed = await self.create_embed(db)
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            await interaction.response.defer()
+
+    @discord.ui.button(label="Next Page ▶", style=discord.ButtonStyle.gray, custom_id="draft_next_page", row=2)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go to next page"""
+        self.current_page += 1
+        async with aiosqlite.connect(DB_PATH) as db:
+            embed = await self.create_embed(db)
+        await interaction.response.edit_message(embed=embed, view=self)
 
     async def process_pick(self, db, player_id, is_pass):
         """Process the draft pick or pass"""
@@ -1676,8 +1722,20 @@ class DraftPickView(discord.ui.View):
                 except:
                     pass
 
+            # Check if this is the first pick of a new round (post round header)
+            # Get the number of picks in each round
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM draft_picks WHERE draft_id = ? AND round_number = 1",
+                (self.draft_id,)
+            )
+            picks_per_round = (await cursor.fetchone())[0]
+
+            # Check if this pick number is the start of a new round
+            if (pick_num - 1) % picks_per_round == 0:
+                await draft_channel.send(f"**-- ROUND {round_num} --**")
+
             if is_pass:
-                message = f"Round {round_num}, Pick {pick_num}: {emoji_str}**{team_name}** - PASS"
+                message = f"**Pick {pick_num}:** {emoji_str}{team_name} - PASS"
             else:
                 # Get player info
                 cursor = await db.execute(
@@ -1686,7 +1744,7 @@ class DraftPickView(discord.ui.View):
                 )
                 player_name, pos, age, ovr = await cursor.fetchone()
 
-                message = f"Round {round_num}, Pick {pick_num}: {emoji_str}**{team_name}** - **{player_name}** ({pos}, {age}, {ovr})"
+                message = f"**Pick {pick_num}:** {emoji_str}{team_name} select **{player_name.upper()}** ({pos}, {age} yo, {ovr} OVR)"
 
             await draft_channel.send(message)
 
