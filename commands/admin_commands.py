@@ -1310,6 +1310,7 @@ class AdminCommands(commands.Cog):
             teams_updated = 0
             players_added = 0
             players_updated = 0
+            players_deleted = 0
             errors = []
             duplicate_warnings = []
             
@@ -1349,6 +1350,9 @@ class AdminCommands(commands.Cog):
                     cursor = await db.execute("SELECT team_id, team_name FROM teams")
                     teams = await cursor.fetchall()
                     team_map = {name.lower(): id for id, name in teams}
+
+                    # Collect all player IDs from the Excel file
+                    excel_player_ids = set()
 
                     for _, row in players_df.iterrows():
                         try:
@@ -1419,6 +1423,7 @@ class AdminCommands(commands.Cog):
 
                             # Only UPDATE existing players (don't add new ones)
                             if existing:
+                                excel_player_ids.add(existing[0])  # Track this player ID
                                 await db.execute(
                                     """UPDATE players
                                        SET name = ?, position = ?, overall_rating = ?, age = ?, birth_year = ?, team_id = ?, contract_expiry = ?
@@ -1431,7 +1436,17 @@ class AdminCommands(commands.Cog):
 
                         except Exception as e:
                             errors.append(f"Player '{name}': {str(e)}")
-                    
+
+                    # Delete players that exist in database but NOT in Excel file
+                    cursor = await db.execute("SELECT player_id, name FROM players")
+                    all_db_players = await cursor.fetchall()
+                    players_deleted = 0
+                    for db_player_id, db_player_name in all_db_players:
+                        if db_player_id not in excel_player_ids:
+                            await db.execute("DELETE FROM players WHERE player_id = ?", (db_player_id,))
+                            players_deleted += 1
+                            print(f"Deleted player not in Excel: {db_player_name} (ID: {db_player_id})")
+
                     await db.commit()
                 except Exception as e:
                     errors.append(f"Players sheet error: {str(e)}")
@@ -2315,7 +2330,7 @@ class AdminCommands(commands.Cog):
             # Build response
             response = "✅ **Import Complete!**\n\n"
             response += f"**Teams:** {teams_added} added, {teams_updated} updated\n"
-            response += f"**Players:** {players_added} added, {players_updated} updated\n"
+            response += f"**Players:** {players_added} added, {players_updated} updated, {players_deleted} deleted\n"
             if current_lineups_imported > 0:
                 response += f"**Current Lineups:** {current_lineups_imported} imported\n"
             if starting_lineups_imported > 0:
