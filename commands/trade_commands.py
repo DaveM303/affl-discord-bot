@@ -967,6 +967,8 @@ class TradeMenuView(discord.ui.View):
                     inline=True
                 )
 
+                embed.set_footer(text=f"Trade ID: {trade_id}")
+
                 await channel.send(embed=embed)
 
         # Send to moderators for approval
@@ -1077,6 +1079,8 @@ class TradeMenuView(discord.ui.View):
                     value="\n".join(recv_items) if recv_items else "*Nothing*",
                     inline=True
                 )
+
+                embed.set_footer(text=f"Trade ID: {trade_id}")
 
                 await channel.send(embed=embed)
 
@@ -1235,6 +1239,8 @@ class TradeMenuView(discord.ui.View):
                         value="\n".join(recv_items) if recv_items else "*Nothing*",
                         inline=True
                     )
+
+                    embed.set_footer(text=f"Trade ID: {trade_id}")
 
                     await channel.send(embed=embed)
 
@@ -1543,6 +1549,8 @@ class PendingTradesView(discord.ui.View):
                         inline=True
                     )
 
+                    embed.set_footer(text=f"Trade ID: {trade_id}")
+
                     await channel.send(embed=embed)
 
             # Notify receiving team
@@ -1565,6 +1573,8 @@ class PendingTradesView(discord.ui.View):
                         value="\n".join(recv_items) if recv_items else "*Nothing*",
                         inline=True
                     )
+
+                    embed.set_footer(text=f"Trade ID: {trade_id}")
 
                     await channel.send(embed=embed)
 
@@ -2552,6 +2562,8 @@ class ModeratorApprovalView(discord.ui.View):
                         inline=True
                     )
 
+                    embed.set_footer(text=f"Trade ID: {trade_id}")
+
                     await channel.send(embed=embed)
 
             # Notify receiving team
@@ -2574,6 +2586,8 @@ class ModeratorApprovalView(discord.ui.View):
                         value="\n".join(recv_items) if recv_items else "*Nothing*",
                         inline=True
                     )
+
+                    embed.set_footer(text=f"Trade ID: {trade_id}")
 
                     await channel.send(embed=embed)
 
@@ -2785,6 +2799,8 @@ class ModeratorApprovalView(discord.ui.View):
             value="\n".join(recv_receiving) if recv_receiving else "*Nothing*",
             inline=True
         )
+
+        embed.set_footer(text=f"Trade ID: {self.trade_id}")
 
         # Send to trade log channel
         if log_result and log_result[0]:
