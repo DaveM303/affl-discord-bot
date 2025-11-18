@@ -2279,7 +2279,7 @@ class TradeResponseView(discord.ui.View):
         # Open trade menu to this specific offer (no team restriction - anyone can respond)
         # Get parent_cog from bot
         parent_cog = self.bot.get_cog('TradeCommands')
-        view = TradeMenuView(receiving_team_id, role_result[1], self.bot, interaction.guild, parent_cog, specific_trade_id=self.trade_id)
+        view = TradeMenuView(receiving_team_id, role_result[0], self.bot, interaction.guild, parent_cog, specific_trade_id=self.trade_id)
         embed = await view.create_incoming_page_embed()
         await view.add_incoming_page_buttons()
 
