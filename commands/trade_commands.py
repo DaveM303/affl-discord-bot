@@ -545,7 +545,7 @@ class TradeMenuView(discord.ui.View):
                 inline=True
             )
 
-            embed.set_footer(text=f"Offer {self.incoming_page + 1} of {len(self.incoming_trades)}")
+            embed.set_footer(text=f"Offer {self.incoming_page + 1} of {len(self.incoming_trades)} • Trade ID: {trade_id}")
 
         return embed
 
@@ -658,7 +658,7 @@ class TradeMenuView(discord.ui.View):
                 inline=True
             )
 
-            embed.set_footer(text=f"Offer {self.outgoing_page + 1} of {len(self.outgoing_trades)}")
+            embed.set_footer(text=f"Offer {self.outgoing_page + 1} of {len(self.outgoing_trades)} • Trade ID: {trade_id}")
 
         return embed
 
@@ -772,7 +772,7 @@ class TradeMenuView(discord.ui.View):
                 inline=True
             )
 
-            embed.set_footer(text=f"Trade {self.approval_page + 1} of {len(self.approval_trades)}")
+            embed.set_footer(text=f"Trade {self.approval_page + 1} of {len(self.approval_trades)} • Trade ID: {trade_id}")
 
         return embed
 
@@ -1370,7 +1370,7 @@ class PendingTradesView(discord.ui.View):
                 inline=True
             )
 
-            embed.set_footer(text=f"Trade {self.current_page + 1} of {len(self.pending_trades)}")
+            embed.set_footer(text=f"Trade {self.current_page + 1} of {len(self.pending_trades)} • Trade ID: {trade_id}")
 
         return embed
 

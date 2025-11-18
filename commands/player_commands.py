@@ -75,7 +75,7 @@ class PlayerCommands(commands.Cog):
             # Search for each term
             for search_term in search_terms:
                 cursor = await db.execute(
-                    """SELECT p.name, p.position, p.overall_rating, p.age, t.team_name, t.emoji_id
+                    """SELECT p.player_id, p.name, p.position, p.overall_rating, p.age, t.team_name, t.emoji_id
                        FROM players p
                        LEFT JOIN teams t ON p.team_id = t.team_id
                        WHERE p.name LIKE ?
@@ -85,13 +85,13 @@ class PlayerCommands(commands.Cog):
                 results = await cursor.fetchall()
                 all_players.extend(results)
 
-            # Remove duplicates while preserving order (in case searches overlap)
+            # Remove duplicates by player_id (not name, to allow duplicate names)
             seen = set()
             unique_players = []
             for player in all_players:
-                player_name = player[0]
-                if player_name not in seen:
-                    seen.add(player_name)
+                player_id = player[0]
+                if player_id not in seen:
+                    seen.add(player_id)
                     unique_players.append(player)
 
             if not unique_players:
@@ -104,7 +104,7 @@ class PlayerCommands(commands.Cog):
 
             # Show list view for all results (single or multiple)
             player_list = []
-            for p_name, pos, rating, age, team, emoji_id in unique_players:
+            for player_id, p_name, pos, rating, age, team, emoji_id in unique_players:
                 # Build team display
                 if team:
                     emoji = self.get_team_emoji(emoji_id)

@@ -82,6 +82,36 @@ class LineupCommands(commands.Cog):
         # Return up to 25 choices (Discord limit)
         return choices[:25]
 
+    async def player_name_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete for player names with format: Name (Team, POS, age, OVR)"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating, t.team_name
+                   FROM players p
+                   LEFT JOIN teams t ON p.team_id = t.team_id
+                   ORDER BY p.name"""
+            )
+            players = await cursor.fetchall()
+
+        # Filter players based on what the user has typed
+        choices = []
+        for player_id, name, position, age, rating, team_name in players:
+            # Check if current input matches player name
+            if current.lower() in name.lower():
+                # Format: Name (Team, POS, age yo, OVR)
+                team_prefix = team_name if team_name else "Delisted"
+                display_name = f"{name} ({team_prefix}, {position}, {age}yo, {rating} OVR)"
+
+                # Value is player_id so we can query by ID later
+                choices.append(app_commands.Choice(name=display_name, value=str(player_id)))
+
+        # Return up to 25 choices (Discord limit)
+        return choices[:25]
+
     @app_commands.command(name="teamlineup", description="Open the lineup management menu")
     @app_commands.describe(team_name="[ADMIN ONLY] Team name to manage lineup for")
     @app_commands.autocomplete(team_name=team_autocomplete)
@@ -296,7 +326,17 @@ class LineupCommands(commands.Cog):
         player8="Eighth player to delist (optional)",
         team_name="[ADMIN ONLY] Team name to delist players from"
     )
-    @app_commands.autocomplete(team_name=team_autocomplete)
+    @app_commands.autocomplete(
+        player1=player_name_autocomplete,
+        player2=player_name_autocomplete,
+        player3=player_name_autocomplete,
+        player4=player_name_autocomplete,
+        player5=player_name_autocomplete,
+        player6=player_name_autocomplete,
+        player7=player_name_autocomplete,
+        player8=player_name_autocomplete,
+        team_name=team_autocomplete
+    )
     async def delist_player(
         self,
         interaction: discord.Interaction,
@@ -360,34 +400,33 @@ class LineupCommands(commands.Cog):
 
             current_season = season[0]
 
-            # Collect all player names
-            player_names = [player1, player2, player3, player4, player5, player6, player7, player8]
-            player_names = [p for p in player_names if p is not None]  # Remove None values
+            # Collect all player IDs (from autocomplete)
+            player_ids = [player1, player2, player3, player4, player5, player6, player7, player8]
+            player_ids = [p for p in player_ids if p is not None]  # Remove None values
 
             delisted_players = []
             errors = []
 
-            for player_name in player_names:
-                # Find player by name on this team
+            for player_id_str in player_ids:
+                try:
+                    player_id = int(player_id_str)
+                except ValueError:
+                    errors.append(f"❌ Invalid player selection. Please use the autocomplete suggestions.")
+                    continue
+
+                # Find player by ID on this team
                 cursor = await db.execute(
                     """SELECT player_id, name, position, overall_rating, age FROM players
-                       WHERE team_id = ? AND LOWER(name) LIKE LOWER(?)
-                       ORDER BY name LIMIT 5""",
-                    (team_id, f"%{player_name}%")
+                       WHERE player_id = ? AND team_id = ?""",
+                    (player_id, team_id)
                 )
-                matches = await cursor.fetchall()
+                result = await cursor.fetchone()
 
-                if not matches:
-                    errors.append(f"❌ No player found matching '{player_name}'")
+                if not result:
+                    errors.append(f"❌ Player not found on this team (ID: {player_id})")
                     continue
 
-                if len(matches) > 1:
-                    # Multiple matches - list them
-                    names = [f"• {name}" for _, name, _, _, _ in matches]
-                    errors.append(f"❌ Multiple players match '{player_name}':\n" + "\n".join(names))
-                    continue
-
-                player_id, full_name, position, rating, age = matches[0]
+                player_id, full_name, position, rating, age = result
 
                 # Delist the player (set team_id to NULL and contract_expiry to current season)
                 await db.execute(
@@ -1015,11 +1054,13 @@ class TeamLineupMenu(discord.ui.View):
 
         self.lineup = {}
 
-        await interaction.followup.send("✅ Lineup cleared!", ephemeral=True)
-
-        # Refresh menu
+        # Get the original message from the parent menu and refresh it
         embed = await self.create_menu_embed()
-        await interaction.edit_original_response(embed=embed, view=self)
+
+        # Edit the original lineup menu message (not the confirmation message)
+        await self.message.edit(embed=embed, view=self)
+
+        await interaction.followup.send("✅ Lineup cleared!", ephemeral=True)
 
     async def view_starting_lineup_callback(self, interaction: discord.Interaction):
         """Display the saved starting lineup"""
