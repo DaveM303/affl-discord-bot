@@ -1046,7 +1046,7 @@ class TeamLineupMenu(discord.ui.View):
 
     async def do_clear_lineup(self, interaction: discord.Interaction):
         """Actually clear the lineup after confirmation"""
-        await interaction.response.defer(ephemeral=True)
+        # Interaction has already been responded to by the confirmation view
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("DELETE FROM lineups WHERE team_id = ?", (self.team_id,))
@@ -1259,10 +1259,10 @@ class ConfirmClearLineupView(discord.ui.View):
 
     @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.danger)
     async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Disable all buttons
+        # Disable all buttons and respond to interaction
         for item in self.children:
             item.disabled = True
-        await interaction.message.edit(view=self)
+        await interaction.response.edit_message(view=self)
 
         # Call the parent's do_clear method
         await self.parent_menu.do_clear_lineup(interaction)
