@@ -1985,39 +1985,53 @@ class AdminCommands(commands.Cog):
                     if 'Worksheet Ladder_Positions' not in str(e):
                         errors.append(f"Ladder Positions sheet error: {str(e)}")
 
-                # Import Submitted Lineups
+                # Import Submitted Lineups (from merged Lineups sheet where Type='submitted')
                 submitted_lineups_imported = 0
                 try:
-                    submitted_lineups_df = pd.read_excel(excel_file, sheet_name='Submitted_Lineups')
+                    # Read submitted lineups from the merged Lineups sheet
+                    submitted_rows = lineups_df[lineups_df['Type'] == 'submitted']
 
-                    # Clear existing submitted lineups
-                    await db.execute("DELETE FROM submitted_lineups")
+                    if not submitted_rows.empty:
+                        # Clear existing submitted lineups
+                        await db.execute("DELETE FROM submitted_lineups")
 
-                    for _, row in submitted_lineups_df.iterrows():
-                        try:
-                            # Get team ID
-                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Team_Name']),))
-                            team = await cursor.fetchone()
+                        # Group by team, season, and round to rebuild each submission
+                        grouped = submitted_rows.groupby(['Team_Name', 'Season', 'Round'])
 
-                            # Get season ID
-                            cursor = await db.execute("SELECT season_id FROM seasons WHERE season_number = ?", (int(row['Season']),))
-                            season = await cursor.fetchone()
+                        submission_id = 1  # Auto-increment submission IDs
+                        for (team_name, season_num, round_num), group in grouped:
+                            try:
+                                # Get team ID
+                                cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(team_name),))
+                                team = await cursor.fetchone()
+                                if not team:
+                                    continue
 
-                            if team and season:
+                                # Get season ID
+                                cursor = await db.execute("SELECT season_id FROM seasons WHERE season_number = ?", (int(season_num),))
+                                season = await cursor.fetchone()
+                                if not season:
+                                    continue
+
+                                # Build player_ids array from Player_ID column (in position order)
+                                player_ids = group['Player_ID'].tolist()
+                                player_ids_json = json.dumps(player_ids)
+
+                                # Use current timestamp for submitted_at (we don't track this in the merged sheet)
                                 await db.execute(
                                     """INSERT INTO submitted_lineups
                                        (submission_id, team_id, season_id, round_number, player_ids, submitted_at)
-                                       VALUES (?, ?, ?, ?, ?, ?)""",
-                                    (int(row['Submission_ID']), team[0], season[0], int(row['Round']),
-                                     str(row['Player_IDs']), str(row['Submitted_At']))
+                                       VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                                    (submission_id, team[0], season[0], int(round_num), player_ids_json)
                                 )
                                 submitted_lineups_imported += 1
-                        except Exception as e:
-                            errors.append(f"Submitted Lineup {row['Submission_ID']}: {str(e)}")
-                    await db.commit()
+                                submission_id += 1
+                            except Exception as e:
+                                errors.append(f"Submitted Lineup for {team_name} S{season_num} R{round_num}: {str(e)}")
+
+                        await db.commit()
                 except Exception as e:
-                    if 'Worksheet Submitted_Lineups' not in str(e):
-                        errors.append(f"Submitted Lineups sheet error: {str(e)}")
+                    errors.append(f"Submitted Lineups import error: {str(e)}")
 
                 # Import Compensation Chart (2D table format with individual ages/OVRs)
                 compensation_chart_imported = 0
