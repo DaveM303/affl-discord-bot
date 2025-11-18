@@ -1995,12 +1995,13 @@ class TradeOfferView(discord.ui.View):
                     inline=True
                 )
 
+                embed.set_footer(text=f"Trade ID: {trade_id}")
+
                 # Add response buttons
                 view = TradeResponseView(trade_id, self.bot)
 
-                # Ping the team role
-                role_mention = f"<@&{receiving_role_id}>" if receiving_role_id else ""
-                await channel.send(role_mention, embed=embed, view=view)
+                # Send trade offer (no role restriction - visible to everyone in channel)
+                await channel.send(embed=embed, view=view)
 
         # Cancel original trade if this is a counter-offer
         if self.is_counter_offer and self.original_trade_id:
@@ -2268,20 +2269,14 @@ class TradeResponseView(discord.ui.View):
                 await interaction.response.send_message("❌ This trade is no longer active!", ephemeral=True)
                 return
 
-            # Check if user has the receiving team role
+            # Get team name for the trade menu
             cursor = await db.execute(
-                "SELECT role_id, team_name FROM teams WHERE team_id = ?",
+                "SELECT team_name FROM teams WHERE team_id = ?",
                 (receiving_team_id,)
             )
             role_result = await cursor.fetchone()
 
-        if role_result and role_result[0]:
-            role = interaction.guild.get_role(int(role_result[0]))
-            if not role or role not in interaction.user.roles:
-                await interaction.response.send_message("❌ You don't have permission to respond to this trade!", ephemeral=True)
-                return
-
-        # Open trade menu to this specific offer
+        # Open trade menu to this specific offer (no team restriction - anyone can respond)
         # Get parent_cog from bot
         parent_cog = self.bot.get_cog('TradeCommands')
         view = TradeMenuView(receiving_team_id, role_result[1], self.bot, interaction.guild, parent_cog, specific_trade_id=self.trade_id)
@@ -2371,8 +2366,7 @@ class TradeResponseView(discord.ui.View):
         channel = self.bot.get_channel(approval_channel_id)
         if channel:
             embed = discord.Embed(
-                title="⚖️ Trade Pending Mod Approval",
-                description=f"{init_emoji_str}**{init_team_name}** ↔️ {recv_emoji_str}**{recv_team_name}**",
+                title=f"⚖️ Trade Pending Mod Approval: {init_emoji_str}**{init_team_name}** ↔️ {recv_emoji_str}**{recv_team_name}**",
                 color=discord.Color.orange()
             )
 
@@ -2387,6 +2381,8 @@ class TradeResponseView(discord.ui.View):
                 value="\n".join(receiving_items) if receiving_items else "*Nothing*",
                 inline=True
             )
+
+            embed.set_footer(text=f"Trade ID: {self.trade_id}")
 
             view = RespondToTradeView(self.trade_id, self.bot)
             await channel.send(embed=embed, view=view)
