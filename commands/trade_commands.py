@@ -545,7 +545,7 @@ class TradeMenuView(discord.ui.View):
                 inline=True
             )
 
-            embed.set_footer(text=f"Offer {self.incoming_page + 1} of {len(self.incoming_trades)} • Trade ID: {trade_id}")
+            embed.set_footer(text=f"Offer {self.incoming_page + 1} of {len(self.incoming_trades)} • Trade ID: {current_trade_id}")
 
         return embed
 
@@ -658,7 +658,7 @@ class TradeMenuView(discord.ui.View):
                 inline=True
             )
 
-            embed.set_footer(text=f"Offer {self.outgoing_page + 1} of {len(self.outgoing_trades)} • Trade ID: {trade_id}")
+            embed.set_footer(text=f"Offer {self.outgoing_page + 1} of {len(self.outgoing_trades)} • Trade ID: {current_trade_id}")
 
         return embed
 
