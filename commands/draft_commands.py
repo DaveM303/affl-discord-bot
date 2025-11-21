@@ -2251,13 +2251,23 @@ class FatherSonMatchView(discord.ui.View):
                 comp_pick_number = (max_pick[0] if max_pick[0] else 0) + 1
                 print(f"DEBUG: Inserting compensation pick at position {comp_pick_number}")
 
-                # Determine which round this pick falls into
+                # Get the round number from the pick at the equivalent position
+                # (the pick that represents this compensation value)
                 cursor = await db.execute(
-                    "SELECT num_teams FROM drafts WHERE draft_id = ?",
-                    (self.draft_id,)
+                    """SELECT round_number FROM draft_picks
+                       WHERE draft_id = ? AND pick_number = ?""",
+                    (self.draft_id, comp_pick_equivalent)
                 )
-                num_teams = (await cursor.fetchone())[0]
-                comp_round_number = ((comp_pick_number - 1) // num_teams) + 1
+                round_result = await cursor.fetchone()
+                if round_result:
+                    comp_round_number = round_result[0]
+                else:
+                    # Fallback: calculate based on number of teams if the exact pick doesn't exist
+                    cursor = await db.execute("SELECT COUNT(*) FROM teams WHERE team_name != 'Draft Pool'")
+                    num_teams = (await cursor.fetchone())[0]
+                    comp_round_number = ((comp_pick_equivalent - 1) // num_teams) + 1
+
+                print(f"DEBUG: Compensation pick will be in round {comp_round_number} (equivalent to pick #{comp_pick_equivalent})")
 
                 # Insert compensation pick at the end of the draft
                 await db.execute(
