@@ -315,7 +315,7 @@ class DraftCommands(commands.Cog):
                 cursor = await db.execute(
                     """SELECT dp.pick_number, dp.round_number,
                               ot.team_name as origin_team, dp.round_number as origin_round,
-                              ct.team_name as current_team, ct.emoji_id as current_emoji,
+                              ct.team_name as current_team, ot.emoji_id as origin_emoji,
                               p.name as player_selected
                        FROM draft_picks dp
                        JOIN teams ct ON dp.current_team_id = ct.team_id

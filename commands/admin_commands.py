@@ -1065,18 +1065,16 @@ class AdminCommands(commands.Cog):
                 cursor = await db.execute(
                     """SELECT dp.pick_id as Pick_ID, dp.draft_name as Draft_Name,
                               dp.round_number as Round, dp.pick_number as Pick,
-                              dp.pick_origin as Pick_Origin,
-                              ot.team_name as Original_Team, ct.team_name as Current_Team,
+                              dp.pick_origin as Pick_Origin, ct.team_name as Current_Team,
                               dp.player_selected_id as Player_ID, p.name as Player_Name,
                               dp.passed as Passed, dp.picked_at as Picked_At
                        FROM draft_picks dp
                        JOIN teams ct ON dp.current_team_id = ct.team_id
-                       JOIN teams ot ON dp.original_team_id = ot.team_id
                        LEFT JOIN players p ON dp.player_selected_id = p.player_id
                        ORDER BY dp.draft_name, dp.round_number, dp.pick_number"""
                 )
                 draft_picks = await cursor.fetchall()
-                draft_picks_df = pd.DataFrame(draft_picks, columns=['Pick_ID', 'Draft_Name', 'Round', 'Pick', 'Pick_Origin', 'Original_Team', 'Current_Team', 'Player_ID', 'Player_Name', 'Passed', 'Picked_At'])
+                draft_picks_df = pd.DataFrame(draft_picks, columns=['Pick_ID', 'Draft_Name', 'Round', 'Pick', 'Pick_Origin', 'Current_Team', 'Player_ID', 'Player_Name', 'Passed', 'Picked_At'])
                 draft_picks_df['Pick_Origin'] = draft_picks_df['Pick_Origin'].fillna('')
                 draft_picks_df['Player_ID'] = draft_picks_df['Player_ID'].fillna('')
                 draft_picks_df['Player_Name'] = draft_picks_df['Player_Name'].fillna('')
@@ -1888,14 +1886,25 @@ class AdminCommands(commands.Cog):
                             cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Current_Team']),))
                             current_team = await cursor.fetchone()
 
-                            # Get original team ID (fallback to current team if not specified)
+                            # Parse original_team_id from pick_origin
                             original_team_id = None
-                            if 'Original_Team' in row and pd.notna(row['Original_Team']) and row['Original_Team']:
-                                cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Original_Team']),))
-                                original_team = await cursor.fetchone()
-                                original_team_id = original_team[0] if original_team else None
+                            pick_origin = str(row['Pick_Origin']) if pd.notna(row['Pick_Origin']) and row['Pick_Origin'] else ''
+                            if pick_origin:
+                                # Parse pick_origin format: "Team Name R1" or "Team Name F/S Match"
+                                if ' R' in pick_origin:
+                                    team_name = pick_origin.split(' R')[0]
+                                elif ' F/S' in pick_origin:
+                                    team_name = pick_origin.split(' F/S')[0]
+                                else:
+                                    team_name = None
 
-                            # Fallback to current team if original not specified
+                                if team_name:
+                                    cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
+                                    orig_team = await cursor.fetchone()
+                                    if orig_team:
+                                        original_team_id = orig_team[0]
+
+                            # Fallback to current team if pick_origin parsing failed
                             if not original_team_id:
                                 original_team_id = current_team[0] if current_team else None
 
@@ -1908,9 +1917,6 @@ class AdminCommands(commands.Cog):
                                 player = await cursor.fetchone()
                                 if not player:
                                     player_id = None
-
-                            # Get pick_origin (handle empty/NaN values)
-                            pick_origin = str(row['Pick_Origin']) if pd.notna(row['Pick_Origin']) and row['Pick_Origin'] else ''
 
                             # Handle NaN values for numeric fields
                             pick_id = int(row['Pick_ID']) if pd.notna(row['Pick_ID']) else None
