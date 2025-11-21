@@ -112,8 +112,14 @@ class PlayerCommands(commands.Cog):
                 else:
                     team_prefix = ""
 
+                # Hide OVR for draft pool players
+                if team == "Draft Pool":
+                    ovr_display = "??"
+                else:
+                    ovr_display = rating
+
                 player_list.append(
-                    f"{team_prefix}**{p_name}** - {pos} ({rating} OVR, {age}yo)"
+                    f"{team_prefix}**{p_name}** - {pos} ({ovr_display} OVR, {age}yo)"
                 )
 
             embed = discord.Embed(

@@ -997,8 +997,20 @@ class DraftCommands(commands.Cog):
             draft_channel_id = int(result[0]) if result and result[0] else None
             draft_channel = self.bot.get_channel(draft_channel_id) if draft_channel_id else None
 
-            # Post "on the clock" message to draft channel
+            # Post round header if this is the first pick of a new round
             if draft_channel:
+                # Get the number of picks in each round
+                cursor = await db.execute(
+                    "SELECT COUNT(*) FROM draft_picks WHERE draft_id = ? AND round_number = 1",
+                    (draft_id,)
+                )
+                picks_per_round = (await cursor.fetchone())[0]
+
+                # Check if this pick number is the start of a new round
+                if (pick_num - 1) % picks_per_round == 0:
+                    await draft_channel.send(f"**-- ROUND {round_number} --**")
+
+                # Post "on the clock" message
                 await draft_channel.send(f"{team_emoji}are on the clock...")
 
             # Send interactive notification to team channel
@@ -1572,7 +1584,7 @@ class DraftPickView(discord.ui.View):
 
         await interaction.response.defer()
 
-    @discord.ui.button(label="Confirm Selection", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Confirm Selection", style=discord.ButtonStyle.primary, row=1)
     async def confirm_pick(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Confirm the draft pick"""
         if not self.selected_player_id:
@@ -1606,7 +1618,7 @@ class DraftPickView(discord.ui.View):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
-    @discord.ui.button(label="Pass Pick", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Pass Pick", style=discord.ButtonStyle.secondary, row=1)
     async def pass_pick(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Pass on this pick"""
         await interaction.response.defer()
@@ -1623,7 +1635,7 @@ class DraftPickView(discord.ui.View):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
-    @discord.ui.button(label="◀ Previous Page", style=discord.ButtonStyle.gray, custom_id="draft_prev_page", row=2)
+    @discord.ui.button(label="◀ Previous Page", style=discord.ButtonStyle.gray, custom_id="draft_prev_page", row=0)
     async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Go to previous page"""
         if self.current_page > 0:
@@ -1634,7 +1646,7 @@ class DraftPickView(discord.ui.View):
         else:
             await interaction.response.defer()
 
-    @discord.ui.button(label="Next Page ▶", style=discord.ButtonStyle.gray, custom_id="draft_next_page", row=2)
+    @discord.ui.button(label="Next Page ▶", style=discord.ButtonStyle.gray, custom_id="draft_next_page", row=0)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Go to next page"""
         self.current_page += 1
@@ -1741,22 +1753,34 @@ class DraftPickView(discord.ui.View):
             bidding_team_name, bidding_emoji_id, fs_team_name, fs_emoji_id
         )
 
-        # Send match notification to father/son club
-        if fs_channel_id:
-            fs_channel = self.bot.get_channel(int(fs_channel_id))
-            if fs_channel:
-                # Create match notification view
-                match_view = FatherSonMatchView(
-                    self.bot, self.draft_id, self.draft_name, self.pick_number,
-                    player_id, player_name, pos, age, ovr,
-                    father_son_club_id, fs_team_name,
-                    self.team_id, bidding_team_name,
-                    bid_value, required_value, matching_picks
-                )
+        # Check if F/S club has enough points to match
+        total_match_value = sum(p[3] for p in matching_picks)
 
-                # Create embed
-                embed = await match_view.create_embed(db)
-                await fs_channel.send(embed=embed, view=match_view)
+        if not matching_picks or total_match_value < required_value:
+            # Automatically pass - not enough points
+            await self.auto_pass_father_son_bid(
+                db, player_id, player_name, pos, age, ovr,
+                father_son_club_id, fs_team_name, fs_emoji_id,
+                bidding_team_name, bidding_emoji_id,
+                has_picks=(len(matching_picks) > 0)
+            )
+        else:
+            # Send match notification to father/son club
+            if fs_channel_id:
+                fs_channel = self.bot.get_channel(int(fs_channel_id))
+                if fs_channel:
+                    # Create match notification view
+                    match_view = FatherSonMatchView(
+                        self.bot, self.draft_id, self.draft_name, self.pick_number,
+                        player_id, player_name, pos, age, ovr,
+                        father_son_club_id, fs_team_name,
+                        self.team_id, bidding_team_name,
+                        bid_value, required_value, matching_picks
+                    )
+
+                    # Create embed
+                    embed = await match_view.create_embed(db)
+                    await fs_channel.send(embed=embed, view=match_view)
 
     async def calculate_matching_picks(self, db, team_id, required_value):
         """Calculate which picks are needed to match the bid (earliest picks, minimum value)"""
@@ -1848,11 +1872,96 @@ class DraftPickView(discord.ui.View):
                 except:
                     pass
 
-            message = f"**Pick {self.pick_number}:** {bidding_emoji_str}{bidding_team_name} bid on **{player_name.upper()}** ({pos}, {age} yo, {ovr} OVR) - F/S tied to {fs_emoji_str}{fs_team_name}"
+            message = f"{bidding_emoji_str}bid on **{player_name.upper()}** - F/S tied to {fs_emoji_str}"
             await draft_channel.send(message)
 
         except Exception as e:
             print(f"Error posting F/S bid to draft channel: {e}")
+
+    async def auto_pass_father_son_bid(self, db, player_id, player_name, pos, age, ovr,
+                                        fs_team_id, fs_team_name, fs_emoji_id,
+                                        bidding_team_name, bidding_emoji_id, has_picks):
+        """Automatically pass on F/S bid when club doesn't have enough points"""
+        # Get rookie contract years
+        cursor = await db.execute(
+            "SELECT rookie_contract_years, season_number FROM drafts WHERE draft_id = ?",
+            (self.draft_id,)
+        )
+        rookie_years, season_number = await cursor.fetchone()
+
+        # Update the bid pick with the player
+        await db.execute(
+            """UPDATE draft_picks
+               SET player_selected_id = ?, picked_at = CURRENT_TIMESTAMP
+               WHERE draft_id = ? AND pick_number = ?""",
+            (player_id, self.draft_id, self.pick_number)
+        )
+
+        # Assign player to bidding team
+        contract_expiry = season_number + rookie_years
+        await db.execute(
+            "UPDATE players SET team_id = ?, contract_expiry = ? WHERE player_id = ?",
+            (self.team_id, contract_expiry, player_id)
+        )
+
+        await db.commit()
+
+        # Post auto-pass result to draft channel
+        try:
+            cursor = await db.execute(
+                "SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'"
+            )
+            result = await cursor.fetchone()
+            if result and result[0]:
+                draft_channel = self.bot.get_channel(int(result[0]))
+                if draft_channel:
+                    # Get emojis
+                    bidding_emoji_str = ""
+                    if bidding_emoji_id:
+                        try:
+                            emoji = self.bot.get_emoji(int(bidding_emoji_id))
+                            if emoji:
+                                bidding_emoji_str = f"{emoji} "
+                        except:
+                            pass
+
+                    fs_emoji_str = ""
+                    if fs_emoji_id:
+                        try:
+                            emoji = self.bot.get_emoji(int(fs_emoji_id))
+                            if emoji:
+                                fs_emoji_str = f"{emoji} "
+                        except:
+                            pass
+
+                    # Determine message based on whether they had any picks
+                    if has_picks:
+                        reason = f"{fs_emoji_str}unable to match"
+                    else:
+                        reason = f"{fs_emoji_str}unable to match"
+
+                    message = f"**Pick {self.pick_number}:** {bidding_emoji_str}select **{player_name.upper()}** ({pos}, {age} yo, {ovr} OVR) - {reason}"
+                    await draft_channel.send(message)
+        except Exception as e:
+            print(f"Error posting auto-pass result to draft channel: {e}")
+
+        # Continue with next pick
+        cursor = await db.execute(
+            "SELECT current_pick_number FROM drafts WHERE draft_id = ?",
+            (self.draft_id,)
+        )
+        current_pick = (await cursor.fetchone())[0]
+        next_pick = current_pick + 1
+
+        await db.execute(
+            "UPDATE drafts SET current_pick_number = ? WHERE draft_id = ?",
+            (next_pick, self.draft_id)
+        )
+        await db.commit()
+
+        # Send next pick notification
+        draft_commands = self.bot.get_cog('DraftCommands')
+        await draft_commands.send_pick_notification(db, self.draft_id, self.draft_name, next_pick)
 
     async def post_to_draft_channel(self, db, player_id, is_pass):
         """Post pick result to draft channel"""
@@ -1890,19 +1999,8 @@ class DraftPickView(discord.ui.View):
                     pass
 
             # Check if this is the first pick of a new round (post round header)
-            # Get the number of picks in each round
-            cursor = await db.execute(
-                "SELECT COUNT(*) FROM draft_picks WHERE draft_id = ? AND round_number = 1",
-                (self.draft_id,)
-            )
-            picks_per_round = (await cursor.fetchone())[0]
-
-            # Check if this pick number is the start of a new round
-            if (pick_num - 1) % picks_per_round == 0:
-                await draft_channel.send(f"**-- ROUND {round_num} --**")
-
             if is_pass:
-                message = f"**Pick {pick_num}:** {emoji_str}{team_name} - PASS"
+                message = f"**Pick {pick_num}:** {emoji_str}- PASS"
             else:
                 # Get player info
                 cursor = await db.execute(
@@ -1911,7 +2009,7 @@ class DraftPickView(discord.ui.View):
                 )
                 player_name, pos, age, ovr = await cursor.fetchone()
 
-                message = f"**Pick {pick_num}:** {emoji_str}{team_name} select **{player_name.upper()}** ({pos}, {age} yo, {ovr} OVR)"
+                message = f"**Pick {pick_num}:** {emoji_str}select **{player_name.upper()}** ({pos}, {age} yo, {ovr} OVR)"
 
             await draft_channel.send(message)
 
@@ -1952,7 +2050,7 @@ class FatherSonMatchView(discord.ui.View):
 
         embed.add_field(
             name="Player",
-            value=f"**{self.player_name}** ({self.pos}, {self.age} yo, {self.ovr} OVR)",
+            value=f"**{self.player_name}** ({self.pos}, {self.age} yo)",
             inline=False
         )
 
@@ -2189,12 +2287,50 @@ class FatherSonMatchView(discord.ui.View):
             if not draft_channel:
                 return
 
+            # Get emojis
+            cursor = await db.execute(
+                "SELECT emoji_id FROM teams WHERE team_id = ?",
+                (self.bidding_team_id,)
+            )
+            bidding_result = await cursor.fetchone()
+            bidding_emoji_id = bidding_result[0] if bidding_result else None
+            bidding_emoji_str = ""
+            if bidding_emoji_id:
+                try:
+                    emoji = self.bot.get_emoji(int(bidding_emoji_id))
+                    if emoji:
+                        bidding_emoji_str = f"{emoji} "
+                except:
+                    pass
+
+            cursor = await db.execute(
+                "SELECT emoji_id FROM teams WHERE team_id = ?",
+                (self.fs_team_id,)
+            )
+            fs_result = await cursor.fetchone()
+            fs_emoji_id = fs_result[0] if fs_result else None
+            fs_emoji_str = ""
+            if fs_emoji_id:
+                try:
+                    emoji = self.bot.get_emoji(int(fs_emoji_id))
+                    if emoji:
+                        fs_emoji_str = f"{emoji} "
+                except:
+                    pass
+
             if matched:
                 # Show picks consumed
-                picks_text = ", ".join([f"#{p[0]}" for p in self.matching_picks])
-                message = f"🔄 **{self.fs_team_name}** matched the bid! Drafted **{self.player_name.upper()}** using picks: {picks_text}"
+                picks_text = ", ".join([f"{p[0]}" for p in self.matching_picks])
+                # Join with commas and ampersand for last item
+                picks_list = [str(p[0]) for p in self.matching_picks]
+                if len(picks_list) > 1:
+                    picks_text = ", ".join(picks_list[:-1]) + " & " + picks_list[-1]
+                else:
+                    picks_text = picks_list[0] if picks_list else ""
+
+                message = f"**Pick {self.bid_pick_number}:** {fs_emoji_str}select **{self.player_name.upper()}** ({self.pos}, {self.age} yo, {self.ovr} OVR) - Bid matched using pick/s {picks_text}"
             else:
-                message = f"✅ **{self.bidding_team_name}** select **{self.player_name.upper()}** ({self.pos}, {self.age} yo, {self.ovr} OVR) - F/S bid not matched"
+                message = f"**Pick {self.bid_pick_number}:** {bidding_emoji_str}select **{self.player_name.upper()}** ({self.pos}, {self.age} yo, {self.ovr} OVR) - {fs_emoji_str}elected not to match"
 
             await draft_channel.send(message)
 
