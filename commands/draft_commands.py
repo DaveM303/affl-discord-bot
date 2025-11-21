@@ -314,12 +314,11 @@ class DraftCommands(commands.Cog):
                 # Get draft picks with team emojis
                 cursor = await db.execute(
                     """SELECT dp.pick_number, dp.round_number,
-                              ot.team_name as origin_team, dp.round_number as origin_round,
-                              ct.team_name as current_team, ot.emoji_id as origin_emoji,
+                              dp.pick_origin,
+                              ct.team_name as current_team, ct.emoji_id as current_emoji,
                               p.name as player_selected
                        FROM draft_picks dp
                        JOIN teams ct ON dp.current_team_id = ct.team_id
-                       JOIN teams ot ON dp.original_team_id = ot.team_id
                        LEFT JOIN players p ON dp.player_selected_id = p.player_id
                        WHERE dp.draft_name = ? AND dp.pick_number IS NOT NULL
                        ORDER BY dp.pick_number""",
@@ -1413,16 +1412,16 @@ class DraftOrderView(discord.ui.View):
             return embed
 
         description = ""
-        for pick_num, round_num, origin_team, origin_round, current_team, current_emoji, player_selected in round_picks:
+        for pick_num, round_num, pick_origin, current_team, current_emoji, player_selected in round_picks:
             # Get emoji for current team
             current_emoji_str = self.get_emoji(current_emoji)
 
             # Build pick - number, emoji, and origin
             pick_desc = f"**{pick_num}.** {current_emoji_str}"
 
-            # Show pick origin (original team + round)
-            if origin_team:
-                pick_desc += f"*({origin_team} R{origin_round})*"
+            # Show pick origin (from pick_origin field)
+            if pick_origin:
+                pick_desc += f"*({pick_origin})*"
 
             # Show if player selected
             if player_selected:
