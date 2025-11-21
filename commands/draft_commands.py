@@ -2242,17 +2242,10 @@ class FatherSonMatchView(discord.ui.View):
                 comp_pick_equivalent = result[0]
                 comp_pick_value = result[1]
 
-                # Get the current maximum pick number to append compensation pick at the end
-                cursor = await db.execute(
-                    "SELECT MAX(pick_number) FROM draft_picks WHERE draft_id = ?",
-                    (self.draft_id,)
-                )
-                max_pick = await cursor.fetchone()
-                comp_pick_number = (max_pick[0] if max_pick[0] else 0) + 1
-                print(f"DEBUG: Inserting compensation pick at position {comp_pick_number}")
+                # The compensation pick should be inserted at the position matching its value
+                comp_pick_number = comp_pick_equivalent
 
                 # Get the round number from the pick at the equivalent position
-                # (the pick that represents this compensation value)
                 cursor = await db.execute(
                     """SELECT round_number FROM draft_picks
                        WHERE draft_id = ? AND pick_number = ?""",
@@ -2267,9 +2260,24 @@ class FatherSonMatchView(discord.ui.View):
                     num_teams = (await cursor.fetchone())[0]
                     comp_round_number = ((comp_pick_equivalent - 1) // num_teams) + 1
 
-                print(f"DEBUG: Compensation pick will be in round {comp_round_number} (equivalent to pick #{comp_pick_equivalent})")
+                print(f"DEBUG: Inserting compensation pick #{comp_pick_number} in round {comp_round_number}")
 
-                # Insert compensation pick at the end of the draft
+                # Renumber all picks at or after this position to make room
+                cursor = await db.execute(
+                    """SELECT pick_id, pick_number FROM draft_picks
+                       WHERE draft_id = ? AND pick_number >= ?
+                       ORDER BY pick_number DESC""",
+                    (self.draft_id, comp_pick_number)
+                )
+                picks_to_renumber = await cursor.fetchall()
+
+                for pick_id, old_pick_number in picks_to_renumber:
+                    await db.execute(
+                        "UPDATE draft_picks SET pick_number = ? WHERE pick_id = ?",
+                        (old_pick_number + 1, pick_id)
+                    )
+
+                # Insert compensation pick at the correct position
                 await db.execute(
                     """INSERT INTO draft_picks (
                         draft_id, draft_name, season_number, round_number, pick_number,
@@ -2278,7 +2286,7 @@ class FatherSonMatchView(discord.ui.View):
                     (self.draft_id, draft_name, season_number, comp_round_number, comp_pick_number,
                      f"{self.fs_team_name} F/S Comp", self.fs_team_id, self.fs_team_id, None)
                 )
-                print(f"DEBUG: Compensation pick inserted successfully")
+                print(f"DEBUG: Compensation pick inserted successfully at position {comp_pick_number}")
             else:
                 print(f"DEBUG: No compensation pick found for {excess_points} points")
 
