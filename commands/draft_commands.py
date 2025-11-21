@@ -2062,15 +2062,15 @@ class FatherSonMatchView(discord.ui.View):
 
         embed.add_field(
             name="Required to Match",
-            value=f"{self.required_value} points (80% discount)",
+            value=f"{self.required_value} points (20% discount)",
             inline=True
         )
 
         # Calculate total value of matching picks
         total_match_value = sum(p[3] for p in self.matching_picks)
-        excess_points = total_match_value - self.bid_value
+        excess_points = total_match_value - self.required_value
 
-        print(f"DEBUG create_embed: total_match_value={total_match_value}, bid_value={self.bid_value}, excess_points={excess_points}")
+        print(f"DEBUG create_embed: total_match_value={total_match_value}, required_value={self.required_value}, excess_points={excess_points}")
 
         # Show which picks are needed to match
         if self.matching_picks:
@@ -2179,9 +2179,9 @@ class FatherSonMatchView(discord.ui.View):
 
         # Calculate excess points for compensation pick
         total_match_value = sum(p[3] for p in self.matching_picks)
-        excess_points = total_match_value - self.bid_value
+        excess_points = total_match_value - self.required_value
 
-        print(f"DEBUG process_match: total_match_value={total_match_value}, bid_value={self.bid_value}, excess_points={excess_points}")
+        print(f"DEBUG process_match: total_match_value={total_match_value}, required_value={self.required_value}, excess_points={excess_points}")
 
         # Step 1: Delete the consumed matching picks (these are the F/S club's picks used to match)
         for pick_num, _, _, _ in self.matching_picks:
