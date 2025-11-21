@@ -2068,6 +2068,7 @@ class FatherSonMatchView(discord.ui.View):
 
         # Calculate total value of matching picks
         total_match_value = sum(p[3] for p in self.matching_picks)
+        excess_points = total_match_value - self.bid_value
 
         # Show which picks are needed to match
         if self.matching_picks:
@@ -2081,6 +2082,26 @@ class FatherSonMatchView(discord.ui.View):
                 value=picks_text,
                 inline=False
             )
+
+            # Show compensation pick if there's excess points
+            if excess_points > 0:
+                # Find the compensation pick value
+                cursor = await db.execute(
+                    """SELECT pick_number, points_value FROM draft_value_index
+                       WHERE points_value <= ?
+                       ORDER BY points_value DESC
+                       LIMIT 1""",
+                    (excess_points,)
+                )
+                comp_result = await cursor.fetchone()
+
+                if comp_result:
+                    comp_pick_num, comp_pick_value = comp_result
+                    embed.add_field(
+                        name="💰 Compensation Pick",
+                        value=f"You will receive Pick {comp_pick_num} as compensation due to {excess_points} excess points.",
+                        inline=False
+                    )
 
             if total_match_value < self.required_value:
                 embed.add_field(
@@ -2151,6 +2172,10 @@ class FatherSonMatchView(discord.ui.View):
         )
         round_number = (await cursor.fetchone())[0]
 
+        # Calculate excess points for compensation pick
+        total_match_value = sum(p[3] for p in self.matching_picks)
+        excess_points = total_match_value - self.bid_value
+
         # Step 1: Delete the consumed matching picks (these are the F/S club's picks used to match)
         for pick_num, _, _, _ in self.matching_picks:
             await db.execute(
@@ -2192,7 +2217,49 @@ class FatherSonMatchView(discord.ui.View):
              f"{self.fs_team_name} F/S Match", self.fs_team_id, self.fs_team_id, self.player_id)
         )
 
-        # Step 4: Assign player to father/son club
+        # Step 4: Add compensation pick for excess points (if any)
+        if excess_points > 0:
+            # Find the pick number that has the highest value that doesn't exceed excess points
+            cursor = await db.execute(
+                """SELECT pick_number, points_value FROM draft_value_index
+                   WHERE points_value <= ?
+                   ORDER BY points_value DESC
+                   LIMIT 1""",
+                (excess_points,)
+            )
+            result = await cursor.fetchone()
+
+            if result:
+                comp_pick_equivalent = result[0]
+                comp_pick_value = result[1]
+
+                # Get the current maximum pick number to append compensation pick at the end
+                cursor = await db.execute(
+                    "SELECT MAX(pick_number) FROM draft_picks WHERE draft_id = ?",
+                    (self.draft_id,)
+                )
+                max_pick = await cursor.fetchone()
+                comp_pick_number = (max_pick[0] if max_pick[0] else 0) + 1
+
+                # Determine which round this pick falls into
+                cursor = await db.execute(
+                    "SELECT num_teams FROM drafts WHERE draft_id = ?",
+                    (self.draft_id,)
+                )
+                num_teams = (await cursor.fetchone())[0]
+                comp_round_number = ((comp_pick_number - 1) // num_teams) + 1
+
+                # Insert compensation pick at the end of the draft
+                await db.execute(
+                    """INSERT INTO draft_picks (
+                        draft_id, draft_name, season_number, round_number, pick_number,
+                        pick_origin, original_team_id, current_team_id, player_selected_id, picked_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+                    (self.draft_id, draft_name, season_number, comp_round_number, comp_pick_number,
+                     f"{self.fs_team_name} F/S Comp", self.fs_team_id, self.fs_team_id, None)
+                )
+
+        # Step 5: Assign player to father/son club
         contract_expiry = season_number + rookie_years
         await db.execute(
             "UPDATE players SET team_id = ?, contract_expiry = ? WHERE player_id = ?",
