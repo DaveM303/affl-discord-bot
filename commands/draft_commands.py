@@ -314,11 +314,12 @@ class DraftCommands(commands.Cog):
                 # Get draft picks with team emojis
                 cursor = await db.execute(
                     """SELECT dp.pick_number, dp.round_number,
-                              dp.pick_origin,
+                              ot.team_name as origin_team, dp.round_number as origin_round,
                               ct.team_name as current_team, ct.emoji_id as current_emoji,
                               p.name as player_selected
                        FROM draft_picks dp
                        JOIN teams ct ON dp.current_team_id = ct.team_id
+                       JOIN teams ot ON dp.original_team_id = ot.team_id
                        LEFT JOIN players p ON dp.player_selected_id = p.player_id
                        WHERE dp.draft_name = ? AND dp.pick_number IS NOT NULL
                        ORDER BY dp.pick_number""",
@@ -1412,16 +1413,16 @@ class DraftOrderView(discord.ui.View):
             return embed
 
         description = ""
-        for pick_num, round_num, pick_origin, current_team, current_emoji, player_selected in round_picks:
+        for pick_num, round_num, origin_team, origin_round, current_team, current_emoji, player_selected in round_picks:
             # Get emoji for current team
             current_emoji_str = self.get_emoji(current_emoji)
 
             # Build pick - number, emoji, and origin
             pick_desc = f"**{pick_num}.** {current_emoji_str}"
 
-            # Show pick origin (for testing/debugging)
-            if pick_origin:
-                pick_desc += f"*({pick_origin})*"
+            # Show pick origin (original team + round)
+            if origin_team:
+                pick_desc += f"*({origin_team} R{origin_round})*"
 
             # Show if player selected
             if player_selected:
@@ -1583,12 +1584,25 @@ class DraftPickView(discord.ui.View):
 
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Process the pick
-                await self.process_pick(db, self.selected_player_id, False)
+                # Check if player is a father/son player
+                cursor = await db.execute(
+                    "SELECT father_son_club_id FROM players WHERE player_id = ?",
+                    (self.selected_player_id,)
+                )
+                result = await cursor.fetchone()
+                father_son_club_id = result[0] if result and result[0] else None
 
-                # Update the message
-                await interaction.followup.send("✅ Pick confirmed!", ephemeral=True)
-                await interaction.message.edit(view=None)  # Remove buttons
+                # If player is a father/son player and this team is NOT the tied club
+                if father_son_club_id and father_son_club_id != self.team_id:
+                    # This is a bid on a father/son player
+                    await self.process_father_son_bid(db, self.selected_player_id, father_son_club_id)
+                    await interaction.followup.send("✅ Bid placed on father/son player!", ephemeral=True)
+                    await interaction.message.edit(view=None)  # Remove buttons
+                else:
+                    # Normal pick
+                    await self.process_pick(db, self.selected_player_id, False)
+                    await interaction.followup.send("✅ Pick confirmed!", ephemeral=True)
+                    await interaction.message.edit(view=None)  # Remove buttons
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
@@ -1687,6 +1701,160 @@ class DraftPickView(discord.ui.View):
         draft_commands = self.bot.get_cog('DraftCommands')
         await draft_commands.send_pick_notification(db, self.draft_id, self.draft_name, next_pick)
 
+    async def process_father_son_bid(self, db, player_id, father_son_club_id):
+        """Process a bid on a father/son player"""
+        # Get bid pick value (80% discount for matching)
+        cursor = await db.execute(
+            "SELECT points_value FROM draft_value_index WHERE pick_number = ?",
+            (self.pick_number,)
+        )
+        result = await cursor.fetchone()
+        bid_value = result[0] if result else 0
+        required_value = int(bid_value * 0.8)  # 20% discount
+
+        # Calculate which picks the father/son club needs to match
+        matching_picks = await self.calculate_matching_picks(db, father_son_club_id, required_value)
+
+        # Get player info
+        cursor = await db.execute(
+            "SELECT name, position, age, overall_rating FROM players WHERE player_id = ?",
+            (player_id,)
+        )
+        player_name, pos, age, ovr = await cursor.fetchone()
+
+        # Get bidding team info
+        cursor = await db.execute(
+            "SELECT team_name, emoji_id FROM teams WHERE team_id = ?",
+            (self.team_id,)
+        )
+        bidding_team_name, bidding_emoji_id = await cursor.fetchone()
+
+        # Get father/son club info
+        cursor = await db.execute(
+            "SELECT team_name, emoji_id, channel_id FROM teams WHERE team_id = ?",
+            (father_son_club_id,)
+        )
+        fs_team_name, fs_emoji_id, fs_channel_id = await cursor.fetchone()
+
+        # Post bid to draft channel
+        await self.post_father_son_bid_to_draft_channel(
+            db, player_id, player_name, pos, age, ovr,
+            bidding_team_name, bidding_emoji_id, fs_team_name, fs_emoji_id
+        )
+
+        # Send match notification to father/son club
+        if fs_channel_id:
+            fs_channel = self.bot.get_channel(int(fs_channel_id))
+            if fs_channel:
+                # Create match notification view
+                match_view = FatherSonMatchView(
+                    self.bot, self.draft_id, self.draft_name, self.pick_number,
+                    player_id, player_name, pos, age, ovr,
+                    father_son_club_id, fs_team_name,
+                    self.team_id, bidding_team_name,
+                    bid_value, required_value, matching_picks
+                )
+
+                # Create embed
+                embed = await match_view.create_embed(db)
+                await fs_channel.send(embed=embed, view=match_view)
+
+    async def calculate_matching_picks(self, db, team_id, required_value):
+        """Calculate which picks are needed to match the bid (earliest picks, minimum value)"""
+        # Get all picks for this team after the current pick
+        cursor = await db.execute(
+            """SELECT pick_number, round_number, pick_origin
+               FROM draft_picks
+               WHERE draft_id = ? AND current_team_id = ? AND pick_number > ?
+               AND player_selected_id IS NULL AND passed = 0
+               ORDER BY pick_number ASC""",
+            (self.draft_id, team_id, self.pick_number)
+        )
+        available_picks = await cursor.fetchall()
+
+        # Get point values for each pick
+        picks_with_values = []
+        for pick_number, round_number, pick_origin in available_picks:
+            cursor = await db.execute(
+                "SELECT points_value FROM draft_value_index WHERE pick_number = ?",
+                (pick_number,)
+            )
+            result = await cursor.fetchone()
+            points_value = result[0] if result else 0
+            picks_with_values.append((pick_number, round_number, pick_origin, points_value))
+
+        # Use earliest picks until we reach required value
+        matching_picks = []
+        total_value = 0
+        for pick_number, round_number, pick_origin, points_value in picks_with_values:
+            matching_picks.append((pick_number, round_number, pick_origin, points_value))
+            total_value += points_value
+            if total_value >= required_value:
+                break
+
+        return matching_picks
+
+    async def post_father_son_bid_to_draft_channel(self, db, player_id, player_name, pos, age, ovr,
+                                                     bidding_team_name, bidding_emoji_id,
+                                                     fs_team_name, fs_emoji_id):
+        """Post father/son bid to draft channel"""
+        try:
+            # Get draft channel
+            cursor = await db.execute(
+                "SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'"
+            )
+            result = await cursor.fetchone()
+            if not result or not result[0]:
+                return
+
+            draft_channel = self.bot.get_channel(int(result[0]))
+            if not draft_channel:
+                return
+
+            # Get pick info for round header
+            cursor = await db.execute(
+                """SELECT dp.round_number
+                   FROM draft_picks dp
+                   WHERE dp.draft_id = ? AND dp.pick_number = ?""",
+                (self.draft_id, self.pick_number)
+            )
+            round_num = (await cursor.fetchone())[0]
+
+            # Check if this is the first pick of a new round (post round header)
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM draft_picks WHERE draft_id = ? AND round_number = 1",
+                (self.draft_id,)
+            )
+            picks_per_round = (await cursor.fetchone())[0]
+
+            if (self.pick_number - 1) % picks_per_round == 0:
+                await draft_channel.send(f"**-- ROUND {round_num} --**")
+
+            # Get emojis
+            bidding_emoji_str = ""
+            if bidding_emoji_id:
+                try:
+                    emoji = self.bot.get_emoji(int(bidding_emoji_id))
+                    if emoji:
+                        bidding_emoji_str = f"{emoji} "
+                except:
+                    pass
+
+            fs_emoji_str = ""
+            if fs_emoji_id:
+                try:
+                    emoji = self.bot.get_emoji(int(fs_emoji_id))
+                    if emoji:
+                        fs_emoji_str = f"{emoji} "
+                except:
+                    pass
+
+            message = f"**Pick {self.pick_number}:** {bidding_emoji_str}{bidding_team_name} bid on **{player_name.upper()}** ({pos}, {age} yo, {ovr} OVR) - F/S tied to {fs_emoji_str}{fs_team_name}"
+            await draft_channel.send(message)
+
+        except Exception as e:
+            print(f"Error posting F/S bid to draft channel: {e}")
+
     async def post_to_draft_channel(self, db, player_id, is_pass):
         """Post pick result to draft channel"""
         try:
@@ -1750,6 +1918,305 @@ class DraftPickView(discord.ui.View):
 
         except Exception as e:
             print(f"Error posting to draft channel: {e}")
+
+
+class FatherSonMatchView(discord.ui.View):
+    """View for father/son club to match or pass on a bid"""
+    def __init__(self, bot, draft_id, draft_name, bid_pick_number, player_id, player_name, pos, age, ovr,
+                 fs_team_id, fs_team_name, bidding_team_id, bidding_team_name,
+                 bid_value, required_value, matching_picks):
+        super().__init__(timeout=None)  # No timeout for important decisions
+        self.bot = bot
+        self.draft_id = draft_id
+        self.draft_name = draft_name
+        self.bid_pick_number = bid_pick_number
+        self.player_id = player_id
+        self.player_name = player_name
+        self.pos = pos
+        self.age = age
+        self.ovr = ovr
+        self.fs_team_id = fs_team_id
+        self.fs_team_name = fs_team_name
+        self.bidding_team_id = bidding_team_id
+        self.bidding_team_name = bidding_team_name
+        self.bid_value = bid_value
+        self.required_value = required_value
+        self.matching_picks = matching_picks
+
+    async def create_embed(self, db):
+        """Create the match notification embed"""
+        embed = discord.Embed(
+            title=f"⚠️ Father/Son Bid - {self.player_name}",
+            description=f"**{self.bidding_team_name}** has bid on your father/son player with pick **#{self.bid_pick_number}**",
+            color=discord.Color.orange()
+        )
+
+        embed.add_field(
+            name="Player",
+            value=f"**{self.player_name}** ({self.pos}, {self.age} yo, {self.ovr} OVR)",
+            inline=False
+        )
+
+        embed.add_field(
+            name="Bid Value",
+            value=f"{self.bid_value} points (Pick #{self.bid_pick_number})",
+            inline=True
+        )
+
+        embed.add_field(
+            name="Required to Match",
+            value=f"{self.required_value} points (80% discount)",
+            inline=True
+        )
+
+        # Calculate total value of matching picks
+        total_match_value = sum(p[3] for p in self.matching_picks)
+
+        # Show which picks are needed to match
+        if self.matching_picks:
+            picks_text = ""
+            for pick_num, round_num, origin, points in self.matching_picks:
+                picks_text += f"• Pick #{pick_num} (R{round_num}, {points} pts)\n"
+            picks_text += f"\n**Total: {total_match_value} points**"
+
+            embed.add_field(
+                name="Picks Needed to Match",
+                value=picks_text,
+                inline=False
+            )
+
+            if total_match_value < self.required_value:
+                embed.add_field(
+                    name="⚠️ Insufficient Points",
+                    value=f"You don't have enough draft points to match this bid. The bidding team will automatically select {self.player_name}.",
+                    inline=False
+                )
+                # Disable the Match button
+                self.match_button.disabled = True
+        else:
+            embed.add_field(
+                name="⚠️ No Available Picks",
+                value=f"You have no picks remaining to match this bid. The bidding team will automatically select {self.player_name}.",
+                inline=False
+            )
+            # Disable the Match button
+            self.match_button.disabled = True
+
+        return embed
+
+    @discord.ui.button(label="Match Bid", style=discord.ButtonStyle.success, custom_id="fs_match")
+    async def match_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Match the bid and draft the player"""
+        await interaction.response.defer()
+
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Calculate total value
+                total_match_value = sum(p[3] for p in self.matching_picks)
+
+                # Verify they have enough points
+                if total_match_value < self.required_value:
+                    await interaction.followup.send("❌ Insufficient draft points to match!", ephemeral=True)
+                    return
+
+                # Process the match
+                await self.process_match(db, interaction)
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+    @discord.ui.button(label="Pass on Bid", style=discord.ButtonStyle.danger, custom_id="fs_pass")
+    async def pass_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Pass on the bid - let bidding team select the player"""
+        await interaction.response.defer()
+
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Process the pass
+                await self.process_pass(db, interaction)
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+    async def process_match(self, db, interaction):
+        """Father/son club matched the bid - consume picks and draft player"""
+        # Get rookie contract years and draft info
+        cursor = await db.execute(
+            "SELECT rookie_contract_years, season_number, draft_name FROM drafts WHERE draft_id = ?",
+            (self.draft_id,)
+        )
+        rookie_years, season_number, draft_name = await cursor.fetchone()
+
+        # Get the round number for the bid pick
+        cursor = await db.execute(
+            "SELECT round_number FROM draft_picks WHERE draft_id = ? AND pick_number = ?",
+            (self.draft_id, self.bid_pick_number)
+        )
+        round_number = (await cursor.fetchone())[0]
+
+        # Step 1: Push back all picks from bid_pick_number onwards by 1
+        # Do this in reverse order to avoid unique constraint issues
+        cursor = await db.execute(
+            """SELECT pick_number FROM draft_picks
+               WHERE draft_id = ? AND pick_number >= ?
+               ORDER BY pick_number DESC""",
+            (self.draft_id, self.bid_pick_number)
+        )
+        picks_to_push = await cursor.fetchall()
+
+        for (pick_num,) in picks_to_push:
+            await db.execute(
+                "UPDATE draft_picks SET pick_number = ? WHERE draft_id = ? AND pick_number = ?",
+                (pick_num + 1, self.draft_id, pick_num)
+            )
+
+        # Step 2: Delete the consumed matching picks
+        for pick_num, _, _, _ in self.matching_picks:
+            # The pick numbers have been pushed back by 1, so add 1 to the pick number
+            await db.execute(
+                "DELETE FROM draft_picks WHERE draft_id = ? AND pick_number = ?",
+                (self.draft_id, pick_num + 1)
+            )
+
+        # Step 3: Renumber all picks after deletions to fill gaps
+        await self.renumber_picks_after_deletion(db)
+
+        # Step 4: Insert new pick for father/son club at the bid position
+        await db.execute(
+            """INSERT INTO draft_picks (
+                draft_id, draft_name, season_number, round_number, pick_number,
+                pick_origin, original_team_id, current_team_id, player_selected_id, picked_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+            (self.draft_id, draft_name, season_number, round_number, self.bid_pick_number,
+             f"{self.fs_team_name} F/S Match", self.fs_team_id, self.fs_team_id, self.player_id)
+        )
+
+        # Step 5: Assign player to father/son club
+        contract_expiry = season_number + rookie_years
+        await db.execute(
+            "UPDATE players SET team_id = ?, contract_expiry = ? WHERE player_id = ?",
+            (self.fs_team_id, contract_expiry, self.player_id)
+        )
+
+        await db.commit()
+
+        # Post match result to draft channel
+        await self.post_match_result_to_draft_channel(db, matched=True)
+
+        # Disable buttons and update message
+        for item in self.children:
+            item.disabled = True
+        await interaction.message.edit(content="✅ **Bid Matched!** You have drafted this player.", view=self)
+
+        # Continue with next pick (bidding team picks again with their pushed-back pick)
+        await self.continue_draft(db)
+
+    async def process_pass(self, db, interaction):
+        """Father/son club passed - bidding team gets the player"""
+        # Get rookie contract years
+        cursor = await db.execute(
+            "SELECT rookie_contract_years, season_number FROM drafts WHERE draft_id = ?",
+            (self.draft_id,)
+        )
+        rookie_years, season_number = await cursor.fetchone()
+
+        # Update the bid pick with the player
+        await db.execute(
+            """UPDATE draft_picks
+               SET player_selected_id = ?, picked_at = CURRENT_TIMESTAMP
+               WHERE draft_id = ? AND pick_number = ?""",
+            (self.player_id, self.draft_id, self.bid_pick_number)
+        )
+
+        # Assign player to bidding team
+        contract_expiry = season_number + rookie_years
+        await db.execute(
+            "UPDATE players SET team_id = ?, contract_expiry = ? WHERE player_id = ?",
+            (self.bidding_team_id, contract_expiry, self.player_id)
+        )
+
+        await db.commit()
+
+        # Post pass result to draft channel
+        await self.post_match_result_to_draft_channel(db, matched=False)
+
+        # Disable buttons and update message
+        for item in self.children:
+            item.disabled = True
+        await interaction.message.edit(content="❌ **Bid Passed** - Bidding team selects the player.", view=self)
+
+        # Continue with next pick
+        await self.continue_draft(db)
+
+    async def renumber_picks_after_deletion(self, db):
+        """Renumber all picks after picks are deleted, shifting everything forward"""
+        # Get all remaining picks ordered by pick_number
+        cursor = await db.execute(
+            """SELECT pick_id, pick_number FROM draft_picks
+               WHERE draft_id = ?
+               ORDER BY pick_number ASC""",
+            (self.draft_id,)
+        )
+        all_picks = await cursor.fetchall()
+
+        # Renumber sequentially
+        new_pick_number = 1
+        for pick_id, old_pick_number in all_picks:
+            if new_pick_number != old_pick_number:
+                await db.execute(
+                    "UPDATE draft_picks SET pick_number = ? WHERE pick_id = ?",
+                    (new_pick_number, pick_id)
+                )
+            new_pick_number += 1
+
+        await db.commit()
+
+    async def post_match_result_to_draft_channel(self, db, matched):
+        """Post the match/pass result to draft channel"""
+        try:
+            # Get draft channel
+            cursor = await db.execute(
+                "SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'"
+            )
+            result = await cursor.fetchone()
+            if not result or not result[0]:
+                return
+
+            draft_channel = self.bot.get_channel(int(result[0]))
+            if not draft_channel:
+                return
+
+            if matched:
+                # Show picks consumed
+                picks_text = ", ".join([f"#{p[0]}" for p in self.matching_picks])
+                message = f"🔄 **{self.fs_team_name}** matched the bid! Drafted **{self.player_name.upper()}** using picks: {picks_text}"
+            else:
+                message = f"✅ **{self.bidding_team_name}** select **{self.player_name.upper()}** ({self.pos}, {self.age} yo, {self.ovr} OVR) - F/S bid not matched"
+
+            await draft_channel.send(message)
+
+        except Exception as e:
+            print(f"Error posting F/S match result to draft channel: {e}")
+
+    async def continue_draft(self, db):
+        """Continue the draft with the next pick"""
+        # Increment current pick number
+        cursor = await db.execute(
+            "SELECT current_pick_number FROM drafts WHERE draft_id = ?",
+            (self.draft_id,)
+        )
+        current_pick = (await cursor.fetchone())[0]
+        next_pick = current_pick + 1
+
+        await db.execute(
+            "UPDATE drafts SET current_pick_number = ? WHERE draft_id = ?",
+            (next_pick, self.draft_id)
+        )
+        await db.commit()
+
+        # Send next pick notification
+        draft_commands = self.bot.get_cog('DraftCommands')
+        await draft_commands.send_pick_notification(db, self.draft_id, self.draft_name, next_pick)
 
 
 async def setup(bot):

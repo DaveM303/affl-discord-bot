@@ -209,6 +209,14 @@ async def init_db():
             )
         ''')
 
+        # Create Draft Value Index table (points value for each draft pick)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS draft_value_index (
+                pick_number INTEGER PRIMARY KEY,
+                points_value INTEGER NOT NULL
+            )
+        ''')
+
         # Create Submitted Lineups table (for tracking lineup submissions per round)
         await db.execute('''
             CREATE TABLE IF NOT EXISTS submitted_lineups (
@@ -243,6 +251,30 @@ async def init_db():
             (24, 26, 4),
             (27, 30, 3),
             (31, NULL, 2)
+        ''')
+
+        # Insert default draft value index (AFL-style points system)
+        # First round picks have highest value, diminishing returns after that
+        await db.execute('''
+            INSERT OR IGNORE INTO draft_value_index (pick_number, points_value) VALUES
+            (1, 3000), (2, 2517), (3, 2234), (4, 2034), (5, 1878),
+            (6, 1751), (7, 1644), (8, 1551), (9, 1469), (10, 1395),
+            (11, 1329), (12, 1268), (13, 1212), (14, 1161), (15, 1112),
+            (16, 1067), (17, 1025), (18, 985), (19, 948), (20, 912),
+            (21, 878), (22, 845), (23, 815), (24, 785), (25, 756),
+            (26, 729), (27, 703), (28, 677), (29, 653), (30, 629),
+            (31, 606), (32, 584), (33, 563), (34, 542), (35, 522),
+            (36, 502), (37, 483), (38, 465), (39, 446), (40, 429),
+            (41, 412), (42, 395), (43, 378), (44, 362), (45, 347),
+            (46, 331), (47, 316), (48, 302), (49, 287), (50, 273),
+            (51, 259), (52, 246), (53, 233), (54, 220), (55, 207),
+            (56, 194), (57, 182), (58, 170), (59, 158), (60, 146),
+            (61, 135), (62, 123), (63, 112), (64, 101), (65, 90),
+            (66, 80), (67, 69), (68, 59), (69, 49), (70, 39),
+            (71, 29), (72, 19), (73, 9), (74, 9), (75, 9),
+            (76, 9), (77, 9), (78, 9), (79, 9), (80, 9),
+            (81, 9), (82, 9), (83, 9), (84, 9), (85, 9),
+            (86, 9), (87, 9), (88, 9), (89, 9), (90, 9)
         ''')
 
         # Create Compensation Chart table (free agency compensation bands)

@@ -1065,16 +1065,18 @@ class AdminCommands(commands.Cog):
                 cursor = await db.execute(
                     """SELECT dp.pick_id as Pick_ID, dp.draft_name as Draft_Name,
                               dp.round_number as Round, dp.pick_number as Pick,
-                              dp.pick_origin as Pick_Origin, ct.team_name as Current_Team,
+                              dp.pick_origin as Pick_Origin,
+                              ot.team_name as Original_Team, ct.team_name as Current_Team,
                               dp.player_selected_id as Player_ID, p.name as Player_Name,
                               dp.passed as Passed, dp.picked_at as Picked_At
                        FROM draft_picks dp
                        JOIN teams ct ON dp.current_team_id = ct.team_id
+                       JOIN teams ot ON dp.original_team_id = ot.team_id
                        LEFT JOIN players p ON dp.player_selected_id = p.player_id
                        ORDER BY dp.draft_name, dp.round_number, dp.pick_number"""
                 )
                 draft_picks = await cursor.fetchall()
-                draft_picks_df = pd.DataFrame(draft_picks, columns=['Pick_ID', 'Draft_Name', 'Round', 'Pick', 'Pick_Origin', 'Current_Team', 'Player_ID', 'Player_Name', 'Passed', 'Picked_At'])
+                draft_picks_df = pd.DataFrame(draft_picks, columns=['Pick_ID', 'Draft_Name', 'Round', 'Pick', 'Pick_Origin', 'Original_Team', 'Current_Team', 'Player_ID', 'Player_Name', 'Passed', 'Picked_At'])
                 draft_picks_df['Pick_Origin'] = draft_picks_df['Pick_Origin'].fillna('')
                 draft_picks_df['Player_ID'] = draft_picks_df['Player_ID'].fillna('')
                 draft_picks_df['Player_Name'] = draft_picks_df['Player_Name'].fillna('')
@@ -1139,6 +1141,15 @@ class AdminCommands(commands.Cog):
                 contract_config = await cursor.fetchall()
                 contract_config_df = pd.DataFrame(contract_config, columns=['Min_Age', 'Max_Age', 'Contract_Years'])
                 contract_config_df['Max_Age'] = contract_config_df['Max_Age'].fillna('')
+
+                # Export Draft Value Index
+                cursor = await db.execute(
+                    """SELECT pick_number as Pick_Number, points_value as Points_Value
+                       FROM draft_value_index
+                       ORDER BY pick_number"""
+                )
+                draft_value_index = await cursor.fetchall()
+                draft_value_index_df = pd.DataFrame(draft_value_index, columns=['Pick_Number', 'Points_Value'])
 
                 # Export Free Agency Periods
                 cursor = await db.execute(
@@ -1214,6 +1225,7 @@ class AdminCommands(commands.Cog):
                 settings_df.to_excel(writer, sheet_name='Settings', index=False)
                 compensation_chart_df.to_excel(writer, sheet_name='Compensation_Chart', index=False)
                 contract_config_df.to_excel(writer, sheet_name='Contract_Config', index=False)
+                draft_value_index_df.to_excel(writer, sheet_name='Draft_Value_Index', index=False)
 
                 # Relationship/State sheets (editable)
                 lineups_df.to_excel(writer, sheet_name='Lineups', index=False)
@@ -1876,6 +1888,17 @@ class AdminCommands(commands.Cog):
                             cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Current_Team']),))
                             current_team = await cursor.fetchone()
 
+                            # Get original team ID (fallback to current team if not specified)
+                            original_team_id = None
+                            if 'Original_Team' in row and pd.notna(row['Original_Team']) and row['Original_Team']:
+                                cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Original_Team']),))
+                                original_team = await cursor.fetchone()
+                                original_team_id = original_team[0] if original_team else None
+
+                            # Fallback to current team if original not specified
+                            if not original_team_id:
+                                original_team_id = current_team[0] if current_team else None
+
                             # Get player ID if selected
                             player_id = None
                             if pd.notna(row['Player_ID']) and row['Player_ID']:
@@ -1894,9 +1917,6 @@ class AdminCommands(commands.Cog):
                             round_number = int(row['Round']) if pd.notna(row['Round']) else None
                             pick_number = int(row['Pick']) if pd.notna(row['Pick']) else None
                             draft_name = str(row['Draft_Name']) if pd.notna(row['Draft_Name']) else ''
-
-                            # Get original_team_id (same as current for imports, can be updated via trades)
-                            original_team_id = current_team[0] if current_team else None
 
                             # Get season_number from draft_name if possible (format: "Season X National Draft")
                             season_number = None
@@ -2156,6 +2176,36 @@ class AdminCommands(commands.Cog):
                     if 'Worksheet Contract_Config' not in str(e):
                         errors.append(f"Contract Config sheet error: {str(e)}")
 
+                # Import Draft Value Index
+                draft_value_index_imported = 0
+                try:
+                    draft_value_index_df = pd.read_excel(excel_file, sheet_name='Draft_Value_Index')
+
+                    # Clear existing draft value index
+                    await db.execute("DELETE FROM draft_value_index")
+
+                    for _, row in draft_value_index_df.iterrows():
+                        try:
+                            # Skip empty rows
+                            if pd.isna(row['Pick_Number']) or row['Pick_Number'] == '':
+                                continue
+
+                            pick_number = int(row['Pick_Number'])
+                            points_value = int(row['Points_Value'])
+
+                            await db.execute(
+                                """INSERT INTO draft_value_index (pick_number, points_value)
+                                   VALUES (?, ?)""",
+                                (pick_number, points_value)
+                            )
+                            draft_value_index_imported += 1
+                        except Exception as e:
+                            errors.append(f"Draft Value Index row: {str(e)}")
+                    await db.commit()
+                except Exception as e:
+                    if 'Worksheet Draft_Value_Index' not in str(e):
+                        errors.append(f"Draft Value Index sheet error: {str(e)}")
+
                 # Import Free Agency Periods
                 free_agency_periods_imported = 0
                 try:
@@ -2384,6 +2434,8 @@ class AdminCommands(commands.Cog):
                 response += f"**Compensation Chart:** {compensation_chart_imported} entries imported\n"
             if contract_config_imported > 0:
                 response += f"**Contract Config:** {contract_config_imported} entries imported\n"
+            if draft_value_index_imported > 0:
+                response += f"**Draft Value Index:** {draft_value_index_imported} entries imported\n"
             if free_agency_periods_imported > 0:
                 response += f"**Free Agency Periods:** {free_agency_periods_imported} imported\n"
             if free_agency_bids_imported > 0:

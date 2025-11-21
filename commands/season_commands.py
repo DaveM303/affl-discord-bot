@@ -347,6 +347,14 @@ class SeasonCommands(commands.Cog):
                                 (current_year,)
                             )
 
+                # Add father_son_club_id column to players if it doesn't exist
+                cursor = await db.execute("PRAGMA table_info(players)")
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+
+                if 'father_son_club_id' not in column_names:
+                    await db.execute('ALTER TABLE players ADD COLUMN father_son_club_id INTEGER REFERENCES teams(team_id)')
+
                 # Add season_1_year setting if it doesn't exist
                 cursor = await db.execute(
                     "SELECT setting_value FROM settings WHERE setting_key = 'season_1_year'"
