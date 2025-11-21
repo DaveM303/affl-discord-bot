@@ -279,34 +279,34 @@ class DraftCommands(commands.Cog):
 
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # If no draft name provided, get the most recent current draft
+                # If no draft name provided, get the most recent current or in-progress draft
                 if draft_name is None:
                     cursor = await db.execute(
                         """SELECT draft_name
                            FROM drafts
-                           WHERE status = 'current'
+                           WHERE status IN ('current', 'in_progress')
                            ORDER BY draft_id DESC
                            LIMIT 1"""
                     )
                     draft_result = await cursor.fetchone()
                     if not draft_result:
                         await interaction.followup.send(
-                            "❌ No current drafts found!\n"
+                            "❌ No current or in-progress drafts found!\n"
                             "Use `/setdraftladder` to set the order for a future draft."
                         )
                         return
                     draft_name = draft_result[0]
 
-                # Verify this draft is current (has ladder set)
+                # Verify this draft is current or in progress (has ladder set)
                 cursor = await db.execute(
                     "SELECT status FROM drafts WHERE draft_name = ?",
                     (draft_name,)
                 )
                 draft_status = await cursor.fetchone()
-                if not draft_status or draft_status[0] != 'current':
+                if not draft_status or draft_status[0] not in ('current', 'in_progress'):
                     await interaction.followup.send(
-                        f"❌ Draft '{draft_name}' is not a current draft (status: {draft_status[0] if draft_status else 'unknown'})!\n"
-                        f"Only current drafts with ladder order set can be viewed.\n"
+                        f"❌ Draft '{draft_name}' is not viewable (status: {draft_status[0] if draft_status else 'unknown'})!\n"
+                        f"Only current or in-progress drafts with ladder order set can be viewed.\n"
                         f"Use `/setdraftladder` to set the order for a future draft."
                     )
                     return
@@ -2053,34 +2053,38 @@ class FatherSonMatchView(discord.ui.View):
         )
         round_number = (await cursor.fetchone())[0]
 
-        # Step 1: Push back all picks from bid_pick_number onwards by 1
-        # Do this in reverse order to avoid unique constraint issues
-        cursor = await db.execute(
-            """SELECT pick_number FROM draft_picks
-               WHERE draft_id = ? AND pick_number >= ?
-               ORDER BY pick_number DESC""",
-            (self.draft_id, self.bid_pick_number)
-        )
-        picks_to_push = await cursor.fetchall()
-
-        for (pick_num,) in picks_to_push:
-            await db.execute(
-                "UPDATE draft_picks SET pick_number = ? WHERE draft_id = ? AND pick_number = ?",
-                (pick_num + 1, self.draft_id, pick_num)
-            )
-
-        # Step 2: Delete the consumed matching picks
+        # Step 1: Delete the consumed matching picks (these are the F/S club's picks used to match)
         for pick_num, _, _, _ in self.matching_picks:
-            # The pick numbers have been pushed back by 1, so add 1 to the pick number
             await db.execute(
                 "DELETE FROM draft_picks WHERE draft_id = ? AND pick_number = ?",
-                (self.draft_id, pick_num + 1)
+                (self.draft_id, pick_num)
             )
 
-        # Step 3: Renumber all picks after deletions to fill gaps
-        await self.renumber_picks_after_deletion(db)
+        # Step 2: Get all remaining picks and renumber them sequentially,
+        # but insert the F/S pick at the bid position
+        cursor = await db.execute(
+            """SELECT pick_id, pick_number FROM draft_picks
+               WHERE draft_id = ?
+               ORDER BY pick_number ASC""",
+            (self.draft_id,)
+        )
+        all_picks = await cursor.fetchall()
 
-        # Step 4: Insert new pick for father/son club at the bid position
+        # Renumber picks: everything before bid stays same, bid position onwards shifts by 1
+        new_pick_number = 1
+        for pick_id, old_pick_number in all_picks:
+            if new_pick_number == self.bid_pick_number:
+                # Skip this number - it will be used for the F/S pick
+                new_pick_number += 1
+
+            if new_pick_number != old_pick_number:
+                await db.execute(
+                    "UPDATE draft_picks SET pick_number = ? WHERE pick_id = ?",
+                    (new_pick_number, pick_id)
+                )
+            new_pick_number += 1
+
+        # Step 3: Insert new pick for father/son club at the bid position
         await db.execute(
             """INSERT INTO draft_picks (
                 draft_id, draft_name, season_number, round_number, pick_number,
@@ -2090,7 +2094,7 @@ class FatherSonMatchView(discord.ui.View):
              f"{self.fs_team_name} F/S Match", self.fs_team_id, self.fs_team_id, self.player_id)
         )
 
-        # Step 5: Assign player to father/son club
+        # Step 4: Assign player to father/son club
         contract_expiry = season_number + rookie_years
         await db.execute(
             "UPDATE players SET team_id = ?, contract_expiry = ? WHERE player_id = ?",
