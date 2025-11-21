@@ -2070,6 +2070,8 @@ class FatherSonMatchView(discord.ui.View):
         total_match_value = sum(p[3] for p in self.matching_picks)
         excess_points = total_match_value - self.bid_value
 
+        print(f"DEBUG create_embed: total_match_value={total_match_value}, bid_value={self.bid_value}, excess_points={excess_points}")
+
         # Show which picks are needed to match
         if self.matching_picks:
             picks_text = ""
@@ -2085,6 +2087,7 @@ class FatherSonMatchView(discord.ui.View):
 
             # Show compensation pick if there's excess points
             if excess_points > 0:
+                print(f"DEBUG: Excess points detected: {excess_points}")
                 # Find the compensation pick value
                 cursor = await db.execute(
                     """SELECT pick_number, points_value FROM draft_value_index
@@ -2094,9 +2097,11 @@ class FatherSonMatchView(discord.ui.View):
                     (excess_points,)
                 )
                 comp_result = await cursor.fetchone()
+                print(f"DEBUG: comp_result = {comp_result}")
 
                 if comp_result:
                     comp_pick_num, comp_pick_value = comp_result
+                    print(f"DEBUG: Adding compensation field - Pick {comp_pick_num}, {comp_pick_value} pts")
                     embed.add_field(
                         name="💰 Compensation Pick",
                         value=f"You will receive Pick {comp_pick_num} as compensation due to {excess_points} excess points.",
@@ -2176,6 +2181,8 @@ class FatherSonMatchView(discord.ui.View):
         total_match_value = sum(p[3] for p in self.matching_picks)
         excess_points = total_match_value - self.bid_value
 
+        print(f"DEBUG process_match: total_match_value={total_match_value}, bid_value={self.bid_value}, excess_points={excess_points}")
+
         # Step 1: Delete the consumed matching picks (these are the F/S club's picks used to match)
         for pick_num, _, _, _ in self.matching_picks:
             await db.execute(
@@ -2219,6 +2226,7 @@ class FatherSonMatchView(discord.ui.View):
 
         # Step 4: Add compensation pick for excess points (if any)
         if excess_points > 0:
+            print(f"DEBUG: Processing compensation pick for {excess_points} excess points")
             # Find the pick number that has the highest value that doesn't exceed excess points
             cursor = await db.execute(
                 """SELECT pick_number, points_value FROM draft_value_index
@@ -2228,6 +2236,7 @@ class FatherSonMatchView(discord.ui.View):
                 (excess_points,)
             )
             result = await cursor.fetchone()
+            print(f"DEBUG: Compensation pick query result: {result}")
 
             if result:
                 comp_pick_equivalent = result[0]
@@ -2240,6 +2249,7 @@ class FatherSonMatchView(discord.ui.View):
                 )
                 max_pick = await cursor.fetchone()
                 comp_pick_number = (max_pick[0] if max_pick[0] else 0) + 1
+                print(f"DEBUG: Inserting compensation pick at position {comp_pick_number}")
 
                 # Determine which round this pick falls into
                 cursor = await db.execute(
@@ -2258,6 +2268,9 @@ class FatherSonMatchView(discord.ui.View):
                     (self.draft_id, draft_name, season_number, comp_round_number, comp_pick_number,
                      f"{self.fs_team_name} F/S Comp", self.fs_team_id, self.fs_team_id, None)
                 )
+                print(f"DEBUG: Compensation pick inserted successfully")
+            else:
+                print(f"DEBUG: No compensation pick found for {excess_points} points")
 
         # Step 5: Assign player to father/son club
         contract_expiry = season_number + rookie_years
