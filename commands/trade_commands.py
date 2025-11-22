@@ -2550,6 +2550,11 @@ class ModeratorApprovalView(discord.ui.View):
             )
             result = await cursor.fetchone()
 
+            # Store team info outside the if block for logging
+            init_channel_id = recv_channel_id = init_team_name = recv_team_name = None
+            init_emoji_id = recv_emoji_id = init_players_json = recv_players_json = None
+            init_picks_json = recv_picks_json = None
+
             if result:
                 init_channel_id, init_team_name, init_emoji_id, recv_channel_id, recv_team_name, recv_emoji_id, init_players_json, recv_players_json, init_picks_json, recv_picks_json = result
 
@@ -2591,7 +2596,7 @@ class ModeratorApprovalView(discord.ui.View):
             await db.commit()
 
             # Log to bot logs channel
-            if result:
+            if result and init_emoji_id and recv_emoji_id:
                 log_channel = await self.bot.get_cog('TradeCommands').get_bot_logs_channel(db)
                 if log_channel:
                     init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
@@ -2842,9 +2847,9 @@ class ModeratorApprovalView(discord.ui.View):
             if team_info:
                 bot_log_channel = await parent_cog.get_bot_logs_channel(db)
                 if bot_log_channel:
-                    init_team_name, init_channel_id, init_emoji_id, recv_team_name, recv_channel_id, recv_emoji_id = team_info
-                    init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
-                    recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
+                    log_init_team_name, log_init_channel_id, log_init_emoji_id, log_recv_team_name, log_recv_channel_id, log_recv_emoji_id = team_info
+                    init_emoji = self.bot.get_emoji(int(log_init_emoji_id)) if log_init_emoji_id else None
+                    recv_emoji = self.bot.get_emoji(int(log_recv_emoji_id)) if log_recv_emoji_id else None
                     init_emoji_str = f"{init_emoji} " if init_emoji else ""
                     recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
 
