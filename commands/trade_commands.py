@@ -60,6 +60,19 @@ class TradeCommands(commands.Cog):
 
         return False
 
+    async def get_bot_logs_channel(self, db):
+        """Get the bot logs channel from settings"""
+        cursor = await db.execute(
+            "SELECT setting_value FROM settings WHERE setting_key = 'bot_logs_channel_id'"
+        )
+        result = await cursor.fetchone()
+        if result and result[0]:
+            try:
+                return self.bot.get_channel(int(result[0]))
+            except:
+                return None
+        return None
+
     def format_pick_display(self, pick_number, season_number, round_number, emoji_id, current_season):
         """
         Format pick display based on whether it's a current or future pick.
@@ -937,6 +950,17 @@ class TradeMenuView(discord.ui.View):
             )
             await db.commit()
 
+            # Log to bot logs channel
+            log_channel = await self.bot.get_cog('TradeCommands').get_bot_logs_channel(db)
+            if log_channel:
+                init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
+                recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
+                init_emoji_str = f"{init_emoji} " if init_emoji else ""
+                recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
+
+                log_message = f"{recv_emoji_str}has accepted {init_emoji_str}'s trade offer (Trade ID: {trade_id}) - {interaction.user.mention}"
+                await log_channel.send(log_message)
+
         await interaction.response.send_message("✅ Trade accepted! Sent to moderators for approval.", ephemeral=True)
 
         # Notify the team that proposed the trade
@@ -1050,6 +1074,17 @@ class TradeMenuView(discord.ui.View):
                 (str(interaction.user.id), trade_id)
             )
             await db.commit()
+
+            # Log to bot logs channel
+            log_channel = await self.bot.get_cog('TradeCommands').get_bot_logs_channel(db)
+            if log_channel:
+                init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
+                recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
+                init_emoji_str = f"{init_emoji} " if init_emoji else ""
+                recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
+
+                log_message = f"{recv_emoji_str}has declined {init_emoji_str}'s trade offer (Trade ID: {trade_id}) - {interaction.user.mention}"
+                await log_channel.send(log_message)
 
         await interaction.response.send_message("✅ Trade declined.", ephemeral=True)
 
@@ -1175,6 +1210,20 @@ class TradeMenuView(discord.ui.View):
                 (trade_id,)
             )
             await db.commit()
+
+            # Log to bot logs channel
+            if trade_info:
+                initiating_team_id, init_team_name, recv_channel_id, init_emoji_id, recv_emoji_id, init_players_json, recv_players_json, init_picks_json, recv_picks_json = trade_info
+
+                log_channel = await self.bot.get_cog('TradeCommands').get_bot_logs_channel(db)
+                if log_channel:
+                    init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
+                    recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
+                    init_emoji_str = f"{init_emoji} " if init_emoji else ""
+                    recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
+
+                    log_message = f"{init_emoji_str}has withdrawn their trade offer to {recv_emoji_str}(Trade ID: {trade_id}) - {interaction.user.mention}"
+                    await log_channel.send(log_message)
 
         # Notify the receiving team
         if trade_info:
@@ -2012,6 +2061,17 @@ class TradeOfferView(discord.ui.View):
                 )
                 await db.commit()
 
+        # Log to bot logs channel
+        async with aiosqlite.connect(DB_PATH) as db:
+            log_channel = await self.parent_cog.get_bot_logs_channel(db)
+            if log_channel:
+                initiating_emoji_str = f"{self.initiating_emoji} " if self.initiating_emoji else ""
+                receiving_emoji_str = f"{self.receiving_emoji} " if self.receiving_emoji else ""
+
+                action_type = "counter-offer" if self.is_counter_offer else "trade offer"
+                log_message = f"{initiating_emoji_str}sent {receiving_emoji_str}a {action_type} (Trade ID: {trade_id}) - {interaction.user.mention}"
+                await log_channel.send(log_message)
+
         await interaction.response.send_message("✅ **Trade offer sent!**", ephemeral=True)
 
 
@@ -2530,6 +2590,18 @@ class ModeratorApprovalView(discord.ui.View):
 
             await db.commit()
 
+            # Log to bot logs channel
+            if result:
+                log_channel = await self.bot.get_cog('TradeCommands').get_bot_logs_channel(db)
+                if log_channel:
+                    init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
+                    recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
+                    init_emoji_str = f"{init_emoji} " if init_emoji else ""
+                    recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
+
+                    log_message = f"Admin vetoed trade between {init_emoji_str}and {recv_emoji_str}(Trade ID: {self.trade_id}) - {interaction.user.mention}"
+                    await log_channel.send(log_message)
+
         if result:
             # Get emojis
             init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
@@ -2765,6 +2837,19 @@ class ModeratorApprovalView(discord.ui.View):
             log_result = await cursor.fetchone()
 
             await db.commit()
+
+            # Log to bot logs channel
+            if team_info:
+                bot_log_channel = await parent_cog.get_bot_logs_channel(db)
+                if bot_log_channel:
+                    init_team_name, init_channel_id, init_emoji_id, recv_team_name, recv_channel_id, recv_emoji_id = team_info
+                    init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
+                    recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
+                    init_emoji_str = f"{init_emoji} " if init_emoji else ""
+                    recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
+
+                    log_message = f"Admin approved trade between {init_emoji_str}and {recv_emoji_str}(Trade ID: {self.trade_id}) - {interaction.user.mention}"
+                    await bot_log_channel.send(log_message)
 
         if not team_info:
             await interaction.response.send_message("❌ Team info not found!", ephemeral=True)
