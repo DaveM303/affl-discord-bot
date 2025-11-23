@@ -855,10 +855,10 @@ class DraftCommands(commands.Cog):
 
             # Format into multiple columns
             embed = discord.Embed(
-                title="📊 Draft Pick Points Value",
-                description="AFL-style points system for draft picks",
+                title="Draft Value Index",
                 color=discord.Color.blue()
             )
+            embed.set_footer(text="*Reminder that F/S bids can be matched with a 20% discount!*")
 
             # Split into 3 columns of ~30 picks each
             picks_per_column = 30
@@ -872,7 +872,7 @@ class DraftCommands(commands.Cog):
             # Add columns to embed (max 3 inline fields per row)
             for idx, column in enumerate(columns):
                 embed.add_field(
-                    name=f"Picks {all_picks[idx * picks_per_column][0]}-{min(all_picks[(idx + 1) * picks_per_column - 1][0] if (idx + 1) * picks_per_column <= len(all_picks) else all_picks[-1][0], all_picks[-1][0])}",
+                    name="\u200b",  # Zero-width space for empty header
                     value=column,
                     inline=True
                 )
