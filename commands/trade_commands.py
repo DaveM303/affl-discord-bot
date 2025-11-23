@@ -2532,9 +2532,11 @@ class ModeratorApprovalView(discord.ui.View):
 
         # Get parent_cog for helper methods
         parent_cog = self.bot.get_cog('TradeCommands')
+        print(f"DEBUG veto START: trade_id={self.trade_id}, parent_cog={parent_cog}")
 
         # Update trade status
         async with aiosqlite.connect(DB_PATH) as db:
+            print(f"DEBUG veto: Inside db context, updating trade status")
             await db.execute(
                 """UPDATE trades SET status = 'vetoed', approved_by_user_id = ?
                    WHERE trade_id = ?""",
@@ -2542,6 +2544,7 @@ class ModeratorApprovalView(discord.ui.View):
             )
 
             # Get team info and trade details
+            print(f"DEBUG veto: Fetching team info")
             cursor = await db.execute(
                 """SELECT t1.channel_id, t1.team_name, t1.emoji_id, t2.channel_id, t2.team_name, t2.emoji_id,
                           tr.initiating_players, tr.receiving_players, tr.initiating_picks, tr.receiving_picks
@@ -2552,6 +2555,7 @@ class ModeratorApprovalView(discord.ui.View):
                 (self.trade_id,)
             )
             result = await cursor.fetchone()
+            print(f"DEBUG veto: Query result received, result exists={result is not None}")
 
             # Store team info outside the if block for logging
             init_channel_id = recv_channel_id = init_team_name = recv_team_name = None
