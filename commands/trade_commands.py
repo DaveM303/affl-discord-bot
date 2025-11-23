@@ -2527,7 +2527,6 @@ class ModeratorApprovalView(discord.ui.View):
 
     @discord.ui.button(label="Veto", style=discord.ButtonStyle.red, custom_id="veto_trade")
     async def veto_trade(self, interaction: discord.Interaction, button: discord.ui.Button):
-        print(f"DEBUG veto: Button clicked! trade_id={self.trade_id}, user={interaction.user}")
         # Check if user is admin
         is_admin = False
         if interaction.guild.owner_id == interaction.user.id:
@@ -2545,11 +2544,9 @@ class ModeratorApprovalView(discord.ui.View):
 
         # Get parent_cog for helper methods
         parent_cog = self.bot.get_cog('TradeCommands')
-        print(f"DEBUG veto START: trade_id={self.trade_id}, parent_cog={parent_cog}")
 
         # Update trade status
         async with aiosqlite.connect(DB_PATH) as db:
-            print(f"DEBUG veto: Inside db context, updating trade status")
             await db.execute(
                 """UPDATE trades SET status = 'vetoed', approved_by_user_id = ?
                    WHERE trade_id = ?""",
@@ -2557,7 +2554,6 @@ class ModeratorApprovalView(discord.ui.View):
             )
 
             # Get team info and trade details
-            print(f"DEBUG veto: Fetching team info")
             cursor = await db.execute(
                 """SELECT t1.channel_id, t1.team_name, t1.emoji_id, t2.channel_id, t2.team_name, t2.emoji_id,
                           tr.initiating_players, tr.receiving_players, tr.initiating_picks, tr.receiving_picks
@@ -2568,7 +2564,6 @@ class ModeratorApprovalView(discord.ui.View):
                 (self.trade_id,)
             )
             result = await cursor.fetchone()
-            print(f"DEBUG veto: Query result received, result exists={result is not None}")
 
             # Store team info outside the if block for logging
             init_channel_id = recv_channel_id = init_team_name = recv_team_name = None
@@ -2616,10 +2611,8 @@ class ModeratorApprovalView(discord.ui.View):
             await db.commit()
 
             # Log to bot logs channel
-            print(f"DEBUG veto: result={result is not None}")
             if result:
                 log_channel = await parent_cog.get_bot_logs_channel(db)
-                print(f"DEBUG veto: log_channel={log_channel}")
                 if log_channel:
                     init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
                     recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
@@ -2627,13 +2620,7 @@ class ModeratorApprovalView(discord.ui.View):
                     recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
 
                     log_message = f"Admin vetoed trade between {init_emoji_str}and {recv_emoji_str}(Trade ID: {self.trade_id}) - {interaction.user.mention}"
-                    print(f"DEBUG veto: Sending log message: {log_message}")
                     await log_channel.send(log_message)
-                    print(f"DEBUG veto: Log message sent successfully")
-                else:
-                    print(f"DEBUG veto: No log channel found")
-            else:
-                print(f"DEBUG veto: No result from query")
 
         if result:
             # Get emojis

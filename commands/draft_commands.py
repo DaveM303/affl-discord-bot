@@ -836,6 +836,49 @@ class DraftCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
+    @app_commands.command(name="draftpoints", description="View the points value for all draft pick numbers")
+    async def draft_points(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Get all draft point values
+            cursor = await db.execute(
+                """SELECT pick_number, points_value FROM draft_value_index
+                   WHERE points_value > 0
+                   ORDER BY pick_number ASC"""
+            )
+            all_picks = await cursor.fetchall()
+
+            if not all_picks:
+                await interaction.followup.send("❌ No draft point values found!", ephemeral=True)
+                return
+
+            # Format into multiple columns
+            embed = discord.Embed(
+                title="📊 Draft Pick Points Value",
+                description="AFL-style points system for draft picks",
+                color=discord.Color.blue()
+            )
+
+            # Split into 3 columns of ~30 picks each
+            picks_per_column = 30
+            columns = []
+
+            for i in range(0, len(all_picks), picks_per_column):
+                column_picks = all_picks[i:i + picks_per_column]
+                column_text = "\n".join([f"**#{pick}:** {points}" for pick, points in column_picks])
+                columns.append(column_text)
+
+            # Add columns to embed (max 3 inline fields per row)
+            for idx, column in enumerate(columns):
+                embed.add_field(
+                    name=f"Picks {all_picks[idx * picks_per_column][0]}-{min(all_picks[(idx + 1) * picks_per_column - 1][0] if (idx + 1) * picks_per_column <= len(all_picks) else all_picks[-1][0], all_picks[-1][0])}",
+                    value=column,
+                    inline=True
+                )
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
     @app_commands.command(name="startdraft", description="[ADMIN] Start a live draft")
     @app_commands.describe(draft_name="Name of the draft to start")
     @app_commands.autocomplete(draft_name=draft_name_autocomplete)
@@ -2070,8 +2113,6 @@ class FatherSonMatchView(discord.ui.View):
         total_match_value = sum(p[3] for p in self.matching_picks)
         excess_points = total_match_value - self.required_value
 
-        print(f"DEBUG create_embed: total_match_value={total_match_value}, required_value={self.required_value}, excess_points={excess_points}")
-
         # Show which picks are needed to match
         if self.matching_picks:
             picks_text = ""
@@ -2087,7 +2128,6 @@ class FatherSonMatchView(discord.ui.View):
 
             # Show compensation pick if there's excess points
             if excess_points > 0:
-                print(f"DEBUG: Excess points detected: {excess_points}")
                 # Find the compensation pick value
                 cursor = await db.execute(
                     """SELECT pick_number, points_value FROM draft_value_index
@@ -2097,11 +2137,9 @@ class FatherSonMatchView(discord.ui.View):
                     (excess_points,)
                 )
                 comp_result = await cursor.fetchone()
-                print(f"DEBUG: comp_result = {comp_result}")
 
                 if comp_result:
                     comp_pick_num, comp_pick_value = comp_result
-                    print(f"DEBUG: Adding compensation field - Pick {comp_pick_num}, {comp_pick_value} pts")
                     embed.add_field(
                         name="💰 Compensation Pick",
                         value=f"You will receive Pick {comp_pick_num} as compensation due to {excess_points} excess points.",
@@ -2181,8 +2219,6 @@ class FatherSonMatchView(discord.ui.View):
         total_match_value = sum(p[3] for p in self.matching_picks)
         excess_points = total_match_value - self.required_value
 
-        print(f"DEBUG process_match: total_match_value={total_match_value}, required_value={self.required_value}, excess_points={excess_points}")
-
         # Step 1: Delete the consumed matching picks (these are the F/S club's picks used to match)
         for pick_num, _, _, _ in self.matching_picks:
             await db.execute(
@@ -2226,7 +2262,6 @@ class FatherSonMatchView(discord.ui.View):
 
         # Step 4: Add compensation pick for excess points (if any)
         if excess_points > 0:
-            print(f"DEBUG: Processing compensation pick for {excess_points} excess points")
             # Find the pick number that has the highest value that doesn't exceed excess points
             cursor = await db.execute(
                 """SELECT pick_number, points_value FROM draft_value_index
@@ -2236,7 +2271,6 @@ class FatherSonMatchView(discord.ui.View):
                 (excess_points,)
             )
             result = await cursor.fetchone()
-            print(f"DEBUG: Compensation pick query result: {result}")
 
             if result:
                 comp_pick_equivalent = result[0]
@@ -2259,8 +2293,6 @@ class FatherSonMatchView(discord.ui.View):
                     cursor = await db.execute("SELECT COUNT(*) FROM teams WHERE team_name != 'Draft Pool'")
                     num_teams = (await cursor.fetchone())[0]
                     comp_round_number = ((comp_pick_equivalent - 1) // num_teams) + 1
-
-                print(f"DEBUG: Inserting compensation pick #{comp_pick_number} in round {comp_round_number}")
 
                 # Renumber all picks at or after this position to make room
                 cursor = await db.execute(
@@ -2286,9 +2318,6 @@ class FatherSonMatchView(discord.ui.View):
                     (self.draft_id, draft_name, season_number, comp_round_number, comp_pick_number,
                      f"{self.fs_team_name} F/S Comp", self.fs_team_id, self.fs_team_id, None)
                 )
-                print(f"DEBUG: Compensation pick inserted successfully at position {comp_pick_number}")
-            else:
-                print(f"DEBUG: No compensation pick found for {excess_points} points")
 
         # Step 5: Assign player to father/son club
         contract_expiry = season_number + rookie_years
