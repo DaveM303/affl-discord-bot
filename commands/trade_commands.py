@@ -1570,6 +1570,18 @@ class PendingTradesView(discord.ui.View):
 
             await db.commit()
 
+            # Log to bot logs channel
+            if result:
+                log_channel = await parent_cog.get_bot_logs_channel(db)
+                if log_channel:
+                    init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
+                    recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
+                    init_emoji_str = f"{init_emoji} " if init_emoji else ""
+                    recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
+
+                    log_message = f"Admin vetoed trade between {init_emoji_str}and {recv_emoji_str}(Trade ID: {trade_id}) - {interaction.user.mention}"
+                    await log_channel.send(log_message)
+
         if result:
             # Get emojis
             init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
