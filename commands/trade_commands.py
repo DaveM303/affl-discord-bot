@@ -2515,6 +2515,7 @@ class ModeratorApprovalView(discord.ui.View):
 
     @discord.ui.button(label="Veto", style=discord.ButtonStyle.red, custom_id="veto_trade")
     async def veto_trade(self, interaction: discord.Interaction, button: discord.ui.Button):
+        print(f"DEBUG veto: Button clicked! trade_id={self.trade_id}, user={interaction.user}")
         # Check if user is admin
         is_admin = False
         if interaction.guild.owner_id == interaction.user.id:
