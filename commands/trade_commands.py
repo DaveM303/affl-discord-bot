@@ -2530,6 +2530,9 @@ class ModeratorApprovalView(discord.ui.View):
             await interaction.response.send_message("❌ Only moderators can veto trades!", ephemeral=True)
             return
 
+        # Get parent_cog for helper methods
+        parent_cog = self.bot.get_cog('TradeCommands')
+
         # Update trade status
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
@@ -2596,8 +2599,8 @@ class ModeratorApprovalView(discord.ui.View):
             await db.commit()
 
             # Log to bot logs channel
-            if result and init_emoji_id and recv_emoji_id:
-                log_channel = await self.bot.get_cog('TradeCommands').get_bot_logs_channel(db)
+            if result:
+                log_channel = await parent_cog.get_bot_logs_channel(db)
                 if log_channel:
                     init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
                     recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
