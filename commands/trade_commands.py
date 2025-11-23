@@ -2599,8 +2599,10 @@ class ModeratorApprovalView(discord.ui.View):
             await db.commit()
 
             # Log to bot logs channel
+            print(f"DEBUG veto: result={result is not None}")
             if result:
                 log_channel = await parent_cog.get_bot_logs_channel(db)
+                print(f"DEBUG veto: log_channel={log_channel}")
                 if log_channel:
                     init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
                     recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
@@ -2608,7 +2610,13 @@ class ModeratorApprovalView(discord.ui.View):
                     recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
 
                     log_message = f"Admin vetoed trade between {init_emoji_str}and {recv_emoji_str}(Trade ID: {self.trade_id}) - {interaction.user.mention}"
+                    print(f"DEBUG veto: Sending log message: {log_message}")
                     await log_channel.send(log_message)
+                    print(f"DEBUG veto: Log message sent successfully")
+                else:
+                    print(f"DEBUG veto: No log channel found")
+            else:
+                print(f"DEBUG veto: No result from query")
 
         if result:
             # Get emojis
