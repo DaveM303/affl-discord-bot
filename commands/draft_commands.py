@@ -56,12 +56,12 @@ class DraftCommands(commands.Cog):
         interaction: discord.Interaction,
         current: str,
     ) -> list[app_commands.Choice[str]]:
-        """Autocomplete for draft names - only shows current drafts with ladder set"""
+        """Autocomplete for draft names - shows current and in-progress drafts"""
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
                     """SELECT draft_name FROM drafts
-                       WHERE status = 'current'
+                       WHERE status IN ('current', 'in_progress')
                        ORDER BY draft_id DESC"""
                 )
                 drafts = await cursor.fetchall()
