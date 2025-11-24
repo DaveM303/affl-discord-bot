@@ -2281,7 +2281,7 @@ class FreeAgencyCommands(commands.Cog):
                                 """INSERT INTO draft_picks (draft_id, draft_name, season_number, round_number, pick_number, pick_origin, original_team_id, current_team_id)
                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                                 (draft_id, draft_name, draft_season, round_num, new_pick_num,
-                                 f"Compensation Band {comp_band} (lost {player_name})", team_id, team_id)
+                                 f"Band {comp_band} Compensation", team_id, team_id)
                             )
                             pick_id = cursor.lastrowid
 

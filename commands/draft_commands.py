@@ -1050,6 +1050,29 @@ class DraftCommands(commands.Cog):
     async def send_pick_notification(self, db, draft_id, draft_name, pick_number):
         """Send draft pick notification to team's channel"""
         try:
+            # Check if there are any players left in the draft pool
+            cursor = await db.execute(
+                """SELECT COUNT(*) FROM players p
+                   JOIN teams t ON p.team_id = t.team_id
+                   WHERE t.team_name = 'Draft Pool'"""
+            )
+            players_in_pool = (await cursor.fetchone())[0]
+
+            if players_in_pool == 0:
+                # No players left - auto-end draft
+                cursor = await db.execute(
+                    "SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'"
+                )
+                result = await cursor.fetchone()
+                draft_channel_id = int(result[0]) if result and result[0] else None
+                draft_channel = self.bot.get_channel(draft_channel_id) if draft_channel_id else None
+
+                if draft_channel:
+                    await draft_channel.send("**No players left in draft pool**")
+
+                await self.complete_draft(db, draft_id, draft_name)
+                return
+
             # Get the pick info
             cursor = await db.execute(
                 """SELECT dp.current_team_id, dp.round_number, dp.pick_number, t.team_name, t.channel_id
@@ -1535,7 +1558,7 @@ class DraftOrderView(discord.ui.View):
 
             # Show if player selected
             if player_selected:
-                pick_desc += f"\n→ **{player_selected}**"
+                pick_desc += f" → **{player_selected}**"
 
             description += pick_desc + "\n"
 
@@ -1856,34 +1879,36 @@ class DraftPickView(discord.ui.View):
             bidding_team_name, bidding_emoji_id, fs_team_name, fs_emoji_id
         )
 
-        # Check if F/S club has enough points to match
-        total_match_value = sum(p[3] for p in matching_picks)
+        # Send match notification to father/son club (always, even if they can't match)
+        if fs_channel_id:
+            fs_channel = self.bot.get_channel(int(fs_channel_id))
+            if fs_channel:
+                # Calculate total match value to determine if they can match
+                total_match_value = sum(p[3] for p in matching_picks)
+                can_match = matching_picks and total_match_value >= required_value
 
-        if not matching_picks or total_match_value < required_value:
-            # Automatically pass - not enough points
-            await self.auto_pass_father_son_bid(
-                db, player_id, player_name, pos, age, ovr,
-                father_son_club_id, fs_team_name, fs_emoji_id,
-                bidding_team_name, bidding_emoji_id,
-                has_picks=(len(matching_picks) > 0)
-            )
-        else:
-            # Send match notification to father/son club
-            if fs_channel_id:
-                fs_channel = self.bot.get_channel(int(fs_channel_id))
-                if fs_channel:
-                    # Create match notification view
-                    match_view = FatherSonMatchView(
-                        self.bot, self.draft_id, self.draft_name, self.pick_number,
-                        player_id, player_name, pos, age, ovr,
-                        father_son_club_id, fs_team_name,
-                        self.team_id, bidding_team_name,
-                        bid_value, required_value, matching_picks
+                # Create match notification view
+                match_view = FatherSonMatchView(
+                    self.bot, self.draft_id, self.draft_name, self.pick_number,
+                    player_id, player_name, pos, age, ovr,
+                    father_son_club_id, fs_team_name,
+                    self.team_id, bidding_team_name,
+                    bid_value, required_value, matching_picks,
+                    can_match=can_match
+                )
+
+                # Create embed
+                embed = await match_view.create_embed(db)
+                await fs_channel.send(embed=embed, view=match_view)
+
+                # If they can't match, automatically pass after sending notification
+                if not can_match:
+                    await self.auto_pass_father_son_bid(
+                        db, player_id, player_name, pos, age, ovr,
+                        father_son_club_id, fs_team_name, fs_emoji_id,
+                        bidding_team_name, bidding_emoji_id,
+                        has_picks=(len(matching_picks) > 0)
                     )
-
-                    # Create embed
-                    embed = await match_view.create_embed(db)
-                    await fs_channel.send(embed=embed, view=match_view)
 
     async def calculate_matching_picks(self, db, team_id, required_value):
         """Calculate which picks are needed to match the bid (earliest picks, minimum value)"""
@@ -2124,7 +2149,7 @@ class FatherSonMatchView(discord.ui.View):
     """View for father/son club to match or pass on a bid"""
     def __init__(self, bot, draft_id, draft_name, bid_pick_number, player_id, player_name, pos, age, ovr,
                  fs_team_id, fs_team_name, bidding_team_id, bidding_team_name,
-                 bid_value, required_value, matching_picks):
+                 bid_value, required_value, matching_picks, can_match=True):
         super().__init__(timeout=None)  # No timeout for important decisions
         self.bot = bot
         self.draft_id = draft_id
@@ -2142,6 +2167,7 @@ class FatherSonMatchView(discord.ui.View):
         self.bid_value = bid_value
         self.required_value = required_value
         self.matching_picks = matching_picks
+        self.can_match = can_match
 
     async def create_embed(self, db):
         """Create the match notification embed"""
@@ -2151,37 +2177,43 @@ class FatherSonMatchView(discord.ui.View):
             color=discord.Color.orange()
         )
 
+        # Combine player, bid value, and required to match into one field to reduce gaps
+        info_text = f"Player: **{self.player_name}** ({self.pos}, {self.age} yo)\n"
+        info_text += f"Bid Value: **{self.bid_value} points** (Pick #{self.bid_pick_number})\n"
+        info_text += f"Required to Match: **{self.required_value} points** (20% discount)"
+
         embed.add_field(
             name="\u200b",
-            value=f"Player: **{self.player_name}** ({self.pos}, {self.age} yo)",
+            value=info_text,
             inline=False
         )
 
-        embed.add_field(
-            name="\u200b",
-            value=f"Bid Value: **{self.bid_value} points** (Pick #{self.bid_pick_number})",
-            inline=True
-        )
+        # Check if team can match the bid
+        if not self.can_match:
+            # Show insufficient points message instead of picks
+            embed.add_field(
+                name="\n\nPicks Needed to Match",
+                value="Insufficient points to match, player has been drafted by the bidding team",
+                inline=False
+            )
+            # Disable and grey out both buttons
+            for item in self.children:
+                if isinstance(item, discord.ui.Button):
+                    item.disabled = True
+                    item.style = discord.ButtonStyle.gray
+        else:
+            # Calculate total value of matching picks
+            total_match_value = sum(p[3] for p in self.matching_picks)
+            excess_points = total_match_value - self.required_value
 
-        embed.add_field(
-            name="\u200b",
-            value=f"Required to Match: **{self.required_value} points** (20% discount)",
-            inline=False
-        )
-
-        # Calculate total value of matching picks
-        total_match_value = sum(p[3] for p in self.matching_picks)
-        excess_points = total_match_value - self.required_value
-
-        # Show which picks are needed to match
-        if self.matching_picks:
+            # Show which picks are needed to match
             picks_text = ""
             for pick_num, round_num, origin, points in self.matching_picks:
                 picks_text += f"• Pick #{pick_num} (**{points} pts**)\n"
             picks_text += f"\n**Total: {total_match_value} points**"
 
             embed.add_field(
-                name="\nPicks Needed to Match",
+                name="\n\nPicks Needed to Match",
                 value=picks_text,
                 inline=False
             )
@@ -2201,27 +2233,10 @@ class FatherSonMatchView(discord.ui.View):
                 if comp_result:
                     comp_pick_num, comp_pick_value = comp_result
                     embed.add_field(
-                        name="Compensation Pick",
-                        value=f"\nYou will receive Pick {comp_pick_num} as compensation due to {excess_points} excess points.",
+                        name="\n\nCompensation Pick",
+                        value=f"You will receive Pick {comp_pick_num} as compensation due to {excess_points} excess points.",
                         inline=False
                     )
-
-            if total_match_value < self.required_value:
-                embed.add_field(
-                    name="⚠️ Insufficient Points",
-                    value=f"You don't have enough draft points to match this bid. The bidding team will automatically select {self.player_name}.",
-                    inline=False
-                )
-                # Disable the Match button
-                self.match_button.disabled = True
-        else:
-            embed.add_field(
-                name="⚠️ No Available Picks",
-                value=f"You have no picks remaining to match this bid. The bidding team will automatically select {self.player_name}.",
-                inline=False
-            )
-            # Disable the Match button
-            self.match_button.disabled = True
 
         return embed
 
