@@ -1677,7 +1677,7 @@ class DraftPickView(discord.ui.View):
 
         return embed
 
-    @discord.ui.select(placeholder="Select a player to draft...", min_values=0, max_values=1, custom_id="player_select")
+    @discord.ui.select(placeholder="Select a player to draft...", min_values=0, max_values=1, custom_id="player_select", row=0)
     async def player_select(self, interaction: discord.Interaction, select: discord.ui.Select):
         """Handle player selection"""
         if select.values:
@@ -1687,7 +1687,7 @@ class DraftPickView(discord.ui.View):
 
         await interaction.response.defer()
 
-    @discord.ui.button(label="Confirm Selection", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="Confirm Selection", style=discord.ButtonStyle.primary, row=2)
     async def confirm_pick(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Confirm the draft pick"""
         if not self.selected_player_id:
@@ -1721,7 +1721,7 @@ class DraftPickView(discord.ui.View):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
-    @discord.ui.button(label="Pass Pick", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Pass Pick", style=discord.ButtonStyle.secondary, row=2)
     async def pass_pick(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Pass on this pick"""
         await interaction.response.defer()
@@ -1738,7 +1738,7 @@ class DraftPickView(discord.ui.View):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
-    @discord.ui.button(label="◀ Previous Page", style=discord.ButtonStyle.gray, custom_id="draft_prev_page", row=0)
+    @discord.ui.button(label="◀ Previous Page", style=discord.ButtonStyle.gray, custom_id="draft_prev_page", row=1)
     async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Go to previous page"""
         if self.current_page > 0:
@@ -1749,7 +1749,7 @@ class DraftPickView(discord.ui.View):
         else:
             await interaction.response.defer()
 
-    @discord.ui.button(label="Next Page ▶", style=discord.ButtonStyle.gray, custom_id="draft_next_page", row=0)
+    @discord.ui.button(label="Next Page ▶", style=discord.ButtonStyle.gray, custom_id="draft_next_page", row=1)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Go to next page"""
         self.current_page += 1
@@ -2152,21 +2152,21 @@ class FatherSonMatchView(discord.ui.View):
         )
 
         embed.add_field(
-            name="Player",
-            value=f"**{self.player_name}** ({self.pos}, {self.age} yo)",
+            name="\u200b",
+            value=f"Player: **{self.player_name}** ({self.pos}, {self.age} yo)",
             inline=False
         )
 
         embed.add_field(
-            name="Bid Value",
-            value=f"{self.bid_value} points (Pick #{self.bid_pick_number})",
+            name="\u200b",
+            value=f"Bid Value: **{self.bid_value} points** (Pick #{self.bid_pick_number})",
             inline=True
         )
 
         embed.add_field(
-            name="Required to Match",
-            value=f"{self.required_value} points (20% discount)",
-            inline=True
+            name="\u200b",
+            value=f"Required to Match: **{self.required_value} points** (20% discount)",
+            inline=False
         )
 
         # Calculate total value of matching picks
@@ -2177,8 +2177,14 @@ class FatherSonMatchView(discord.ui.View):
         if self.matching_picks:
             picks_text = ""
             for pick_num, round_num, origin, points in self.matching_picks:
-                picks_text += f"• Pick #{pick_num} (R{round_num}, {points} pts)\n"
+                picks_text += f"• Pick #{pick_num} (**{points} pts**)\n"
             picks_text += f"\n**Total: {total_match_value} points**"
+
+            embed.add_field(
+                name="\u200b",
+                value="\u200b",
+                inline=False
+            )
 
             embed.add_field(
                 name="Picks Needed to Match",
@@ -2201,8 +2207,8 @@ class FatherSonMatchView(discord.ui.View):
                 if comp_result:
                     comp_pick_num, comp_pick_value = comp_result
                     embed.add_field(
-                        name="💰 Compensation Pick",
-                        value=f"You will receive Pick {comp_pick_num} as compensation due to {excess_points} excess points.",
+                        name="Compensation Pick",
+                        value=f"\nYou will receive Pick {comp_pick_num} as compensation due to {excess_points} excess points.",
                         inline=False
                     )
 
