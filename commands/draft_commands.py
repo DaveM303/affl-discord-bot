@@ -879,10 +879,18 @@ class DraftCommands(commands.Cog):
 
             await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="startdraft", description="[ADMIN] Start a live draft")
-    @app_commands.describe(draft_name="Name of the draft to start")
+    @app_commands.command(name="livedraft", description="[ADMIN] Manage live draft")
+    @app_commands.describe(
+        action="Action to perform",
+        draft_name="Name of the draft"
+    )
+    @app_commands.choices(action=[
+        app_commands.Choice(name="start", value="start"),
+        app_commands.Choice(name="end", value="end"),
+        app_commands.Choice(name="re-send current pick notification", value="resend")
+    ])
     @app_commands.autocomplete(draft_name=draft_name_autocomplete)
-    async def start_draft(self, interaction: discord.Interaction, draft_name: str):
+    async def live_draft(self, interaction: discord.Interaction, action: str, draft_name: str):
         await interaction.response.defer(ephemeral=True)
 
         # Check if user has admin role
@@ -894,7 +902,7 @@ class DraftCommands(commands.Cog):
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get draft info
                 cursor = await db.execute(
-                    "SELECT draft_id, status, rounds, season_number FROM drafts WHERE draft_name = ?",
+                    "SELECT draft_id, status, rounds, season_number, current_pick_number FROM drafts WHERE draft_name = ?",
                     (draft_name,)
                 )
                 draft_info = await cursor.fetchone()
@@ -903,89 +911,136 @@ class DraftCommands(commands.Cog):
                     await interaction.followup.send(f"❌ Draft '{draft_name}' not found!", ephemeral=True)
                     return
 
-                draft_id, status, rounds, season_number = draft_info
+                draft_id, status, rounds, season_number, current_pick_number = draft_info
 
-                # Check if draft is current (has ladder set)
-                if status != 'current':
+                if action == "start":
+                    # Check if draft is current (has ladder set)
+                    if status != 'current':
+                        await interaction.followup.send(
+                            f"❌ Draft '{draft_name}' is not ready to start (status: {status})!\n"
+                            f"Use `/setdraftladder` to set the draft order first.",
+                            ephemeral=True
+                        )
+                        return
+
+                    # Check if draft has already been started
+                    cursor = await db.execute(
+                        "SELECT started_at FROM drafts WHERE draft_id = ?",
+                        (draft_id,)
+                    )
+                    started_at = (await cursor.fetchone())[0]
+                    if started_at:
+                        await interaction.followup.send(
+                            f"❌ Draft '{draft_name}' has already been started!",
+                            ephemeral=True
+                        )
+                        return
+
+                    # Get draft channel from settings
+                    cursor = await db.execute(
+                        "SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'"
+                    )
+                    result = await cursor.fetchone()
+                    if not result or not result[0]:
+                        await interaction.followup.send(
+                            "❌ No draft channel configured! Use `/config` to set the draft channel.",
+                            ephemeral=True
+                        )
+                        return
+
+                    draft_channel_id = int(result[0])
+                    draft_channel = self.bot.get_channel(draft_channel_id)
+                    if not draft_channel:
+                        await interaction.followup.send(
+                            "❌ Draft channel not found! Please check the configuration.",
+                            ephemeral=True
+                        )
+                        return
+
+                    # Check if there are draft-eligible players (in Draft Pool team)
+                    cursor = await db.execute(
+                        """SELECT COUNT(*) FROM players p
+                           JOIN teams t ON p.team_id = t.team_id
+                           WHERE t.team_name = 'Draft Pool'"""
+                    )
+                    draft_pool_count = (await cursor.fetchone())[0]
+
+                    if draft_pool_count == 0:
+                        await interaction.followup.send(
+                            "❌ No players in the Draft Pool! Use `/updateplayer` to assign players to the 'Draft Pool' team.",
+                            ephemeral=True
+                        )
+                        return
+
+                    # Update draft status to 'in_progress' and set started_at
+                    await db.execute(
+                        """UPDATE drafts
+                           SET status = 'in_progress', started_at = CURRENT_TIMESTAMP, current_pick_number = 1
+                           WHERE draft_id = ?""",
+                        (draft_id,)
+                    )
+                    await db.commit()
+
+                    # Post draft start message to draft channel
+                    await draft_channel.send(f"# {draft_name}")
+
+                    # Send first pick notification
+                    await self.send_pick_notification(db, draft_id, draft_name, 1)
+
                     await interaction.followup.send(
-                        f"❌ Draft '{draft_name}' is not ready to start (status: {status})!\n"
-                        f"Use `/setdraftladder` to set the draft order first.",
+                        f"✅ **Draft Started!**\n\n"
+                        f"**Draft:** {draft_name}\n"
+                        f"**Rounds:** {rounds}\n"
+                        f"**Players Available:** {draft_pool_count}\n\n"
+                        f"Pick notifications have been sent to team channels.",
                         ephemeral=True
                     )
-                    return
 
-                # Check if draft has already been started
-                cursor = await db.execute(
-                    "SELECT started_at FROM drafts WHERE draft_id = ?",
-                    (draft_id,)
-                )
-                started_at = (await cursor.fetchone())[0]
-                if started_at:
+                elif action == "end":
+                    # Check if draft is in progress
+                    if status != 'in_progress':
+                        await interaction.followup.send(
+                            f"❌ Draft '{draft_name}' is not currently in progress (status: {status})!",
+                            ephemeral=True
+                        )
+                        return
+
+                    # End the draft
+                    await self.complete_draft(db, draft_id, draft_name)
+
                     await interaction.followup.send(
-                        f"❌ Draft '{draft_name}' has already been started!",
+                        f"✅ **Draft Ended!**\n\n"
+                        f"**Draft:** {draft_name}\n"
+                        f"The draft has been marked as completed.",
                         ephemeral=True
                     )
-                    return
 
-                # Get draft channel from settings
-                cursor = await db.execute(
-                    "SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'"
-                )
-                result = await cursor.fetchone()
-                if not result or not result[0]:
+                elif action == "resend":
+                    # Check if draft is in progress
+                    if status != 'in_progress':
+                        await interaction.followup.send(
+                            f"❌ Draft '{draft_name}' is not currently in progress (status: {status})!",
+                            ephemeral=True
+                        )
+                        return
+
+                    if not current_pick_number:
+                        await interaction.followup.send(
+                            f"❌ No current pick to re-send!",
+                            ephemeral=True
+                        )
+                        return
+
+                    # Re-send the current pick notification
+                    await self.send_pick_notification(db, draft_id, draft_name, current_pick_number)
+
                     await interaction.followup.send(
-                        "❌ No draft channel configured! Use `/config` to set the draft channel.",
+                        f"✅ **Pick Notification Re-sent!**\n\n"
+                        f"**Draft:** {draft_name}\n"
+                        f"**Current Pick:** {current_pick_number}\n\n"
+                        f"Notification has been re-sent to the draft channel and team channel.",
                         ephemeral=True
                     )
-                    return
-
-                draft_channel_id = int(result[0])
-                draft_channel = self.bot.get_channel(draft_channel_id)
-                if not draft_channel:
-                    await interaction.followup.send(
-                        "❌ Draft channel not found! Please check the configuration.",
-                        ephemeral=True
-                    )
-                    return
-
-                # Check if there are draft-eligible players (in Draft Pool team)
-                cursor = await db.execute(
-                    """SELECT COUNT(*) FROM players p
-                       JOIN teams t ON p.team_id = t.team_id
-                       WHERE t.team_name = 'Draft Pool'"""
-                )
-                draft_pool_count = (await cursor.fetchone())[0]
-
-                if draft_pool_count == 0:
-                    await interaction.followup.send(
-                        "❌ No players in the Draft Pool! Use `/updateplayer` to assign players to the 'Draft Pool' team.",
-                        ephemeral=True
-                    )
-                    return
-
-                # Update draft status to 'in_progress' and set started_at
-                await db.execute(
-                    """UPDATE drafts
-                       SET status = 'in_progress', started_at = CURRENT_TIMESTAMP, current_pick_number = 1
-                       WHERE draft_id = ?""",
-                    (draft_id,)
-                )
-                await db.commit()
-
-                # Post draft start message to draft channel
-                await draft_channel.send(f"# {draft_name}")
-
-                # Send first pick notification
-                await self.send_pick_notification(db, draft_id, draft_name, 1)
-
-                await interaction.followup.send(
-                    f"✅ **Draft Started!**\n\n"
-                    f"**Draft:** {draft_name}\n"
-                    f"**Rounds:** {rounds}\n"
-                    f"**Players Available:** {draft_pool_count}\n\n"
-                    f"Pick notifications have been sent to team channels.",
-                    ephemeral=True
-                )
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
@@ -1557,9 +1612,10 @@ class DraftPickView(discord.ui.View):
 
         # Get ALL available players from Draft Pool
         cursor = await db.execute(
-            """SELECT p.player_id, p.name, p.position, p.age
+            """SELECT p.player_id, p.name, p.position, p.age, p.father_son_club_id, t_fs.team_name
                FROM players p
                JOIN teams t ON p.team_id = t.team_id
+               LEFT JOIN teams t_fs ON p.father_son_club_id = t_fs.team_id
                WHERE t.team_name = 'Draft Pool'
                ORDER BY p.name"""
         )
@@ -1574,11 +1630,15 @@ class DraftPickView(discord.ui.View):
 
         # Populate dropdown with current page
         options = []
-        for player_id, name, pos, age in page_players:
+        for player_id, name, pos, age, fs_club_id, fs_club_name in page_players:
             # Don't show OVR for draft pool players, add "yo" after age
+            label = f"{name} ({pos}, {age} yo)"
+            if fs_club_id:
+                label += f" (F/S tied to {fs_club_name})"
+
             options.append(
                 discord.SelectOption(
-                    label=f"{name} ({pos}, {age} yo)",
+                    label=label,
                     value=str(player_id)
                 )
             )
@@ -1915,7 +1975,7 @@ class DraftPickView(discord.ui.View):
                 except:
                     pass
 
-            message = f"{bidding_emoji_str}bid on **{player_name.upper()}** - F/S tied to {fs_emoji_str}"
+            message = f"{bidding_emoji_str}Bid pending..."
             await draft_channel.send(message)
 
         except Exception as e:
