@@ -868,7 +868,7 @@ class AdminCommands(commands.Cog):
                 players_df['Father_Son_Club'] = players_df['Father_Son_Club'].fillna('')
 
                 # Create Add_Players sheet (for bulk adding new players)
-                add_players_df = pd.DataFrame(columns=['Name', 'Team', 'Age', 'Pos', 'OVR', 'Contract_Expiry'])
+                add_players_df = pd.DataFrame(columns=['Name', 'Team', 'Age', 'Pos', 'OVR', 'Contract_Expiry', 'Father_Son_Club'])
                 add_players_df = add_players_df.fillna('')
                 
                 # Export Lineups (merged Current, Starting, and Submitted into one sheet with Type column)
@@ -1551,11 +1551,17 @@ class AdminCommands(commands.Cog):
                                 team_name_lower = str(row['Team']).strip().lower()
                                 team_id = team_map.get(team_name_lower)
 
+                            # Get father/son club ID
+                            father_son_club_id = None
+                            if 'Father_Son_Club' in add_players_df.columns and pd.notna(row['Father_Son_Club']) and row['Father_Son_Club']:
+                                fs_team_name_lower = str(row['Father_Son_Club']).strip().lower()
+                                father_son_club_id = team_map.get(fs_team_name_lower)
+
                             # Add player (duplicate names now allowed since we use Player_ID)
                             await db.execute(
-                                """INSERT INTO players (name, position, overall_rating, age, birth_year, team_id, contract_expiry)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                                (name, normalized_pos, rating, age, birth_year, team_id, contract_expiry)
+                                """INSERT INTO players (name, position, overall_rating, age, birth_year, team_id, contract_expiry, father_son_club_id)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (name, normalized_pos, rating, age, birth_year, team_id, contract_expiry, father_son_club_id)
                             )
                             players_added += 1
                         except Exception as e:
