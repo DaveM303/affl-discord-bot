@@ -2181,13 +2181,7 @@ class FatherSonMatchView(discord.ui.View):
             picks_text += f"\n**Total: {total_match_value} points**"
 
             embed.add_field(
-                name="\u200b",
-                value="\u200b",
-                inline=False
-            )
-
-            embed.add_field(
-                name="Picks Needed to Match",
+                name="\nPicks Needed to Match",
                 value=picks_text,
                 inline=False
             )
