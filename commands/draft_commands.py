@@ -2648,12 +2648,8 @@ class DraftPointsCalculatorView(discord.ui.View):
 
     def create_embed(self):
         """Create the calculator embed"""
-        title = "Draft Points Calculator"
-        if self.draft_name:
-            title += f" - {self.draft_name}"
-
         embed = discord.Embed(
-            title=title,
+            title="Draft Points Calculator",
             description="Select draft picks from the dropdown to calculate the highest bid you can match.",
             color=discord.Color.blue()
         )
@@ -2682,12 +2678,6 @@ class DraftPointsCalculatorView(discord.ui.View):
                 inline=False
             )
 
-            embed.add_field(
-                name="Total Points",
-                value=f"**{total_points} points**",
-                inline=False
-            )
-
             # Calculate the highest bid that can be matched (with 20% discount)
             # They need 80% of the bid value, so: total_points = bid_value * 0.8
             # Therefore: bid_value = total_points / 0.8
@@ -2702,10 +2692,22 @@ class DraftPointsCalculatorView(discord.ui.View):
                 else:
                     break
 
+            embed.add_field(
+                name="Total Points",
+                value=f"**{total_points} points**",
+                inline=False
+            )
+
             if max_matchable_pick:
                 embed.add_field(
                     name="\n✅ Maximum Bid Match",
                     value=f"These picks are enough to match a bid as high as **Pick #{max_matchable_pick}**!",
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name="\n❌ No Match Available",
+                    value="These picks do not have enough value to match any bid.",
                     inline=False
                 )
         else:
@@ -2722,8 +2724,17 @@ class DraftPointsCalculatorView(discord.ui.View):
     @discord.ui.select(placeholder="Select picks to add to calculator...", min_values=0, max_values=25, row=0)
     async def pick_select(self, interaction: discord.Interaction, select: discord.ui.Select):
         """Handle pick selection"""
-        # Update selected picks based on dropdown values
-        self.selected_picks = [int(val.replace("pick_", "")) for val in select.values]
+        # Get picks from current page
+        start_idx = self.current_page * self.picks_per_page
+        end_idx = min(start_idx + self.picks_per_page, len(self.all_picks))
+        current_page_pick_ids = [p[0] for p in self.all_picks[start_idx:end_idx]]
+
+        # Remove picks from current page from selected list
+        self.selected_picks = [pid for pid in self.selected_picks if pid not in current_page_pick_ids]
+
+        # Add newly selected picks from current page
+        new_selections = [int(val.replace("pick_", "")) for val in select.values]
+        self.selected_picks.extend(new_selections)
 
         # Update the embed
         embed = self.create_embed()
@@ -2771,19 +2782,19 @@ class DraftPointsCalculatorView(discord.ui.View):
             # Format: "Pick #X - Z pts"
             label = f"Pick #{pick_number} - {points_value} pts"
 
-            # Only show team emoji in description if there's an active draft
-            description = None
-            if emoji_id or team_name:
-                emoji_str = self.get_emoji(emoji_id) if emoji_id else ""
-                description = f"{emoji_str}{team_name}".strip() if team_name else emoji_str.strip()
-                if not description:
-                    description = None
+            # Get emoji object for the SelectOption emoji parameter
+            pick_emoji = None
+            if emoji_id:
+                try:
+                    pick_emoji = self.guild.get_emoji(int(emoji_id))
+                except:
+                    pass
 
             options.append(
                 discord.SelectOption(
                     label=label,
-                    description=description,
                     value=f"pick_{pick_id}",
+                    emoji=pick_emoji,
                     default=(pick_id in self.selected_picks)
                 )
             )
