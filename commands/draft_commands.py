@@ -2126,14 +2126,6 @@ class DraftPickView(discord.ui.View):
                         except:
                             pass
 
-                    # Determine message based on whether they had any picks
-                    if has_picks:
-                        reason = f"{fs_emoji_str}unable to match"
-                    else:
-                        reason = f"{fs_emoji_str}unable to match"
-
-                    message = f"**Pick {self.pick_number}:** {bidding_emoji_str}select **{player_name.upper()}** ({pos}, {age} yo, {ovr} OVR) - {reason}"
-
                     # Get plays_like info
                     cursor = await db.execute(
                         "SELECT plays_like FROM players WHERE player_id = ?",
@@ -2142,12 +2134,15 @@ class DraftPickView(discord.ui.View):
                     plays_like_result = await cursor.fetchone()
                     plays_like = plays_like_result[0] if plays_like_result and plays_like_result[0] else None
 
-                    # Add plays like info
-                    if plays_like:
-                        message += f"\nPlays like *{plays_like}*"
+                    # Build main message line
+                    message = f"**Pick {self.pick_number}:** {bidding_emoji_str}select **{player_name.upper()}** ({pos}, {age} yo, {ovr} OVR)"
 
-                    # Add F/S info on new line
-                    message += f"\n└ F/S tied to {fs_emoji_str}{fs_team_name}"
+                    # Add plays like on main line
+                    if plays_like:
+                        message += f" - Plays like *{plays_like}*"
+
+                    # Add matching status on new line
+                    message += f"\n└ {fs_emoji_str}Unable to match"
 
                     await draft_channel.send(message)
         except Exception as e:
@@ -2220,28 +2215,9 @@ class DraftPickView(discord.ui.View):
 
                 message = f"**Pick {pick_num}:** {emoji_str}select **{player_name.upper()}** ({pos}, {age} yo, {ovr} OVR)"
 
-                # Add plays like info
+                # Add plays like info on main line
                 if plays_like:
-                    message += f"\nPlays like *{plays_like}*"
-
-                # Add father/son info if applicable
-                if father_son_club_id:
-                    cursor = await db.execute(
-                        "SELECT team_name, emoji_id FROM teams WHERE team_id = ?",
-                        (father_son_club_id,)
-                    )
-                    fs_result = await cursor.fetchone()
-                    if fs_result:
-                        fs_team_name, fs_emoji_id = fs_result
-                        fs_emoji_str = ""
-                        if fs_emoji_id:
-                            try:
-                                fs_emoji = self.bot.get_emoji(int(fs_emoji_id))
-                                if fs_emoji:
-                                    fs_emoji_str = f"{fs_emoji} "
-                            except:
-                                pass
-                        message += f"\n└ F/S tied to {fs_emoji_str}{fs_team_name}"
+                    message += f" - Plays like *{plays_like}*"
 
             await draft_channel.send(message)
 
@@ -2632,26 +2608,24 @@ class FatherSonMatchView(discord.ui.View):
             plays_like_result = await cursor.fetchone()
             plays_like = plays_like_result[0] if plays_like_result and plays_like_result[0] else None
 
+            # Build main message line
+            message = f"**Pick {self.bid_pick_number}:** {fs_emoji_str}select **{self.player_name.upper()}** ({self.pos}, {self.age} yo, {self.ovr} OVR)"
+
+            # Add plays like on main line
+            if plays_like:
+                message += f" - Plays like *{plays_like}*"
+
+            # Add matching status on new line
             if matched:
                 # Show picks consumed
-                picks_text = ", ".join([f"{p[0]}" for p in self.matching_picks])
-                # Join with commas and ampersand for last item
                 picks_list = [str(p[0]) for p in self.matching_picks]
                 if len(picks_list) > 1:
                     picks_text = ", ".join(picks_list[:-1]) + " & " + picks_list[-1]
                 else:
                     picks_text = picks_list[0] if picks_list else ""
-
-                message = f"**Pick {self.bid_pick_number}:** {fs_emoji_str}select **{self.player_name.upper()}** ({self.pos}, {self.age} yo, {self.ovr} OVR) - Bid matched using pick/s {picks_text}"
+                message += f"\n└ {fs_emoji_str}Matched using pick/s {picks_text}"
             else:
-                message = f"**Pick {self.bid_pick_number}:** {bidding_emoji_str}select **{self.player_name.upper()}** ({self.pos}, {self.age} yo, {self.ovr} OVR) - {fs_emoji_str}elected not to match"
-
-            # Add plays like info
-            if plays_like:
-                message += f"\nPlays like *{plays_like}*"
-
-            # Add F/S info on new line
-            message += f"\n└ F/S tied to {fs_emoji_str}{self.fs_team_name}"
+                message += f"\n└ {bidding_emoji_str}Elected not to match"
 
             await draft_channel.send(message)
 
