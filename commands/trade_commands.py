@@ -2486,8 +2486,17 @@ class TradeResponseView(discord.ui.View):
         self.trade_id = trade_id
         self.bot = bot
 
-    @discord.ui.button(label="Respond to Offer", style=discord.ButtonStyle.primary, custom_id="respond_trade")
+    @discord.ui.button(label="Respond to Offer", style=discord.ButtonStyle.primary)
     async def respond_trade(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Check if user is admin
+        is_admin = False
+        if interaction.guild.owner_id == interaction.user.id:
+            is_admin = True
+        elif ADMIN_ROLE_ID:
+            admin_role_id = int(ADMIN_ROLE_ID) if isinstance(ADMIN_ROLE_ID, str) else ADMIN_ROLE_ID
+            if any(role.id == admin_role_id for role in interaction.user.roles):
+                is_admin = True
+
         # Verify user has the team role and get team info
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
@@ -2507,17 +2516,37 @@ class TradeResponseView(discord.ui.View):
                 await interaction.response.send_message("❌ This trade is no longer active!", ephemeral=True)
                 return
 
-            # Get team name for the trade menu
+            # Get team name and role ID for validation
             cursor = await db.execute(
-                "SELECT team_name FROM teams WHERE team_id = ?",
+                "SELECT team_name, role_id FROM teams WHERE team_id = ?",
                 (receiving_team_id,)
             )
-            role_result = await cursor.fetchone()
+            team_result = await cursor.fetchone()
 
-        # Open trade menu to this specific offer (no team restriction - anyone can respond)
+            if not team_result:
+                await interaction.response.send_message("❌ Team not found!", ephemeral=True)
+                return
+
+            team_name, role_id = team_result
+
+        # Verify the user belongs to the receiving team (unless they're admin)
+        if not is_admin:
+            if role_id:
+                user_role_ids = [role.id for role in interaction.user.roles]
+                if int(role_id) not in user_role_ids:
+                    await interaction.response.send_message(
+                        "❌ You can only respond to trade offers sent to your team!",
+                        ephemeral=True
+                    )
+                    return
+            else:
+                await interaction.response.send_message("❌ Team role not configured!", ephemeral=True)
+                return
+
+        # Open trade menu to this specific offer
         # Get parent_cog from bot
         parent_cog = self.bot.get_cog('TradeCommands')
-        view = TradeMenuView(receiving_team_id, role_result[0], self.bot, interaction.guild, parent_cog, specific_trade_id=self.trade_id)
+        view = TradeMenuView(receiving_team_id, team_name, self.bot, interaction.guild, parent_cog, specific_trade_id=self.trade_id)
         embed = await view.create_incoming_page_embed()
         await view.add_incoming_page_buttons()
 
