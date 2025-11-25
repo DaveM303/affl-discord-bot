@@ -2680,16 +2680,19 @@ class DraftPointsCalculatorView(discord.ui.View):
 
             # Calculate the highest bid that can be matched (with 20% discount)
             # They need 80% of the bid value, so: total_points = bid_value * 0.8
-            # Therefore: bid_value = total_points / 0.8
+            # Therefore: max_bid_value = total_points / 0.8
             max_bid_value = int(total_points / 0.8)
 
-            # Find the pick number with the highest value that doesn't exceed max_bid_value
-            # Since all_picks is sorted by pick_number (ascending), find the last pick where points_value <= max_bid_value
+            # Find the pick number whose BID VALUE is closest to (but not exceeding) max_bid_value
             max_matchable_pick = None
+            closest_value = 0
             for _, pick_number, _, _, points_value in self.all_picks:
-                if points_value <= max_bid_value:
+                if points_value <= max_bid_value and points_value > closest_value:
                     max_matchable_pick = pick_number
-                    # Don't break - keep looking for higher picks until we exceed max_bid_value
+                    closest_value = points_value
+                elif points_value > max_bid_value:
+                    # Once we exceed max_bid_value, no need to continue
+                    break
 
             embed.add_field(
                 name="Total Points",
