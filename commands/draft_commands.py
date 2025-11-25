@@ -2684,13 +2684,12 @@ class DraftPointsCalculatorView(discord.ui.View):
             max_bid_value = int(total_points / 0.8)
 
             # Find the pick number with the highest value that doesn't exceed max_bid_value
-            # Since all_picks is sorted by pick_number (ascending), we can search through it
+            # Since all_picks is sorted by pick_number (ascending), find the last pick where points_value <= max_bid_value
             max_matchable_pick = None
             for _, pick_number, _, _, points_value in self.all_picks:
                 if points_value <= max_bid_value:
                     max_matchable_pick = pick_number
-                else:
-                    break
+                    # Don't break - keep looking for higher picks until we exceed max_bid_value
 
             embed.add_field(
                 name="Total Points",
@@ -2735,6 +2734,9 @@ class DraftPointsCalculatorView(discord.ui.View):
         # Add newly selected picks from current page
         new_selections = [int(val.replace("pick_", "")) for val in select.values]
         self.selected_picks.extend(new_selections)
+
+        # Update the dropdown to show correct selections
+        self.update_dropdown()
 
         # Update the embed
         embed = self.create_embed()
