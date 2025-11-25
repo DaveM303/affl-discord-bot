@@ -879,6 +879,70 @@ class DraftCommands(commands.Cog):
 
             await interaction.followup.send(embed=embed, ephemeral=True)
 
+    @app_commands.command(name="draftpointscalculator", description="Calculate the highest bid your draft picks can match")
+    async def draft_points_calculator(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Check if there's a current or in-progress draft
+            cursor = await db.execute(
+                """SELECT draft_id, draft_name FROM drafts
+                   WHERE status IN ('current', 'in_progress')
+                   ORDER BY draft_id DESC
+                   LIMIT 1"""
+            )
+            draft_result = await cursor.fetchone()
+
+            # Get all pick numbers with point values from draft_value_index
+            cursor = await db.execute(
+                """SELECT pick_number, points_value FROM draft_value_index
+                   WHERE points_value > 0
+                   ORDER BY pick_number ASC"""
+            )
+            index_picks = await cursor.fetchall()
+
+            if not index_picks:
+                await interaction.followup.send(
+                    "❌ No draft point values found in the draft value index!",
+                    ephemeral=True
+                )
+                return
+
+            # Convert to format expected by view: (pick_id, pick_number, emoji_id, team_name, points_value)
+            all_picks = []
+
+            if draft_result:
+                # If there's an active draft, get team info for each pick
+                draft_id, draft_name = draft_result
+                for pick_number, points_value in index_picks:
+                    # Try to get team emoji for this pick from the draft
+                    cursor = await db.execute(
+                        """SELECT t.emoji_id, t.team_name
+                           FROM draft_picks dp
+                           JOIN teams t ON dp.current_team_id = t.team_id
+                           WHERE dp.draft_id = ? AND dp.pick_number = ?""",
+                        (draft_id, pick_number)
+                    )
+                    team_result = await cursor.fetchone()
+
+                    if team_result:
+                        emoji_id, team_name = team_result
+                        all_picks.append((pick_number, pick_number, emoji_id, team_name, points_value))
+                    else:
+                        # Pick exists in index but not in draft yet
+                        all_picks.append((pick_number, pick_number, None, None, points_value))
+            else:
+                # No active draft - just use pick numbers
+                draft_name = None
+                for pick_number, points_value in index_picks:
+                    all_picks.append((pick_number, pick_number, None, None, points_value))
+
+        # Create the calculator view
+        view = DraftPointsCalculatorView(self.bot, draft_name, all_picks, interaction.guild)
+        view.update_dropdown()  # Initialize the dropdown with first page
+        embed = view.create_embed()
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
     @app_commands.command(name="livedraft", description="[ADMIN] Manage live draft")
     @app_commands.describe(
         action="Action to perform",
@@ -2558,6 +2622,186 @@ class FatherSonMatchView(discord.ui.View):
         # Send next pick notification
         draft_commands = self.bot.get_cog('DraftCommands')
         await draft_commands.send_pick_notification(db, self.draft_id, self.draft_name, next_pick)
+
+
+class DraftPointsCalculatorView(discord.ui.View):
+    """Interactive view for calculating draft points and matching bids"""
+    def __init__(self, bot, draft_name, all_picks, guild):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.draft_name = draft_name
+        self.all_picks = all_picks  # List of (pick_id, pick_number, emoji_id, team_name, points_value)
+        self.guild = guild
+        self.selected_picks = []  # List of pick_ids
+        self.current_page = 0
+        self.picks_per_page = 25
+
+    def get_emoji(self, emoji_id):
+        """Convert emoji_id to Discord emoji or return empty string"""
+        if not emoji_id:
+            return ""
+        try:
+            emoji = self.guild.get_emoji(int(emoji_id))
+            return str(emoji) + " " if emoji else ""
+        except:
+            return ""
+
+    def create_embed(self):
+        """Create the calculator embed"""
+        title = "Draft Points Calculator"
+        if self.draft_name:
+            title += f" - {self.draft_name}"
+
+        embed = discord.Embed(
+            title=title,
+            description="Select draft picks from the dropdown to calculate the highest bid you can match.",
+            color=discord.Color.blue()
+        )
+
+        # Calculate total points from selected picks
+        total_points = 0
+        if self.selected_picks:
+            for pick_id in self.selected_picks:
+                pick = next((p for p in self.all_picks if p[0] == pick_id), None)
+                if pick:
+                    total_points += pick[4]  # points_value
+
+        # Show selected picks
+        if self.selected_picks:
+            selected_text = ""
+            for pick_id in self.selected_picks:
+                pick = next((p for p in self.all_picks if p[0] == pick_id), None)
+                if pick:
+                    _, pick_number, emoji_id, _, points_value = pick
+                    emoji_str = self.get_emoji(emoji_id) if emoji_id else ""
+                    selected_text += f"{emoji_str}Pick #{pick_number} - **{points_value} pts**\n"
+
+            embed.add_field(
+                name="Selected Picks",
+                value=selected_text,
+                inline=False
+            )
+
+            embed.add_field(
+                name="Total Points",
+                value=f"**{total_points} points**",
+                inline=False
+            )
+
+            # Calculate the highest bid that can be matched (with 20% discount)
+            # They need 80% of the bid value, so: total_points = bid_value * 0.8
+            # Therefore: bid_value = total_points / 0.8
+            max_bid_value = int(total_points / 0.8)
+
+            # Find the pick number with the highest value that doesn't exceed max_bid_value
+            # Since all_picks is sorted by pick_number (ascending), we can search through it
+            max_matchable_pick = None
+            for _, pick_number, _, _, points_value in self.all_picks:
+                if points_value <= max_bid_value:
+                    max_matchable_pick = pick_number
+                else:
+                    break
+
+            if max_matchable_pick:
+                embed.add_field(
+                    name="\n✅ Maximum Bid Match",
+                    value=f"These picks are enough to match a bid as high as **Pick #{max_matchable_pick}**!",
+                    inline=False
+                )
+        else:
+            embed.add_field(
+                name="No Picks Selected",
+                value="Use the dropdown below to select picks and calculate match potential.",
+                inline=False
+            )
+
+        embed.set_footer(text="Remember the 20% matching discount - only 80% of the bid value needs to be met for a successful match!")
+
+        return embed
+
+    @discord.ui.select(placeholder="Select picks to add to calculator...", min_values=0, max_values=25, row=0)
+    async def pick_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        """Handle pick selection"""
+        # Update selected picks based on dropdown values
+        self.selected_picks = [int(val.replace("pick_", "")) for val in select.values]
+
+        # Update the embed
+        embed = self.create_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.gray, row=1)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go to previous page"""
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_dropdown()
+            embed = self.create_embed()
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            await interaction.response.defer()
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.gray, row=1)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go to next page"""
+        total_pages = (len(self.all_picks) + self.picks_per_page - 1) // self.picks_per_page
+        if self.current_page < total_pages - 1:
+            self.current_page += 1
+            self.update_dropdown()
+            embed = self.create_embed()
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            await interaction.response.defer()
+
+    @discord.ui.button(label="Clear Selection", style=discord.ButtonStyle.danger, row=1)
+    async def clear_selection(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Clear all selected picks"""
+        self.selected_picks = []
+        self.update_dropdown()
+        embed = self.create_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    def update_dropdown(self):
+        """Update the dropdown options based on current page"""
+        start_idx = self.current_page * self.picks_per_page
+        end_idx = min(start_idx + self.picks_per_page, len(self.all_picks))
+        page_picks = self.all_picks[start_idx:end_idx]
+
+        options = []
+        for pick_id, pick_number, emoji_id, team_name, points_value in page_picks:
+            # Format: "Pick #X - Z pts"
+            label = f"Pick #{pick_number} - {points_value} pts"
+
+            # Only show team emoji in description if there's an active draft
+            description = None
+            if emoji_id or team_name:
+                emoji_str = self.get_emoji(emoji_id) if emoji_id else ""
+                description = f"{emoji_str}{team_name}".strip() if team_name else emoji_str.strip()
+                if not description:
+                    description = None
+
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    description=description,
+                    value=f"pick_{pick_id}",
+                    default=(pick_id in self.selected_picks)
+                )
+            )
+
+        # Update the select menu
+        for item in self.children:
+            if isinstance(item, discord.ui.Select):
+                item.options = options
+                break
+
+        # Update button states
+        total_pages = (len(self.all_picks) + self.picks_per_page - 1) // self.picks_per_page
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                if "Previous" in item.label:
+                    item.disabled = (self.current_page == 0)
+                elif "Next" in item.label:
+                    item.disabled = (self.current_page >= total_pages - 1)
 
 
 async def setup(bot):
