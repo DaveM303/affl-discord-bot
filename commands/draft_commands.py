@@ -2808,9 +2808,9 @@ class DraftPointsCalculatorView(discord.ui.View):
         total_pages = (len(self.all_picks) + self.picks_per_page - 1) // self.picks_per_page
         for item in self.children:
             if isinstance(item, discord.ui.Button):
-                if "Previous" in item.label:
+                if "◀ Previous" in item.label:
                     item.disabled = (self.current_page == 0)
-                elif "Next" in item.label:
+                elif "Next ▶" in item.label:
                     item.disabled = (self.current_page >= total_pages - 1)
 
 
