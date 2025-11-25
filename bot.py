@@ -353,6 +353,15 @@ async def init_db():
             )
             print("Created 'Draft Pool' team")
 
+        # Add plays_like column to players table if it doesn't exist
+        cursor = await db.execute("PRAGMA table_info(players)")
+        columns = await cursor.fetchall()
+        column_names = [column[1] for column in columns]
+
+        if 'plays_like' not in column_names:
+            await db.execute("ALTER TABLE players ADD COLUMN plays_like TEXT")
+            print("Added 'plays_like' column to players table")
+
         await db.commit()
         print("Database initialized successfully!")
 

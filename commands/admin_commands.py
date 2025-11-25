@@ -854,21 +854,22 @@ class AdminCommands(commands.Cog):
                 cursor = await db.execute(
                     """SELECT p.player_id as Player_ID, p.name as Name, t.team_name as Team,
                               p.age as Age, p.birth_year as Birth_Year, p.position as Pos, p.overall_rating as OVR,
-                              p.contract_expiry as Contract_Expiry, fs.team_name as Father_Son_Club
+                              p.contract_expiry as Contract_Expiry, p.plays_like as Plays_Like, fs.team_name as Father_Son_Club
                        FROM players p
                        LEFT JOIN teams t ON p.team_id = t.team_id
                        LEFT JOIN teams fs ON p.father_son_club_id = fs.team_id
                        ORDER BY p.name"""
                 )
                 players = await cursor.fetchall()
-                players_df = pd.DataFrame(players, columns=['Player_ID', 'Name', 'Team', 'Age', 'Birth_Year', 'Pos', 'OVR', 'Contract_Expiry', 'Father_Son_Club'])
+                players_df = pd.DataFrame(players, columns=['Player_ID', 'Name', 'Team', 'Age', 'Birth_Year', 'Pos', 'OVR', 'Contract_Expiry', 'Plays_Like', 'Father_Son_Club'])
                 players_df['Team'] = players_df['Team'].fillna('')
                 players_df['Birth_Year'] = players_df['Birth_Year'].fillna('')
                 players_df['Contract_Expiry'] = players_df['Contract_Expiry'].fillna('')
+                players_df['Plays_Like'] = players_df['Plays_Like'].fillna('')
                 players_df['Father_Son_Club'] = players_df['Father_Son_Club'].fillna('')
 
                 # Create Add_Players sheet (for bulk adding new players)
-                add_players_df = pd.DataFrame(columns=['Name', 'Team', 'Age', 'Pos', 'OVR', 'Contract_Expiry', 'Father_Son_Club'])
+                add_players_df = pd.DataFrame(columns=['Name', 'Team', 'Age', 'Pos', 'OVR', 'Contract_Expiry', 'Plays_Like', 'Father_Son_Club'])
                 add_players_df = add_players_df.fillna('')
                 
                 # Export Lineups (merged Current, Starting, and Submitted into one sheet with Type column)
@@ -1451,6 +1452,11 @@ class AdminCommands(commands.Cog):
                                 fs_team_name_lower = str(row['Father_Son_Club']).strip().lower()
                                 father_son_club_id = team_map.get(fs_team_name_lower)
 
+                            # Get plays_like value
+                            plays_like = None
+                            if 'Plays_Like' in players_df.columns and pd.notna(row['Plays_Like']) and row['Plays_Like']:
+                                plays_like = str(row['Plays_Like']).strip()
+
                             # Check if player exists (by ID first, then by name)
                             existing = None
                             if player_id:
@@ -1466,9 +1472,9 @@ class AdminCommands(commands.Cog):
                                 excel_player_ids.add(existing[0])  # Track this player ID
                                 await db.execute(
                                     """UPDATE players
-                                       SET name = ?, position = ?, overall_rating = ?, age = ?, birth_year = ?, team_id = ?, contract_expiry = ?, father_son_club_id = ?
+                                       SET name = ?, position = ?, overall_rating = ?, age = ?, birth_year = ?, team_id = ?, contract_expiry = ?, father_son_club_id = ?, plays_like = ?
                                        WHERE player_id = ?""",
-                                    (name, normalized_pos, rating, age, birth_year, team_id, contract_expiry, father_son_club_id, existing[0])
+                                    (name, normalized_pos, rating, age, birth_year, team_id, contract_expiry, father_son_club_id, plays_like, existing[0])
                                 )
                                 players_updated += 1
                             else:
@@ -1557,11 +1563,16 @@ class AdminCommands(commands.Cog):
                                 fs_team_name_lower = str(row['Father_Son_Club']).strip().lower()
                                 father_son_club_id = team_map.get(fs_team_name_lower)
 
+                            # Get plays_like value
+                            plays_like = None
+                            if 'Plays_Like' in add_players_df.columns and pd.notna(row['Plays_Like']) and row['Plays_Like']:
+                                plays_like = str(row['Plays_Like']).strip()
+
                             # Add player (duplicate names now allowed since we use Player_ID)
                             await db.execute(
-                                """INSERT INTO players (name, position, overall_rating, age, birth_year, team_id, contract_expiry, father_son_club_id)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                                (name, normalized_pos, rating, age, birth_year, team_id, contract_expiry, father_son_club_id)
+                                """INSERT INTO players (name, position, overall_rating, age, birth_year, team_id, contract_expiry, father_son_club_id, plays_like)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (name, normalized_pos, rating, age, birth_year, team_id, contract_expiry, father_son_club_id, plays_like)
                             )
                             players_added += 1
                         except Exception as e:
