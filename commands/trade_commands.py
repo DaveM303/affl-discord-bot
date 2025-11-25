@@ -166,13 +166,17 @@ class TradeCommands(commands.Cog):
 
         return None, None
 
-    @app_commands.command(name="tradeperiod", description="[ADMIN] Start or end the trade period")
-    @app_commands.describe(action="Start or end the trade period")
+    @app_commands.command(name="tradeperiod", description="[ADMIN] Start or end the trade period, or resend a trade notification")
+    @app_commands.describe(
+        action="Action to perform",
+        trade_id="Trade ID (required for resend action)"
+    )
     @app_commands.choices(action=[
         app_commands.Choice(name="Start", value="start"),
         app_commands.Choice(name="End", value="end"),
+        app_commands.Choice(name="Resend notification", value="resend"),
     ])
-    async def trade_period(self, interaction: discord.Interaction, action: str):
+    async def trade_period(self, interaction: discord.Interaction, action: str, trade_id: int = None):
         if not await self.is_admin(interaction):
             await interaction.response.send_message(
                 "❌ You need admin permissions to use this command.",
@@ -188,31 +192,193 @@ class TradeCommands(commands.Cog):
                 )
                 await db.commit()
                 await interaction.response.send_message("✅ **Trade period has been opened!** Coaches can now submit trade offers.")
-            else:
+
+            elif action == "end":
                 await db.execute(
                     "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
                     ("trade_period_active", "0")
                 )
+
+                # Mark all active trade offers as expired
+                await db.execute(
+                    "UPDATE trades SET status = 'expired' WHERE status = 'pending'"
+                )
+
                 await db.commit()
-                await interaction.response.send_message("✅ **Trade period has been closed!** Coaches can no longer submit trade offers.")
+                await interaction.response.send_message("✅ **Trade period has been closed!** Coaches can no longer submit trade offers. All pending trade offers have been marked as expired.")
+
+            elif action == "resend":
+                # Validate trade_id parameter
+                if trade_id is None:
+                    await interaction.response.send_message("❌ Trade ID is required for resend action!", ephemeral=True)
+                    return
+
+                # Get trade info
+                cursor = await db.execute(
+                    """SELECT t.status, t.initiating_team_id, t.receiving_team_id,
+                              t.initiating_players, t.receiving_players, t.initiating_picks, t.receiving_picks,
+                              it.team_name as init_team_name, it.emoji_id as init_emoji_id,
+                              rt.team_name as recv_team_name, rt.emoji_id as recv_emoji_id, rt.channel_id as recv_channel_id
+                       FROM trades t
+                       JOIN teams it ON t.initiating_team_id = it.team_id
+                       JOIN teams rt ON t.receiving_team_id = rt.team_id
+                       WHERE t.trade_id = ?""",
+                    (trade_id,)
+                )
+                trade_data = await cursor.fetchone()
+
+                if not trade_data:
+                    await interaction.response.send_message(f"❌ Trade ID {trade_id} not found!", ephemeral=True)
+                    return
+
+                (status, init_team_id, recv_team_id, init_players_json, recv_players_json,
+                 init_picks_json, recv_picks_json, init_team_name, init_emoji_id,
+                 recv_team_name, recv_emoji_id, recv_channel_id) = trade_data
+
+                # Check if trade is active (pending)
+                if status != "pending":
+                    await interaction.response.send_message(
+                        f"❌ Trade ID {trade_id} is not active (status: {status})! Only pending trades can be resent.",
+                        ephemeral=True
+                    )
+                    return
+
+                await interaction.response.defer(ephemeral=True)
+
+                # Get current season for pick formatting
+                cursor = await db.execute("SELECT MAX(season_number) FROM seasons")
+                current_season_result = await cursor.fetchone()
+                current_season = current_season_result[0] if current_season_result and current_season_result[0] else 1
+
+                # Parse trade items
+                init_players = json.loads(init_players_json) if init_players_json else []
+                recv_players = json.loads(recv_players_json) if recv_players_json else []
+                init_picks = json.loads(init_picks_json) if init_picks_json else []
+                recv_picks = json.loads(recv_picks_json) if recv_picks_json else []
+
+                # Build trade notification embed
+                if recv_channel_id:
+                    channel = self.bot.get_channel(int(recv_channel_id))
+                    if channel:
+                        # Get emojis
+                        init_emoji = self.bot.get_emoji(int(init_emoji_id)) if init_emoji_id else None
+                        recv_emoji = self.bot.get_emoji(int(recv_emoji_id)) if recv_emoji_id else None
+                        init_emoji_str = f"{init_emoji} " if init_emoji else ""
+                        recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
+
+                        embed = discord.Embed(
+                            title=f"{init_emoji_str}**{init_team_name}** have sent you a trade offer!",
+                            color=discord.Color.gold()
+                        )
+
+                        # Build what each team receives
+                        offering_items = []
+                        receiving_items = []
+
+                        # Add initiating picks
+                        if init_picks:
+                            for pick_id in init_picks:
+                                cursor = await db.execute(
+                                    """SELECT pick_id, draft_name, pick_number, pick_origin, season_number, round_number,
+                                              t.emoji_id
+                                       FROM draft_picks dp
+                                       LEFT JOIN teams t ON dp.original_team_id = t.team_id
+                                       WHERE dp.pick_id = ?""",
+                                    (pick_id,)
+                                )
+                                pick = await cursor.fetchone()
+                                if pick:
+                                    _, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id = pick
+                                    pick_display = self.format_pick_display(
+                                        pick_number, season_number, round_number, emoji_id, current_season
+                                    )
+                                    offering_items.append(f"**{pick_display}**")
+
+                        # Add initiating players
+                        if init_players:
+                            for player_id in init_players:
+                                cursor = await db.execute(
+                                    "SELECT player_id, name, position, overall_rating, age FROM players WHERE player_id = ?",
+                                    (player_id,)
+                                )
+                                player = await cursor.fetchone()
+                                if player:
+                                    _, name, pos, ovr, age = player
+                                    offering_items.append(f"**{name}** ({pos}, {age}, {ovr})")
+
+                        # Add receiving picks
+                        if recv_picks:
+                            for pick_id in recv_picks:
+                                cursor = await db.execute(
+                                    """SELECT pick_id, draft_name, pick_number, pick_origin, season_number, round_number,
+                                              t.emoji_id
+                                       FROM draft_picks dp
+                                       LEFT JOIN teams t ON dp.original_team_id = t.team_id
+                                       WHERE dp.pick_id = ?""",
+                                    (pick_id,)
+                                )
+                                pick = await cursor.fetchone()
+                                if pick:
+                                    _, draft_name, pick_number, pick_origin, season_number, round_number, emoji_id = pick
+                                    pick_display = self.format_pick_display(
+                                        pick_number, season_number, round_number, emoji_id, current_season
+                                    )
+                                    receiving_items.append(f"**{pick_display}**")
+
+                        # Add receiving players
+                        if recv_players:
+                            for player_id in recv_players:
+                                cursor = await db.execute(
+                                    "SELECT player_id, name, position, overall_rating, age FROM players WHERE player_id = ?",
+                                    (player_id,)
+                                )
+                                player = await cursor.fetchone()
+                                if player:
+                                    _, name, pos, ovr, age = player
+                                    receiving_items.append(f"**{name}** ({pos}, {age}, {ovr})")
+
+                        embed.add_field(
+                            name=f"**{recv_emoji_str}receive:**",
+                            value="\n".join(offering_items) if offering_items else "*Nothing*",
+                            inline=True
+                        )
+
+                        embed.add_field(
+                            name=f"**{init_emoji_str}receive:**",
+                            value="\n".join(receiving_items) if receiving_items else "*Nothing*",
+                            inline=True
+                        )
+
+                        embed.set_footer(text=f"Trade ID: {trade_id} • Use /trademenu if the button stops working")
+
+                        # Add response buttons
+                        view = TradeResponseView(trade_id, self.bot)
+
+                        # Send trade notification
+                        await channel.send(embed=embed, view=view)
+                        await interaction.followup.send(f"✅ Trade notification for Trade ID {trade_id} has been resent to {recv_emoji_str}**{recv_team_name}**!", ephemeral=True)
+                    else:
+                        await interaction.followup.send(f"❌ Could not find channel for {recv_team_name}!", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"❌ No channel configured for {recv_team_name}!", ephemeral=True)
 
     async def team_autocomplete(
         self,
         interaction: discord.Interaction,
         current: str,
     ) -> list[app_commands.Choice[str]]:
-        """Autocomplete for team names (exclude user's own team)"""
+        """Autocomplete for team names (exclude user's own team and Draft Pool)"""
         # Get user's team
         user_team_id, _ = await self.get_user_team(interaction.user.id, interaction.guild)
 
         async with aiosqlite.connect(DB_PATH) as db:
             if user_team_id:
                 cursor = await db.execute(
-                    "SELECT team_name FROM teams WHERE team_id != ? ORDER BY team_name",
+                    "SELECT team_name FROM teams WHERE team_id != ? AND team_name != 'Draft Pool' ORDER BY team_name",
                     (user_team_id,)
                 )
             else:
-                cursor = await db.execute("SELECT team_name FROM teams ORDER BY team_name")
+                cursor = await db.execute("SELECT team_name FROM teams WHERE team_name != 'Draft Pool' ORDER BY team_name")
             teams = await cursor.fetchall()
 
         # Filter teams based on what the user has typed
@@ -2056,7 +2222,7 @@ class TradeOfferView(discord.ui.View):
                     inline=True
                 )
 
-                embed.set_footer(text=f"Trade ID: {trade_id}")
+                embed.set_footer(text=f"Trade ID: {trade_id} • Use /trademenu if the button stops working")
 
                 # Add response buttons
                 view = TradeResponseView(trade_id, self.bot)
