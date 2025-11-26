@@ -6,7 +6,7 @@ import json
 from config import DB_PATH
 from commands.season_commands import get_round_name
 
-# AFL lineup structure with 22 positions + 1 sub
+# AFL lineup structure with 18 positions + 5 interchange
 AFL_POSITIONS = [
     # Back 6
     "LBP", "FB", "RBP",
@@ -18,10 +18,8 @@ AFL_POSITIONS = [
     "LFP", "FF", "RFP",
     # Followers 3
     "R", "RR", "RO",
-    # Interchange (4)
-    "INT1", "INT2", "INT3", "INT4",
-    # Sub (1)
-    "SUB"
+    # Interchange (5)
+    "INT1", "INT2", "INT3", "INT4", "INT5"
 ]
 
 class LineupCommands(commands.Cog):
@@ -301,14 +299,14 @@ class LineupCommands(commands.Cog):
                 int_players.append("*Empty*")
         
         field_text += f"**Int:**  {', '.join(int_players)}\n"
-        
-        # Sub
-        if "SUB" in lineup_dict:
-            name, pos, rating = lineup_dict["SUB"]
-            field_text += f"**Sub:**  {name} ({rating})"
+
+        # INT5
+        if "INT5" in lineup_dict:
+            name, pos, rating = lineup_dict["INT5"]
+            field_text += f"**Int5:**  {name} ({rating})"
         else:
-            field_text += f"**Sub:**  *Empty*"
-        
+            field_text += f"**Int5:**  *Empty*"
+
         embed.description = field_text
         embed.set_footer(text=f"{len(lineup)}/23 players selected")
 
@@ -896,12 +894,12 @@ class TeamLineupMenu(discord.ui.View):
                 int_players.append("*Empty*")
         field_text += f"**Int:**  {', '.join(int_players)}\n"
 
-        # Sub
-        if "SUB" in lineup_dict:
-            p = lineup_dict["SUB"]
-            field_text += f"**Sub:**  {p[0]} ({p[2]})"
+        # INT5
+        if "INT5" in lineup_dict:
+            p = lineup_dict["INT5"]
+            field_text += f"**Int5:**  {p[0]} ({p[2]})"
         else:
-            field_text += f"**Sub:**  *Empty*"
+            field_text += f"**Int5:**  *Empty*"
 
         embed.description = field_text
 
@@ -1144,16 +1142,16 @@ class TeamLineupMenu(discord.ui.View):
                 int_players.append("*Empty*")
         field_text += f"**Int:**  {', '.join(int_players)}\n"
 
-        # Sub
-        if "SUB" in lineup_data:
-            player_id = int(lineup_data["SUB"])
+        # INT5
+        if "INT5" in lineup_data:
+            player_id = int(lineup_data["INT5"])
             if player_id in player_lookup:
                 name, pos, rating = player_lookup[player_id]
-                field_text += f"**Sub:**  {name} ({rating})"
+                field_text += f"**Int5:**  {name} ({rating})"
             else:
-                field_text += f"**Sub:**  *Unknown*"
+                field_text += f"**Int5:**  *Unknown*"
         else:
-            field_text += f"**Sub:**  *Empty*"
+            field_text += f"**Int5:**  *Empty*"
 
         embed.description = field_text
         embed.set_footer(text=f"{len(lineup_data)}/23 positions filled")
@@ -1209,12 +1207,12 @@ class TeamLineupMenu(discord.ui.View):
                 int_players.append("*Empty*")
         field_text += f"**Int:**  {', '.join(int_players)}\n"
 
-        # Sub
-        if "SUB" in self.lineup:
-            p = self.lineup["SUB"]
-            field_text += f"**Sub:**  {p['name']} ({p['rating']})"
+        # INT5
+        if "INT5" in self.lineup:
+            p = self.lineup["INT5"]
+            field_text += f"**Int5:**  {p['name']} ({p['rating']})"
         else:
-            field_text += f"**Sub:**  *Empty*"
+            field_text += f"**Int5:**  *Empty*"
 
         embed.description = field_text
 
@@ -1323,7 +1321,7 @@ class LineupView(discord.ui.View):
             (["LBP", "FB", "RBP", "LHB", "CHB", "RHB"]),
             (["LW", "C", "RW", "R", "RR", "RO"]),
             (["LHF", "CHF", "RHF", "LFP", "FF", "RFP"]),
-            (["INT1", "INT2", "INT3", "INT4", "SUB"])
+            (["INT1", "INT2", "INT3", "INT4", "INT5"])
         ]
         
         positions = groups[self.current_group]
@@ -1557,13 +1555,13 @@ class LineupView(discord.ui.View):
         
         field_text += f"**Int:**  {', '.join(int_players)}\n"
         
-        # Show sub
-        prefix = "→ " if "SUB" == self.selected_position else ""
-        if "SUB" in self.lineup:
-            p = self.lineup["SUB"]
-            field_text += f"**Sub:**  {prefix}{p['name']} ({p['rating']})"
+        # Show INT5
+        prefix = "→ " if "INT5" == self.selected_position else ""
+        if "INT5" in self.lineup:
+            p = self.lineup["INT5"]
+            field_text += f"**Int5:**  {prefix}{p['name']} ({p['rating']})"
         else:
-            field_text += f"**Sub:**  {prefix}*Empty*"
+            field_text += f"**Int5:**  {prefix}*Empty*"
         
         embed.add_field(name="\u200b", value=field_text, inline=False)
 

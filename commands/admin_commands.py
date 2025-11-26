@@ -1298,7 +1298,7 @@ class AdminCommands(commands.Cog):
                         '--- VALID POSITIONS ---',
                         '',
                         'Player Positions: MID, KEY FWD, RUCK, GEN DEF, etc.',
-                        'Lineup Positions: FB, CHB, LW, C, RW, CHF, FF, R, RR, RO, INT1-4, SUB',
+                        'Lineup Positions: FB, CHB, LW, C, RW, CHF, FF, R, RR, RO, INT1-5',
                     ]
                 })
                 instructions.to_excel(writer, sheet_name='README', index=False)
@@ -1594,7 +1594,7 @@ class AdminCommands(commands.Cog):
                         "LBP", "FB", "RBP", "LHB", "CHB", "RHB",
                         "LW", "C", "RW", "LHF", "CHF", "RHF",
                         "LFP", "FF", "RFP", "R", "RR", "RO",
-                        "INT1", "INT2", "INT3", "INT4", "SUB"
+                        "INT1", "INT2", "INT3", "INT4", "INT5"
                     ]
 
                     # Group starting lineups by team
