@@ -289,23 +289,16 @@ class LineupCommands(commands.Cog):
         # Add spacing before interchange
         field_text += "\n"
         
-        # Interchange - all on one line
+        # Interchange - all 5 on one line
         int_players = []
-        for pos_name in ["INT1", "INT2", "INT3", "INT4"]:
+        for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]:
             if pos_name in lineup_dict:
                 name, pos, rating = lineup_dict[pos_name]
                 int_players.append(f"{name} ({rating})")
             else:
                 int_players.append("*Empty*")
-        
-        field_text += f"**Int:**  {', '.join(int_players)}\n"
 
-        # INT5
-        if "INT5" in lineup_dict:
-            name, pos, rating = lineup_dict["INT5"]
-            field_text += f"**Int5:**  {name} ({rating})"
-        else:
-            field_text += f"**Int5:**  *Empty*"
+        field_text += f"**Int:**  {', '.join(int_players)}"
 
         embed.description = field_text
         embed.set_footer(text=f"{len(lineup)}/23 players selected")
@@ -884,22 +877,15 @@ class TeamLineupMenu(discord.ui.View):
 
         field_text += "\n"
 
-        # Interchange
+        # Interchange - all 5 on one line
         int_players = []
-        for pos_name in ["INT1", "INT2", "INT3", "INT4"]:
+        for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]:
             if pos_name in lineup_dict:
                 p = lineup_dict[pos_name]
                 int_players.append(f"{p[0]} ({p[2]})")
             else:
                 int_players.append("*Empty*")
-        field_text += f"**Int:**  {', '.join(int_players)}\n"
-
-        # INT5
-        if "INT5" in lineup_dict:
-            p = lineup_dict["INT5"]
-            field_text += f"**Int5:**  {p[0]} ({p[2]})"
-        else:
-            field_text += f"**Int5:**  *Empty*"
+        field_text += f"**Int:**  {', '.join(int_players)}"
 
         embed.description = field_text
 
@@ -1129,8 +1115,9 @@ class TeamLineupMenu(discord.ui.View):
         field_text += "\n"
 
         # Interchange
+        # Interchange - all 5 on one line
         int_players = []
-        for pos_name in ["INT1", "INT2", "INT3", "INT4"]:
+        for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]:
             if pos_name in lineup_data:
                 player_id = int(lineup_data[pos_name])
                 if player_id in player_lookup:
@@ -1140,18 +1127,7 @@ class TeamLineupMenu(discord.ui.View):
                     int_players.append("*Unknown*")
             else:
                 int_players.append("*Empty*")
-        field_text += f"**Int:**  {', '.join(int_players)}\n"
-
-        # INT5
-        if "INT5" in lineup_data:
-            player_id = int(lineup_data["INT5"])
-            if player_id in player_lookup:
-                name, pos, rating = player_lookup[player_id]
-                field_text += f"**Int5:**  {name} ({rating})"
-            else:
-                field_text += f"**Int5:**  *Unknown*"
-        else:
-            field_text += f"**Int5:**  *Empty*"
+        field_text += f"**Int:**  {', '.join(int_players)}"
 
         embed.description = field_text
         embed.set_footer(text=f"{len(lineup_data)}/23 positions filled")
@@ -1197,22 +1173,15 @@ class TeamLineupMenu(discord.ui.View):
 
         field_text += "\n"
 
-        # Interchange
+        # Interchange - all 5 on one line
         int_players = []
-        for pos_name in ["INT1", "INT2", "INT3", "INT4"]:
+        for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]:
             if pos_name in self.lineup:
                 p = self.lineup[pos_name]
                 int_players.append(f"{p['name']} ({p['rating']})")
             else:
                 int_players.append("*Empty*")
-        field_text += f"**Int:**  {', '.join(int_players)}\n"
-
-        # INT5
-        if "INT5" in self.lineup:
-            p = self.lineup["INT5"]
-            field_text += f"**Int5:**  {p['name']} ({p['rating']})"
-        else:
-            field_text += f"**Int5:**  *Empty*"
+        field_text += f"**Int:**  {', '.join(int_players)}"
 
         embed.description = field_text
 
@@ -1543,25 +1512,17 @@ class LineupView(discord.ui.View):
         # Add spacing before interchange
         field_text += "\n"
         
-        # Show interchange - all on one line
+        # Show interchange - all 5 on one line
         int_players = []
-        for pos_name in ["INT1", "INT2", "INT3", "INT4"]:
+        for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]:
             prefix = "→ " if pos_name == self.selected_position else ""
             if pos_name in self.lineup:
                 p = self.lineup[pos_name]
                 int_players.append(f"{prefix}{p['name']} ({p['rating']})")
             else:
                 int_players.append(f"{prefix}*Empty*")
-        
-        field_text += f"**Int:**  {', '.join(int_players)}\n"
-        
-        # Show INT5
-        prefix = "→ " if "INT5" == self.selected_position else ""
-        if "INT5" in self.lineup:
-            p = self.lineup["INT5"]
-            field_text += f"**Int5:**  {prefix}{p['name']} ({p['rating']})"
-        else:
-            field_text += f"**Int5:**  {prefix}*Empty*"
+
+        field_text += f"**Int:**  {', '.join(int_players)}"
         
         embed.add_field(name="\u200b", value=field_text, inline=False)
 
