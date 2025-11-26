@@ -1202,10 +1202,10 @@ class ConfirmSaveStartingLineupView(discord.ui.View):
 
     @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.success)
     async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Disable all buttons
+        # Disable all buttons and respond to interaction
         for item in self.children:
             item.disabled = True
-        await interaction.message.edit(view=self)
+        await interaction.response.edit_message(view=self)
 
         # Call the parent's do_save method
         await self.parent_menu.do_save_starting_lineup(interaction)
