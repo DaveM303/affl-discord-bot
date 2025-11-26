@@ -929,7 +929,7 @@ class TeamLineupMenu(discord.ui.View):
 
     async def do_save_starting_lineup(self, interaction: discord.Interaction):
         """Actually save the starting lineup after confirmation"""
-        await interaction.response.defer(ephemeral=True)
+        # Note: interaction was already responded to by the confirm button
 
         async with aiosqlite.connect(DB_PATH) as db:
             # Get current lineup from database
