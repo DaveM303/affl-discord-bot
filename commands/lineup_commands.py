@@ -197,6 +197,9 @@ class LineupCommands(commands.Cog):
 
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
+        # Store message reference so the view can edit it later
+        view.message = await interaction.original_response()
+
     @app_commands.command(name="viewlineup", description="View your team's current lineup")
     @app_commands.autocomplete(team_name=team_autocomplete)
     async def view_lineup(self, interaction: discord.Interaction, team_name: str = None):
@@ -1807,6 +1810,9 @@ class MainMenuButton(discord.ui.Button):
         embed = await menu_view.create_menu_embed()
 
         await interaction.response.edit_message(embed=embed, view=menu_view)
+
+        # Store message reference so the view can edit it later
+        menu_view.message = await interaction.original_response()
 
 
 async def setup(bot):
