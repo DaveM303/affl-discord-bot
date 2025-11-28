@@ -956,16 +956,16 @@ class TeamLineupMenu(discord.ui.View):
             )
             await db.commit()
 
-        await interaction.followup.send("✅ Starting lineup saved!", ephemeral=True)
-
         # Update button state
         self.has_starting_lineup = True
         self.clear_items()
         self.add_buttons()
 
-        # Refresh the menu
+        # Refresh the original lineup menu message (not the confirmation message)
         embed = await self.create_menu_embed()
-        await interaction.edit_original_response(embed=embed, view=self)
+        await self.message.edit(embed=embed, view=self)
+
+        await interaction.followup.send("✅ Starting lineup saved!", ephemeral=True)
 
     async def revert_starting_lineup_callback(self, interaction: discord.Interaction):
         """Revert to saved starting lineup"""
