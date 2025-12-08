@@ -2,7 +2,13 @@ import os
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
-load_dotenv()
+# Check if .env.test exists (for local testing), otherwise use .env (for production/Railway)
+if os.path.exists('.env.test'):
+    load_dotenv('.env.test')
+    print("Loading test configuration from .env.test")
+else:
+    load_dotenv()
+    print("Loading production configuration from .env")
 
 # Bot Configuration
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")

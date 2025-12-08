@@ -2561,6 +2561,28 @@ class AdminCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
+    @app_commands.command(name="exportdb", description="Export database file (Admin only)")
+    async def export_db(self, interaction: discord.Interaction):
+        """Export the database file for download"""
+        # Check if user has admin role
+        if ADMIN_ROLE_ID and ADMIN_ROLE_ID not in [role.id for role in interaction.user.roles]:
+            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            # Create a discord.File from the database
+            db_file = discord.File(DB_PATH, filename="affl_bot.db")
+
+            await interaction.followup.send(
+                "📦 Here's your database file:",
+                file=db_file,
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error exporting database: {e}", ephemeral=True)
+
 
 async def setup(bot):
     await bot.add_cog(AdminCommands(bot))
