@@ -136,7 +136,7 @@ class PlayerCommands(commands.Cog):
     ) -> list[app_commands.Choice[str]]:
         """Autocomplete for team names"""
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT team_name FROM teams ORDER BY team_name")
+            cursor = await db.execute("SELECT team_name FROM teams WHERE team_name != 'Draft Pool' ORDER BY team_name")
             teams = await cursor.fetchall()
 
         # Filter teams based on what the user has typed
@@ -253,10 +253,12 @@ class PlayerCommands(commands.Cog):
             else:
                 order_clause = "overall_rating DESC, age ASC"
 
-            # Get roster
+            # Get roster (exclude Draft Pool players)
             cursor = await db.execute(
                 f"""SELECT name, position, overall_rating, age
-                   FROM players WHERE team_id = ?
+                   FROM players
+                   WHERE team_id = ?
+                   AND team_id != (SELECT team_id FROM teams WHERE team_name = 'Draft Pool')
                    ORDER BY {order_clause}""",
                 (team_id,)
             )
@@ -310,10 +312,10 @@ class PlayerCommands(commands.Cog):
                         embed.description = description
 
                 # Add roster size to footer
-                embed.set_footer(text=f"{len(players)} players")
+                embed.set_footer(text=f"{len(players)}/44 players")
             else:
                 embed.description = "No players on this team"
-                embed.set_footer(text="0 players")
+                embed.set_footer(text="0/44 players")
 
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -360,11 +362,12 @@ class PlayerCommands(commands.Cog):
         limit: int = 100
     ):
         async with aiosqlite.connect(DB_PATH) as db:
-            # Build the query dynamically based on filters
+            # Build the query dynamically based on filters (exclude Draft Pool players)
             query = """SELECT p.name, p.position, p.overall_rating, p.age, t.team_name, t.emoji_id
                        FROM players p
                        LEFT JOIN teams t ON p.team_id = t.team_id
-                       WHERE 1=1"""
+                       WHERE 1=1
+                       AND (t.team_name IS NULL OR t.team_name != 'Draft Pool')"""
             params = []
             
             if min_rating is not None:

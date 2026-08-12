@@ -39,6 +39,38 @@ class SuspensionCommands(commands.Cog):
         # Return up to 25 choices (Discord limit)
         return choices[:25]
 
+    async def suspended_player_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete for currently suspended players only"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating, t.team_name
+                   FROM players p
+                   LEFT JOIN teams t ON p.team_id = t.team_id
+                   INNER JOIN suspensions s ON p.player_id = s.player_id
+                   WHERE s.status = 'suspended'
+                   ORDER BY p.name"""
+            )
+            players = await cursor.fetchall()
+
+        # Filter players based on what the user has typed
+        choices = []
+        for player_id, name, position, age, rating, team_name in players:
+            # Check if current input matches player name
+            if current.lower() in name.lower():
+                # Format: Team Name (POS, age yo, OVR)
+                team_prefix = team_name if team_name else "Delisted"
+                display_name = f"{name} ({team_prefix}, {position}, {age}yo, {rating} OVR)"
+
+                # Value is player_id so we can query by ID later
+                choices.append(app_commands.Choice(name=display_name, value=str(player_id)))
+
+        # Return up to 25 choices (Discord limit)
+        return choices[:25]
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Check if user has admin permissions for admin commands"""
         # Admin check for all commands
@@ -224,7 +256,7 @@ class SuspensionCommands(commands.Cog):
         new_suspension_reason="New suspension reason (optional)",
         new_games_missed="New games missed (optional)"
     )
-    @app_commands.autocomplete(player_name=player_name_autocomplete)
+    @app_commands.autocomplete(player_name=suspended_player_autocomplete)
     async def edit_suspension(
         self,
         interaction: discord.Interaction,
@@ -262,7 +294,7 @@ class SuspensionCommands(commands.Cog):
 
             # Find active suspension
             cursor = await db.execute(
-                """SELECT suspension_id, suspension_reason, suspension_round, games_missed
+                """SELECT suspension_id, suspension_reason, suspension_round, games_missed, return_round
                    FROM suspensions
                    WHERE player_id = ? AND status = 'suspended'""",
                 (player_id,)
@@ -276,7 +308,17 @@ class SuspensionCommands(commands.Cog):
                 )
                 return
 
-            suspension_id, old_suspension_reason, suspension_round, old_games_missed = suspension
+            suspension_id, old_suspension_reason, suspension_round, old_games_missed, old_return_round = suspension
+
+            # Get current round
+            cursor = await db.execute(
+                "SELECT current_round FROM seasons WHERE status = 'active' LIMIT 1"
+            )
+            season_info = await cursor.fetchone()
+            current_round = season_info[0] if season_info else 0
+
+            # Calculate current games remaining
+            old_games_remaining = old_return_round - current_round
 
             # Update fields
             updates = []
@@ -289,10 +331,13 @@ class SuspensionCommands(commands.Cog):
                 changes.append(f"Reason: {old_suspension_reason} → {new_suspension_reason}")
 
             if new_games_missed:
-                new_return_round = suspension_round + new_games_missed
+                # Calculate return round from current round, not suspension round
+                new_return_round = current_round + new_games_missed
                 updates.append("games_missed = ?, return_round = ?")
                 values.extend([new_games_missed, new_return_round])
-                changes.append(f"Games missed: {old_games_missed} → {new_games_missed} games")
+                old_game_text = "game" if old_games_remaining == 1 else "games"
+                new_game_text = "game" if new_games_missed == 1 else "games"
+                changes.append(f"Games remaining: {old_games_remaining} {old_game_text} → {new_games_missed} {new_game_text}")
 
             if not updates:
                 await interaction.response.send_message(
@@ -315,7 +360,7 @@ class SuspensionCommands(commands.Cog):
 
     @app_commands.command(name="removesuspension", description="[ADMIN] Remove a player's suspension")
     @app_commands.describe(player_name="Player name")
-    @app_commands.autocomplete(player_name=player_name_autocomplete)
+    @app_commands.autocomplete(player_name=suspended_player_autocomplete)
     async def remove_suspension(self, interaction: discord.Interaction, player_name: str):
         async with aiosqlite.connect(DB_PATH) as db:
             # Get player by ID (player_name is actually player_id from autocomplete)

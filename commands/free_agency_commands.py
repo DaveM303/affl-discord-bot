@@ -815,36 +815,39 @@ class FreeAgencyCommands(commands.Cog):
 
                 await db.commit()
 
-                # Log to bot logs channel
-                log_channel = await self.get_bot_logs_channel(db)
-                if log_channel:
-                    # Get bidding team info
-                    cursor = await db.execute("SELECT team_name, emoji_id FROM teams WHERE team_id = ?", (user_team_id,))
-                    bidding_team_data = await cursor.fetchone()
-                    bidding_team_name = bidding_team_data[0] if bidding_team_data else "Unknown Team"
-                    bidding_emoji_id = bidding_team_data[1] if bidding_team_data and bidding_team_data[1] else None
+                # Log to bot logs channel (best-effort - must not mask the successful bid above)
+                try:
+                    log_channel = await self.get_bot_logs_channel(db)
+                    if log_channel:
+                        # Get bidding team info
+                        cursor = await db.execute("SELECT team_name, emoji_id FROM teams WHERE team_id = ?", (user_team_id,))
+                        bidding_team_data = await cursor.fetchone()
+                        bidding_team_name = bidding_team_data[0] if bidding_team_data else "Unknown Team"
+                        bidding_emoji_id = bidding_team_data[1] if bidding_team_data and bidding_team_data[1] else None
 
-                    bidding_emoji_str = ""
-                    if bidding_emoji_id:
-                        try:
-                            emoji = self.bot.get_emoji(int(bidding_emoji_id))
-                            if emoji:
-                                bidding_emoji_str = f"{emoji} "
-                        except:
-                            pass
+                        bidding_emoji_str = ""
+                        if bidding_emoji_id:
+                            try:
+                                emoji = self.bot.get_emoji(int(bidding_emoji_id))
+                                if emoji:
+                                    bidding_emoji_str = f"{emoji} "
+                            except:
+                                pass
 
-                    # Get player's original team emoji
-                    original_emoji_str = ""
-                    if emoji_id:
-                        try:
-                            emoji = self.bot.get_emoji(int(emoji_id))
-                            if emoji:
-                                original_emoji_str = f"{emoji} "
-                        except:
-                            pass
+                        # Get player's original team emoji
+                        original_emoji_str = ""
+                        if emoji_id:
+                            try:
+                                emoji = self.bot.get_emoji(int(emoji_id))
+                                if emoji:
+                                    original_emoji_str = f"{emoji} "
+                            except:
+                                pass
 
-                    action_text = "updated their bid on" if existing_bid else "placed a bid on"
-                    await log_channel.send(f"💰 {bidding_emoji_str}**{bidding_team_name}** {action_text} {original_emoji_str}**{player_name}**: {amount}pts ({interaction.user.mention})")
+                        action_text = "updated their bid on" if existing_bid else "placed a bid on"
+                        await log_channel.send(f"💰 {bidding_emoji_str}**{bidding_team_name}** {action_text} {original_emoji_str}**{player_name}**: {amount}pts ({interaction.user.mention})")
+                except Exception as e:
+                    print(f"Failed to log bid to bot logs channel: {e}")
 
                 # Get emoji
                 emoji_str = ""
@@ -881,10 +884,12 @@ class FreeAgencyCommands(commands.Cog):
                 )
                 embed.set_footer(text="View all bids: /auctionsmenu")
 
-                await interaction.followup.send(embed=embed)
-
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
+            return
+
+        # Sent outside the try block so a failure here can't be mistaken for the bid itself failing
+        await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="auctionsmenu", description="View your bids and remaining auction points")
     async def auctions_menu(self, interaction: discord.Interaction):
@@ -2669,7 +2674,7 @@ class MatchingNotificationView(discord.ui.View):
                 # Get winning bids on this team's players
                 cursor = await db.execute(
                     """SELECT r.player_id, p.name, p.position, p.age, p.overall_rating,
-                              r.winning_team_id, t.team_name, t.emoji_id, r.winning_bid
+                              r.winning_team_id, t.team_name, t.emoji_id, r.winning_bid, r.matched, r.confirmed_at
                        FROM free_agency_results r
                        JOIN players p ON r.player_id = p.player_id
                        JOIN teams t ON r.winning_team_id = t.team_id
@@ -2685,22 +2690,78 @@ class MatchingNotificationView(discord.ui.View):
                     )
                     return
 
-                # Calculate remaining points
-                cursor = await db.execute(
-                    """SELECT COALESCE(SUM(b.bid_amount), 0)
-                       FROM free_agency_bids b
-                       JOIN players p ON b.player_id = p.player_id
-                       WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
-                       AND p.team_id != ?""",
-                    (self.period_id, self.team_id, self.team_id)
-                )
-                winning_bid_total = (await cursor.fetchone())[0]
-                remaining_points = 300 - winning_bid_total
+                # Check if team has already confirmed matches
+                has_confirmed = player_bids[0][10] is not None  # confirmed_at from first row
 
-                # Create matching view
-                matching_view = MatchingView(self.bot, self.period_id, self.team_id, team_name, player_bids, current_season, remaining_points)
-                embed = await matching_view.create_embed()
-                await interaction.response.send_message(embed=embed, view=matching_view, ephemeral=True)
+                if has_confirmed:
+                    # Show confirmed embed instead of matching interface
+                    matches = {player_id: bool(matched) for player_id, _, _, _, _, _, _, _, _, matched, _ in player_bids}
+
+                    # Calculate remaining points
+                    cursor = await db.execute(
+                        """SELECT COALESCE(SUM(b.bid_amount), 0)
+                           FROM free_agency_bids b
+                           JOIN players p ON b.player_id = p.player_id
+                           WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
+                           AND p.team_id != ?""",
+                        (self.period_id, self.team_id, self.team_id)
+                    )
+                    winning_bid_total = (await cursor.fetchone())[0]
+                    remaining_points = 300 - winning_bid_total
+
+                    # Create matching view and set it to confirmed state
+                    # Remove the extra fields from player_bids tuples (matched and confirmed_at)
+                    cleaned_player_bids = [(pid, name, pos, age, ovr, wtid, tname, emoji, bid)
+                                          for pid, name, pos, age, ovr, wtid, tname, emoji, bid, _, _ in player_bids]
+                    matching_view = MatchingView(self.bot, self.period_id, self.team_id, team_name, cleaned_player_bids, current_season, remaining_points)
+                    matching_view.matches = matches
+                    matching_view.confirmed = True
+                    matching_view.update_buttons()
+
+                    # Calculate total cost
+                    total_cost = sum(bid for player_id, _, _, _, _, _, _, _, bid, matched, _ in player_bids if matches.get(player_id, False))
+
+                    # Create confirmed embed
+                    embed = discord.Embed(
+                        title=f"✅ Matches Confirmed - {team_name}",
+                        description="Your matching decisions have been recorded.",
+                        color=discord.Color.green()
+                    )
+
+                    matched_count = sum(1 for m in matches.values() if m)
+                    let_go_count = len(matches) - matched_count
+
+                    embed.add_field(
+                        name="Summary",
+                        value=f"**Matched:** {matched_count} player{'s' if matched_count != 1 else ''} ({total_cost} pts)\n"
+                              f"**Let Go:** {let_go_count} player{'s' if let_go_count != 1 else ''}",
+                        inline=False
+                    )
+                    embed.set_footer(text="Click 'Edit Matches' to make changes • Waiting for admin to end matching period...")
+
+                    await interaction.response.send_message(embed=embed, view=matching_view, ephemeral=True)
+                else:
+                    # Show normal matching interface
+                    # Calculate remaining points
+                    cursor = await db.execute(
+                        """SELECT COALESCE(SUM(b.bid_amount), 0)
+                           FROM free_agency_bids b
+                           JOIN players p ON b.player_id = p.player_id
+                           WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
+                           AND p.team_id != ?""",
+                        (self.period_id, self.team_id, self.team_id)
+                    )
+                    winning_bid_total = (await cursor.fetchone())[0]
+                    remaining_points = 300 - winning_bid_total
+
+                    # Remove the extra fields from player_bids tuples (matched and confirmed_at)
+                    cleaned_player_bids = [(pid, name, pos, age, ovr, wtid, tname, emoji, bid)
+                                          for pid, name, pos, age, ovr, wtid, tname, emoji, bid, _, _ in player_bids]
+
+                    # Create matching view
+                    matching_view = MatchingView(self.bot, self.period_id, self.team_id, team_name, cleaned_player_bids, current_season, remaining_points)
+                    embed = await matching_view.create_embed()
+                    await interaction.response.send_message(embed=embed, view=matching_view, ephemeral=True)
 
         except Exception as e:
             await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
@@ -2784,6 +2845,18 @@ class MatchingView(discord.ui.View):
     def update_buttons(self):
         """Update all buttons based on current state"""
         self.clear_items()
+
+        # If confirmed, only show "Edit Matches" button
+        if self.confirmed:
+            edit_button = discord.ui.Button(
+                label="Edit Matches",
+                style=discord.ButtonStyle.secondary,
+                custom_id="edit_matches",
+                row=0
+            )
+            edit_button.callback = self.edit_matches_callback
+            self.add_item(edit_button)
+            return
 
         # Add dropdown to select players to match (limit to 25)
         if self.player_bids:
@@ -2994,45 +3067,38 @@ class MatchingView(discord.ui.View):
                     )
                 await db.commit()
 
-                # Log to bot logs channel
-                log_channel = await self.bot.get_cog('FreeAgencyCommands').get_bot_logs_channel(db)
-                if log_channel:
-                    # Get team info
-                    cursor = await db.execute("SELECT team_name, emoji_id FROM teams WHERE team_id = ?", (self.team_id,))
-                    team_data = await cursor.fetchone()
-                    team_name = team_data[0] if team_data else "Unknown Team"
-                    emoji_id = team_data[1] if team_data and team_data[1] else None
+                # Log to bot logs channel (best-effort - must not mask the successful confirmation above)
+                try:
+                    log_channel = await self.bot.get_cog('FreeAgencyCommands').get_bot_logs_channel(db)
+                    if log_channel:
+                        # Get team info
+                        cursor = await db.execute("SELECT team_name, emoji_id FROM teams WHERE team_id = ?", (self.team_id,))
+                        team_data = await cursor.fetchone()
+                        team_name = team_data[0] if team_data else "Unknown Team"
+                        emoji_id = team_data[1] if team_data and team_data[1] else None
 
-                    emoji_str = ""
-                    if emoji_id:
-                        try:
-                            emoji = self.bot.get_emoji(int(emoji_id))
-                            if emoji:
-                                emoji_str = f"{emoji} "
-                        except:
-                            pass
+                        emoji_str = ""
+                        if emoji_id:
+                            try:
+                                emoji = self.bot.get_emoji(int(emoji_id))
+                                if emoji:
+                                    emoji_str = f"{emoji} "
+                            except:
+                                pass
 
-                    matched_count = sum(1 for m in self.matches.values() if m)
-                    let_go_count = len(self.matches) - matched_count
+                        matched_count = sum(1 for m in self.matches.values() if m)
+                        let_go_count = len(self.matches) - matched_count
 
-                    await log_channel.send(
-                        f"✅ {emoji_str}**{team_name}** confirmed matches: "
-                        f"{matched_count} matched ({total_cost}pts), {let_go_count} let go ({interaction.user.mention})"
-                    )
+                        await log_channel.send(
+                            f"✅ {emoji_str}**{team_name}** confirmed matches: "
+                            f"{matched_count} matched ({total_cost}pts), {let_go_count} let go ({interaction.user.mention})"
+                        )
+                except Exception as e:
+                    print(f"Failed to log match confirmation to bot logs channel: {e}")
 
-            # Mark as confirmed
+            # Mark as confirmed and update buttons
             self.confirmed = True
-
-            # Replace buttons with just "Edit Matches" button
-            self.clear_items()
-            edit_button = discord.ui.Button(
-                label="Edit Matches",
-                style=discord.ButtonStyle.secondary,
-                custom_id="edit_matches",
-                row=0
-            )
-            edit_button.callback = self.edit_matches_callback
-            self.add_item(edit_button)
+            self.update_buttons()
 
             embed = discord.Embed(
                 title=f"✅ Matches Confirmed - {self.team_name}",
@@ -3051,10 +3117,13 @@ class MatchingView(discord.ui.View):
             )
             embed.set_footer(text="Click 'Edit Matches' to make changes • Waiting for admin to end matching period...")
 
-            await interaction.response.edit_message(embed=embed, view=self)
-
         except Exception as e:
             await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+            return
+
+        # Sent outside the try block: the match confirmation already succeeded above,
+        # so a failure here must not be reported as the confirmation itself failing.
+        await interaction.response.edit_message(embed=embed, view=self)
 
     async def edit_matches_callback(self, interaction: discord.Interaction):
         """Allow editing matches after confirmation"""
@@ -3267,29 +3336,32 @@ class AuctionsMenuView(discord.ui.View):
                     )
                 await db.commit()
 
-                # Log to bot logs channel
-                log_channel = await self.bot.get_cog('FreeAgencyCommands').get_bot_logs_channel(db)
-                if log_channel:
-                    # Get team info
-                    cursor = await db.execute("SELECT team_name, emoji_id FROM teams WHERE team_id = ?", (self.team_id,))
-                    team_data = await cursor.fetchone()
-                    team_name = team_data[0] if team_data else "Unknown Team"
-                    emoji_id = team_data[1] if team_data and team_data[1] else None
+                # Log to bot logs channel (best-effort - must not mask the successful withdrawal above)
+                try:
+                    log_channel = await self.bot.get_cog('FreeAgencyCommands').get_bot_logs_channel(db)
+                    if log_channel:
+                        # Get team info
+                        cursor = await db.execute("SELECT team_name, emoji_id FROM teams WHERE team_id = ?", (self.team_id,))
+                        team_data = await cursor.fetchone()
+                        team_name = team_data[0] if team_data else "Unknown Team"
+                        emoji_id = team_data[1] if team_data and team_data[1] else None
 
-                    emoji_str = ""
-                    if emoji_id:
-                        try:
-                            emoji = self.bot.get_emoji(int(emoji_id))
-                            if emoji:
-                                emoji_str = f"{emoji} "
-                        except:
-                            pass
+                        emoji_str = ""
+                        if emoji_id:
+                            try:
+                                emoji = self.bot.get_emoji(int(emoji_id))
+                                if emoji:
+                                    emoji_str = f"{emoji} "
+                            except:
+                                pass
 
-                    # Get withdrawn bids for logging
-                    withdrawn_bids_temp = [b for b in self.bids if b[0] in selected_bid_ids]
-                    player_names_log = ", ".join(b[3] for b in withdrawn_bids_temp)
+                        # Get withdrawn bids for logging
+                        withdrawn_bids_temp = [b for b in self.bids if b[0] in selected_bid_ids]
+                        player_names_log = ", ".join(b[3] for b in withdrawn_bids_temp)
 
-                    await log_channel.send(f"🚫 {emoji_str}**{team_name}** withdrew bid(s): {player_names_log} ({interaction.user.mention})")
+                        await log_channel.send(f"🚫 {emoji_str}**{team_name}** withdrew bid(s): {player_names_log} ({interaction.user.mention})")
+                except Exception as e:
+                    print(f"Failed to log bid withdrawal to bot logs channel: {e}")
 
             # Update view
             withdrawn_bids = [b for b in self.bids if b[0] in selected_bid_ids]
@@ -3300,17 +3372,19 @@ class AuctionsMenuView(discord.ui.View):
 
             self.update_buttons()
             embed = self.create_embed()
-            await interaction.response.edit_message(embed=embed, view=self)
-
-            # Send confirmation
             player_names = ", ".join(b[3] for b in withdrawn_bids)
-            await interaction.followup.send(
-                f"✅ Withdrawn {len(selected_bid_ids)} bid(s): {player_names} ({refund_amount} points refunded)",
-                ephemeral=True
-            )
 
         except Exception as e:
             await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+            return
+
+        # Sent outside the try block: the withdrawal already succeeded above,
+        # so a failure here must not be reported as the withdrawal itself failing.
+        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.followup.send(
+            f"✅ Withdrawn {len(selected_bid_ids)} bid(s): {player_names} ({refund_amount} points refunded)",
+            ephemeral=True
+        )
 
     async def free_resigns_callback(self, interaction: discord.Interaction):
         """Open the free re-sign selection interface"""

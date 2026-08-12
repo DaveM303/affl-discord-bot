@@ -608,7 +608,7 @@ class SeasonCommands(commands.Cog):
 
             await interaction.followup.send(message, ephemeral=True)
 
-    @app_commands.command(name="startseason", description="[ADMIN] Start the current offseason")
+    @app_commands.command(name="startseason", description="[ADMIN] End the current off-season and begin the next season")
     @app_commands.describe(offseason_weeks="Number of weeks in offseason (default: 23)")
     async def start_season(self, interaction: discord.Interaction, offseason_weeks: int = 23):
         await interaction.response.defer(ephemeral=True)
@@ -802,6 +802,16 @@ class SeasonCommands(commands.Cog):
                 if suspensions_carried_over > 0:
                     message += f"\n• {suspensions_carried_over} suspension(s) carried over to new season"
 
+            # Post injury list to configured channel
+            cursor = await db.execute(
+                "SELECT setting_value FROM settings WHERE setting_key = 'injury_list_channel_id'"
+            )
+            result = await cursor.fetchone()
+            if result and result[0]:
+                injury_commands = self.bot.get_cog('InjuryCommands')
+                if injury_commands:
+                    await injury_commands.post_injury_list_to_channel(db, int(result[0]))
+
             await interaction.followup.send(message, ephemeral=True)
 
     @app_commands.command(name="nextround", description="[ADMIN] Advance to the next round")
@@ -904,6 +914,16 @@ class SeasonCommands(commands.Cog):
 
             if completed_suspensions:
                 await db.commit()
+
+            # Post injury list to configured channel
+            cursor = await db.execute(
+                "SELECT setting_value FROM settings WHERE setting_key = 'injury_list_channel_id'"
+            )
+            result = await cursor.fetchone()
+            if result and result[0]:
+                injury_commands = self.bot.get_cog('InjuryCommands')
+                if injury_commands:
+                    await injury_commands.post_injury_list_to_channel(db, int(result[0]))
 
             response = f"✅ Advanced to **{next_round_name}** of Season {season_number}"
             if recovered_players:

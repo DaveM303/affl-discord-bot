@@ -283,6 +283,7 @@ class AdminCommands(commands.Cog):
         auctions_log_channel="Channel where free agency auction results are logged",
         bot_logs_channel="Channel where bot actions (bids, re-signs, matches) are logged",
         draft_channel="Channel where draft picks are announced",
+        injury_list_channel="Channel where injury list is posted when advancing rounds",
         season_1_year="Calendar year of Season 1 (for player aging)"
     )
     async def config(
@@ -295,16 +296,18 @@ class AdminCommands(commands.Cog):
         auctions_log_channel: discord.TextChannel = None,
         bot_logs_channel: discord.TextChannel = None,
         draft_channel: discord.TextChannel = None,
+        injury_list_channel: discord.TextChannel = None,
         season_1_year: int = None
     ):
         # If no parameters provided, show current settings
-        if all(ch is None for ch in [lineups_channel, delist_log_channel, trade_approval_channel, trade_log_channel, auctions_log_channel, bot_logs_channel, draft_channel, season_1_year]):
+        if all(ch is None for ch in [lineups_channel, delist_log_channel, trade_approval_channel, trade_log_channel, auctions_log_channel, bot_logs_channel, draft_channel, injury_list_channel, season_1_year]):
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
                     """SELECT setting_key, setting_value FROM settings
                        WHERE setting_key IN ('lineups_channel_id', 'delist_log_channel_id',
                                              'trade_approval_channel_id', 'trade_log_channel_id',
-                                             'auctions_log_channel_id', 'bot_logs_channel_id', 'draft_channel_id', 'season_1_year')"""
+                                             'auctions_log_channel_id', 'bot_logs_channel_id', 'draft_channel_id',
+                                             'injury_list_channel_id', 'season_1_year')"""
                 )
                 results = await cursor.fetchall()
 
@@ -367,6 +370,14 @@ class AdminCommands(commands.Cog):
             else:
                 channel_display = "*Not set*"
             embed.add_field(name="Draft Channel", value=channel_display, inline=False)
+
+            # Injury List Channel
+            if 'injury_list_channel_id' in settings and settings['injury_list_channel_id']:
+                channel = interaction.guild.get_channel(int(settings['injury_list_channel_id']))
+                channel_display = channel.mention if channel else f"<#{settings['injury_list_channel_id']}> (channel not found)"
+            else:
+                channel_display = "*Not set*"
+            embed.add_field(name="Injury List Channel", value=channel_display, inline=False)
 
             # Season 1 Year
             if 'season_1_year' in settings and settings['season_1_year']:
@@ -431,6 +442,13 @@ class AdminCommands(commands.Cog):
                     ("draft_channel_id", str(draft_channel.id))
                 )
                 updates.append(f"Draft Channel → {draft_channel.mention}")
+
+            if injury_list_channel:
+                await db.execute(
+                    "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
+                    ("injury_list_channel_id", str(injury_list_channel.id))
+                )
+                updates.append(f"Injury List Channel → {injury_list_channel.mention}")
 
             if season_1_year is not None:
                 await db.execute(
@@ -1481,7 +1499,8 @@ class AdminCommands(commands.Cog):
                                 errors.append(f"Player '{name}' not found - use Add_Players sheet to add new players")
 
                         except Exception as e:
-                            errors.append(f"Player '{name}': {str(e)}")
+                            row_name = str(row['Name']).strip() if 'Name' in players_df.columns and pd.notna(row.get('Name')) else "<unknown>"
+                            errors.append(f"Player '{row_name}': {str(e)}")
 
                     # Delete players that exist in database but NOT in Excel file
                     cursor = await db.execute("SELECT player_id, name FROM players")
@@ -1576,7 +1595,8 @@ class AdminCommands(commands.Cog):
                             )
                             players_added += 1
                         except Exception as e:
-                            errors.append(f"Add_Players - '{name}': {str(e)}")
+                            row_name = str(row['Name']).strip() if pd.notna(row.get('Name')) else "<unknown>"
+                            errors.append(f"Add_Players - '{row_name}': {str(e)}")
 
                     await db.commit()
                 except Exception as e:
@@ -1987,12 +2007,15 @@ class AdminCommands(commands.Cog):
                                 passed = int(row['Passed']) if 'Passed' in row and pd.notna(row['Passed']) else 0
                                 picked_at = str(row['Picked_At']) if 'Picked_At' in row and pd.notna(row['Picked_At']) and row['Picked_At'] else None
 
+                                # Use 0 for season_number if it's NULL/empty (manual drafts)
+                                season_num = season_number if pd.notna(season_number) and season_number else 0
+
                                 await db.execute(
                                     """INSERT INTO draft_picks
                                        (pick_id, draft_id, draft_name, season_number, round_number, pick_number,
                                         pick_origin, original_team_id, current_team_id, player_selected_id, passed, picked_at)
                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                                    (pick_id, draft_id, draft_name, season_number, round_number, pick_number,
+                                    (pick_id, draft_id, draft_name, season_num, round_number, pick_number,
                                      pick_origin, original_team_id, current_team[0], player_id, passed, picked_at)
                                 )
                                 draft_picks_imported += 1
@@ -2493,82 +2516,9 @@ class AdminCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Error importing file: {e}", ephemeral=True)
 
-    @app_commands.command(name="assignrookiecontracts", description="[ADMIN] Assign contract_expiry to drafted rookies")
-    @app_commands.describe(
-        draft_name="Name of the draft (e.g., 'Season 9 National Draft')"
-    )
-    async def assign_rookie_contracts(self, interaction: discord.Interaction, draft_name: str):
-        await interaction.response.defer(ephemeral=True)
-
-        # Check if user has admin role
-        if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
-            await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
-            return
-
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                # Get draft information
-                cursor = await db.execute(
-                    "SELECT draft_id, season_number, rookie_contract_years FROM drafts WHERE draft_name = ?",
-                    (draft_name,)
-                )
-                draft_result = await cursor.fetchone()
-                if not draft_result:
-                    await interaction.followup.send(f"❌ Draft '{draft_name}' not found!")
-                    return
-
-                draft_id, season_number, rookie_contract_years = draft_result
-
-                if rookie_contract_years is None:
-                    rookie_contract_years = 3  # Default
-
-                # Calculate contract expiry: season + years - 1
-                contract_expiry = season_number + rookie_contract_years - 1
-
-                # Get all drafted players from this draft
-                cursor = await db.execute(
-                    """SELECT player_selected_id FROM draft_picks
-                       WHERE draft_id = ? AND player_selected_id IS NOT NULL""",
-                    (draft_id,)
-                )
-                drafted_players = await cursor.fetchall()
-
-                if not drafted_players:
-                    await interaction.followup.send(f"❌ No players have been drafted in '{draft_name}'!")
-                    return
-
-                # Assign contract_expiry to all drafted players
-                players_updated = 0
-                for (player_id,) in drafted_players:
-                    await db.execute(
-                        "UPDATE players SET contract_expiry = ? WHERE player_id = ?",
-                        (contract_expiry, player_id)
-                    )
-                    players_updated += 1
-
-                await db.commit()
-
-                await interaction.followup.send(
-                    f"✅ **Rookie Contracts Assigned!**\n\n"
-                    f"**Draft:** {draft_name}\n"
-                    f"**Season:** {season_number}\n"
-                    f"**Contract Length:** {rookie_contract_years} years\n"
-                    f"**Contract Expiry:** Season {contract_expiry}\n"
-                    f"**Players Updated:** {players_updated}\n\n"
-                    f"All drafted rookies now have contracts expiring after Season {contract_expiry}."
-                )
-
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
-
     @app_commands.command(name="exportdb", description="Export database file (Admin only)")
     async def export_db(self, interaction: discord.Interaction):
         """Export the database file for download"""
-        # Check if user has admin role
-        if ADMIN_ROLE_ID and ADMIN_ROLE_ID not in [role.id for role in interaction.user.roles]:
-            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
-            return
-
         await interaction.response.defer(ephemeral=True)
 
         try:

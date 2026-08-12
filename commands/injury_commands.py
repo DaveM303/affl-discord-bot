@@ -39,6 +39,38 @@ class InjuryCommands(commands.Cog):
         # Return up to 25 choices (Discord limit)
         return choices[:25]
 
+    async def injured_player_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete for currently injured players only"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating, t.team_name
+                   FROM players p
+                   LEFT JOIN teams t ON p.team_id = t.team_id
+                   INNER JOIN injuries i ON p.player_id = i.player_id
+                   WHERE i.status = 'injured'
+                   ORDER BY p.name"""
+            )
+            players = await cursor.fetchall()
+
+        # Filter players based on what the user has typed
+        choices = []
+        for player_id, name, position, age, rating, team_name in players:
+            # Check if current input matches player name
+            if current.lower() in name.lower():
+                # Format: Team Name (POS, age yo, OVR)
+                team_prefix = team_name if team_name else "Delisted"
+                display_name = f"{name} ({team_prefix}, {position}, {age}yo, {rating} OVR)"
+
+                # Value is player_id so we can query by ID later
+                choices.append(app_commands.Choice(name=display_name, value=str(player_id)))
+
+        # Return up to 25 choices (Discord limit)
+        return choices[:25]
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Check if user has admin permissions for admin commands"""
         # Public commands
@@ -226,7 +258,7 @@ class InjuryCommands(commands.Cog):
                 )
 
     @app_commands.command(name="injurylist", description="View current injuries and suspensions")
-    @app_commands.describe(team_name="Team name (leave empty for your team, use 'all' for all teams)")
+    @app_commands.describe(team_name="Team name (leave empty for all teams)")
     async def injury_list(self, interaction: discord.Interaction, team_name: str = None):
         async with aiosqlite.connect(DB_PATH) as db:
             # Get current round, total rounds, and regular_rounds
@@ -242,11 +274,7 @@ class InjuryCommands(commands.Cog):
             filter_team_id = None
             title_suffix = ""
 
-            if team_name and team_name.lower() == 'all':
-                # Show all teams - no suffix
-                filter_team_id = None
-                title_suffix = ""
-            elif team_name:
+            if team_name:
                 # Show specific team (exact match due to autocomplete)
                 cursor = await db.execute(
                     "SELECT team_id, team_name FROM teams WHERE team_name = ?",
@@ -262,34 +290,9 @@ class InjuryCommands(commands.Cog):
                 filter_team_id = team[0]
                 title_suffix = f" - {team[1]}"
             else:
-                # Default to user's team
-                cursor = await db.execute(
-                    "SELECT team_name, role_id FROM teams WHERE role_id IS NOT NULL"
-                )
-                teams = await cursor.fetchall()
-
-                user_team_id = None
-                user_team_name = None
-                for t_name, role_id in teams:
-                    role = interaction.guild.get_role(int(role_id))
-                    if role and role in interaction.user.roles:
-                        cursor = await db.execute(
-                            "SELECT team_id FROM teams WHERE team_name = ?",
-                            (t_name,)
-                        )
-                        result = await cursor.fetchone()
-                        if result:
-                            user_team_id = result[0]
-                            user_team_name = t_name
-                            break
-
-                if user_team_id:
-                    filter_team_id = user_team_id
-                    title_suffix = f" - {user_team_name}"
-                else:
-                    # User has no team, show all
-                    filter_team_id = None
-                    title_suffix = ""
+                # Default to all teams
+                filter_team_id = None
+                title_suffix = ""
 
             # Get active injuries (filtered by team if specified)
             if filter_team_id:
@@ -415,13 +418,129 @@ class InjuryCommands(commands.Cog):
 
             await interaction.response.send_message(embed=embed)
 
+    async def post_injury_list_to_channel(self, db, channel_id: int):
+        """Helper function to post the injury list to a specified channel"""
+        # Get current round, total rounds, and regular_rounds
+        cursor = await db.execute(
+            "SELECT current_round, total_rounds, regular_rounds FROM seasons WHERE status = 'active' LIMIT 1"
+        )
+        season_info = await cursor.fetchone()
+        current_round = season_info[0] if season_info else 0
+        total_rounds = season_info[1] if season_info else 0
+        regular_rounds = season_info[2] if season_info else 24
+
+        # Get all active injuries
+        cursor = await db.execute(
+            """SELECT p.name, i.injury_type, i.return_round, t.team_name, t.emoji_id
+               FROM injuries i
+               JOIN players p ON i.player_id = p.player_id
+               LEFT JOIN teams t ON p.team_id = t.team_id
+               WHERE i.status = 'injured'
+               ORDER BY i.return_round ASC, p.name ASC"""
+        )
+        injuries = await cursor.fetchall()
+
+        # Get all active suspensions
+        cursor = await db.execute(
+            """SELECT p.name, s.suspension_reason, s.return_round, t.team_name, t.emoji_id
+               FROM suspensions s
+               JOIN players p ON s.player_id = p.player_id
+               LEFT JOIN teams t ON p.team_id = t.team_id
+               WHERE s.status = 'suspended'
+               ORDER BY s.return_round ASC, p.name ASC"""
+        )
+        suspensions = await cursor.fetchall()
+
+        if not injuries and not suspensions:
+            # No injuries or suspensions to post
+            return
+
+        # Build combined list
+        combined_list = []
+
+        # Add injuries
+        if injuries:
+            combined_list.append("**🚑 Injuries:**")
+            for name, injury_type, return_round, team_name, emoji_id in injuries:
+                # Calculate weeks remaining
+                weeks_left = return_round - current_round
+
+                # Get team emoji
+                team_display = ""
+                if team_name:
+                    try:
+                        if emoji_id:
+                            emoji = self.bot.get_emoji(int(emoji_id))
+                            if emoji:
+                                team_display = f"{emoji} "
+                    except:
+                        pass
+
+                if weeks_left <= 0:
+                    status = "✅ Ready to return"
+                else:
+                    week_text = "week" if weeks_left == 1 else "weeks"
+                    # Check if injury extends beyond season
+                    season_indicator = " (SEASON)" if return_round > total_rounds else ""
+                    status = f"- {weeks_left} {week_text}{season_indicator}"
+
+                combined_list.append(
+                    f"{team_display}**{name}** - {injury_type} {status}"
+                )
+
+        # Add suspensions
+        if suspensions:
+            if injuries:
+                combined_list.append("")  # Empty line separator
+            combined_list.append("**🚫 Suspensions:**")
+            for name, suspension_reason, return_round, team_name, emoji_id in suspensions:
+                # Calculate games remaining
+                games_left = return_round - current_round
+
+                # Get team emoji
+                team_display = ""
+                if team_name:
+                    try:
+                        if emoji_id:
+                            emoji = self.bot.get_emoji(int(emoji_id))
+                            if emoji:
+                                team_display = f"{emoji} "
+                    except:
+                        pass
+
+                if games_left <= 0:
+                    status = "✅ Ready to return"
+                else:
+                    game_text = "game" if games_left == 1 else "games"
+                    # Check if suspension extends beyond season
+                    season_indicator = " (SEASON)" if return_round > total_rounds else ""
+                    status = f"- {games_left} {game_text}{season_indicator}"
+
+                combined_list.append(
+                    f"{team_display}**{name}** - {suspension_reason} {status}"
+                )
+
+        # Get the round name
+        round_display = get_round_name(current_round, regular_rounds) if current_round > 0 else "Offseason"
+
+        embed = discord.Embed(
+            title=f"Injury & Suspension List - {round_display}",
+            description="\n".join(combined_list),
+            color=discord.Color.red()
+        )
+
+        # Post to channel
+        channel = self.bot.get_channel(channel_id)
+        if channel:
+            await channel.send(embed=embed)
+
     @app_commands.command(name="editinjury", description="[ADMIN] Edit a player's injury")
     @app_commands.describe(
         player_name="Player name",
         new_injury_type="New injury type (optional)",
         new_recovery_rounds="New recovery rounds (optional)"
     )
-    @app_commands.autocomplete(player_name=player_name_autocomplete)
+    @app_commands.autocomplete(player_name=injured_player_autocomplete)
     async def edit_injury(
         self,
         interaction: discord.Interaction,
@@ -459,7 +578,7 @@ class InjuryCommands(commands.Cog):
 
             # Find active injury
             cursor = await db.execute(
-                """SELECT injury_id, injury_type, injury_round, recovery_rounds
+                """SELECT injury_id, injury_type, injury_round, recovery_rounds, return_round
                    FROM injuries
                    WHERE player_id = ? AND status = 'injured'""",
                 (player_id,)
@@ -473,7 +592,17 @@ class InjuryCommands(commands.Cog):
                 )
                 return
 
-            injury_id, old_injury_type, injury_round, old_recovery = injury
+            injury_id, old_injury_type, injury_round, old_recovery, old_return_round = injury
+
+            # Get current round
+            cursor = await db.execute(
+                "SELECT current_round FROM seasons WHERE status = 'active' LIMIT 1"
+            )
+            season_info = await cursor.fetchone()
+            current_round = season_info[0] if season_info else 0
+
+            # Calculate current recovery time remaining
+            old_recovery_remaining = old_return_round - current_round
 
             # Update fields
             updates = []
@@ -486,10 +615,13 @@ class InjuryCommands(commands.Cog):
                 changes.append(f"Injury: {old_injury_type} → {new_injury_type}")
 
             if new_recovery_rounds:
-                new_return_round = injury_round + new_recovery_rounds
+                # Calculate return round from current round, not injury round
+                new_return_round = current_round + new_recovery_rounds
                 updates.append("recovery_rounds = ?, return_round = ?")
                 values.extend([new_recovery_rounds, new_return_round])
-                changes.append(f"Recovery: {old_recovery} → {new_recovery_rounds} rounds")
+                old_week_text = "week" if old_recovery_remaining == 1 else "weeks"
+                new_week_text = "week" if new_recovery_rounds == 1 else "weeks"
+                changes.append(f"Recovery: {old_recovery_remaining} {old_week_text} → {new_recovery_rounds} {new_week_text}")
 
             if not updates:
                 await interaction.response.send_message(
@@ -512,7 +644,7 @@ class InjuryCommands(commands.Cog):
 
     @app_commands.command(name="removeinjury", description="[ADMIN] Remove a player's injury")
     @app_commands.describe(player_name="Player name")
-    @app_commands.autocomplete(player_name=player_name_autocomplete)
+    @app_commands.autocomplete(player_name=injured_player_autocomplete)
     async def remove_injury(self, interaction: discord.Interaction, player_name: str):
         async with aiosqlite.connect(DB_PATH) as db:
             # Get player by ID (player_name is actually player_id from autocomplete)

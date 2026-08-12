@@ -163,7 +163,7 @@ class LineupCommands(commands.Cog):
 
             # Get roster
             cursor = await db.execute(
-                """SELECT player_id, name, position, overall_rating
+                """SELECT player_id, name, position, overall_rating, age
                    FROM players
                    WHERE team_id = ?
                    ORDER BY overall_rating DESC""",
@@ -1354,7 +1354,8 @@ class LineupView(discord.ui.View):
         
         # Sort roster: priority positions first, then by rating
         def sort_key(player):
-            player_id, name, pos, rating = player
+            pos = player[2]  # position
+            rating = player[3]  # overall_rating
             # Check if position is in priority list
             if pos in priority_positions:
                 return (0, -rating)  # Highest priority
@@ -1489,9 +1490,7 @@ class LineupView(discord.ui.View):
             except:
                 pass
         
-        title = f"{emoji}{self.team_name} Lineup"
-        if self.selected_position:
-            title += f" (Editing: {self.selected_position})"
+        title = f"{emoji}{self.team_name} - Lineup Editor"
         
         embed = discord.Embed(
             title=title,
@@ -1665,12 +1664,14 @@ class PlayerSelect(discord.ui.Select):
         count = 0
         added = 0
 
-        for player_id, name, pos, rating in sorted_roster:
+        for player_id, name, pos, rating, age in sorted_roster:
             # Show all players - they can be moved between positions
             # Check if this player is in the current page
             if count >= start_idx and added < 25:
+                # Build label with age
+                label = f"{name} ({pos}, {age}, {rating})"
+
                 # Mark if player is currently in lineup
-                label = f"{name} ({rating} OVR)"
                 if player_id in used_ids:
                     # Find which position they're in
                     current_pos = None
@@ -1679,12 +1680,11 @@ class PlayerSelect(discord.ui.Select):
                             current_pos = pos_name
                             break
                     if current_pos and current_pos != position_name:
-                        label += f" [Currently in {current_pos}]"
+                        label += f" (Currently in {current_pos})"
 
                 options.append(
                     discord.SelectOption(
                         label=label,
-                        description=f"{pos}",
                         value=str(player_id)
                     )
                 )
@@ -1696,14 +1696,12 @@ class PlayerSelect(discord.ui.Select):
         
         if not options:
             options.append(discord.SelectOption(label="No players available", value="none"))
-        
+
         # Add page indicator to placeholder
-        total_available = count
+        total_available = len(sorted_roster)  # Total number of players in roster
         current_page = parent_view.player_page + 1
         total_pages = (total_available + 24) // 25
-        placeholder = f"Select player for {position_name}"
-        if total_pages > 1:
-            placeholder += f" (Page {current_page}/{total_pages})"
+        placeholder = f"Select player for {position_name} (Page {current_page}/{total_pages})"
         
         super().__init__(
             placeholder=placeholder,

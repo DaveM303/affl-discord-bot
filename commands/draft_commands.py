@@ -178,8 +178,8 @@ class DraftCommands(commands.Cog):
                         )
                         return
 
-                # Get all teams
-                cursor = await db.execute("SELECT team_id, team_name FROM teams ORDER BY team_name")
+                # Get all teams (excluding Draft Pool)
+                cursor = await db.execute("SELECT team_id, team_name FROM teams WHERE team_name != 'Draft Pool' ORDER BY team_name")
                 teams = await cursor.fetchall()
 
                 if not teams:
@@ -246,8 +246,8 @@ class DraftCommands(commands.Cog):
                     )
                     return
 
-                # Get all teams
-                cursor = await db.execute("SELECT team_id, team_name FROM teams ORDER BY team_name")
+                # Get all teams (excluding Draft Pool)
+                cursor = await db.execute("SELECT team_id, team_name FROM teams WHERE team_name != 'Draft Pool' ORDER BY team_name")
                 teams = await cursor.fetchall()
 
                 if not teams:
@@ -1220,6 +1220,20 @@ class DraftCommands(commands.Cog):
             )
             await db.commit()
 
+            # Delist all remaining Draft Pool players
+            cursor = await db.execute(
+                "SELECT team_id FROM teams WHERE team_name = 'Draft Pool'"
+            )
+            draft_pool_result = await cursor.fetchone()
+            if draft_pool_result:
+                draft_pool_id = draft_pool_result[0]
+                await db.execute(
+                    "UPDATE players SET team_id = NULL WHERE team_id = ?",
+                    (draft_pool_id,)
+                )
+                await db.commit()
+                print(f"Delisted all remaining Draft Pool players")
+
             # Get draft channel
             cursor = await db.execute(
                 "SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'"
@@ -1261,10 +1275,12 @@ class LadderEntryStartView(discord.ui.View):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Create draft in drafts table with status 'future'
+                # Use 0 for season_number if it's a manual draft (linked_season is None)
+                season_num = self.linked_season if self.linked_season is not None else 0
                 cursor = await db.execute(
                     """INSERT INTO drafts (draft_name, season_number, status, rounds, rookie_contract_years)
                        VALUES (?, ?, 'future', ?, ?)""",
-                    (self.draft_name, self.linked_season, self.rounds, self.rookie_contract_years)
+                    (self.draft_name, season_num, self.rounds, self.rookie_contract_years)
                 )
                 draft_id = cursor.lastrowid
 
@@ -1276,7 +1292,7 @@ class LadderEntryStartView(discord.ui.View):
                             """INSERT INTO draft_picks (draft_id, draft_name, season_number, round_number,
                                                         pick_number, pick_origin, original_team_id, current_team_id)
                                VALUES (?, ?, ?, ?, NULL, ?, ?, ?)""",
-                            (draft_id, self.draft_name, self.linked_season, round_num, pick_origin, team_id, team_id)
+                            (draft_id, self.draft_name, season_num, round_num, pick_origin, team_id, team_id)
                         )
 
                 await db.commit()
@@ -1379,10 +1395,12 @@ class LadderEntryModal(discord.ui.Modal):
                             )
 
                 # Create draft in drafts table with status 'current' (ladder is set)
+                # Use 0 for season_number if it's a manual draft (linked_season is None)
+                season_num = self.linked_season if self.linked_season is not None else 0
                 cursor = await db.execute(
                     """INSERT INTO drafts (draft_name, season_number, status, rounds, rookie_contract_years, ladder_set_at)
                        VALUES (?, ?, 'current', ?, ?, CURRENT_TIMESTAMP)""",
-                    (self.draft_name, self.linked_season, self.rounds, self.rookie_contract_years)
+                    (self.draft_name, season_num, self.rounds, self.rookie_contract_years)
                 )
                 draft_id = cursor.lastrowid
 
@@ -1395,7 +1413,7 @@ class LadderEntryModal(discord.ui.Modal):
                             """INSERT INTO draft_picks (draft_id, draft_name, season_number, round_number, pick_number,
                                                         pick_origin, original_team_id, current_team_id)
                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (draft_id, self.draft_name, self.linked_season, round_num, pick_counter, pick_origin, team_id, team_id)
+                            (draft_id, self.draft_name, season_num, round_num, pick_counter, pick_origin, team_id, team_id)
                         )
                         pick_counter += 1
 
@@ -1783,6 +1801,11 @@ class DraftPickView(discord.ui.View):
 
         await interaction.response.defer()
 
+        # Disable all buttons immediately to prevent double-clicks
+        for item in self.children:
+            item.disabled = True
+        await interaction.message.edit(view=self)
+
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Check if player is a father/son player
@@ -1812,6 +1835,11 @@ class DraftPickView(discord.ui.View):
     async def pass_pick(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Pass on this pick"""
         await interaction.response.defer()
+
+        # Disable all buttons immediately to prevent double-clicks
+        for item in self.children:
+            item.disabled = True
+        await interaction.message.edit(view=self)
 
         try:
             async with aiosqlite.connect(DB_PATH) as db:
@@ -1913,9 +1941,6 @@ class DraftPickView(discord.ui.View):
         bid_value = result[0] if result else 0
         required_value = int(bid_value * 0.8)  # 20% discount
 
-        # Calculate which picks the father/son club needs to match
-        matching_picks = await self.calculate_matching_picks(db, father_son_club_id, required_value)
-
         # Get player info
         cursor = await db.execute(
             "SELECT name, position, age, overall_rating FROM players WHERE player_id = ?",
@@ -1942,6 +1967,19 @@ class DraftPickView(discord.ui.View):
             db, player_id, player_name, pos, age, ovr,
             bidding_team_name, bidding_emoji_id, fs_team_name, fs_emoji_id
         )
+
+        # If bid value is 0, automatically treat as unable to match
+        if bid_value == 0:
+            await self.auto_pass_father_son_bid(
+                db, player_id, player_name, pos, age, ovr,
+                father_son_club_id, fs_team_name, fs_emoji_id,
+                bidding_team_name, bidding_emoji_id,
+                has_picks=False
+            )
+            return
+
+        # Calculate which picks the father/son club needs to match
+        matching_picks = await self.calculate_matching_picks(db, father_son_club_id, required_value)
 
         # Send match notification to father/son club (always, even if they can't match)
         if fs_channel_id:
@@ -2043,7 +2081,9 @@ class DraftPickView(discord.ui.View):
             picks_per_round = (await cursor.fetchone())[0]
 
             if (self.pick_number - 1) % picks_per_round == 0:
-                await draft_channel.send(f"**-- ROUND {round_num} --**")
+                # Calculate the actual round number for this pick
+                actual_round = ((self.pick_number - 1) // picks_per_round) + 1
+                await draft_channel.send(f"**-- ROUND {actual_round} --**")
 
             # Get emojis
             bidding_emoji_str = ""
@@ -2609,7 +2649,9 @@ class FatherSonMatchView(discord.ui.View):
             plays_like = plays_like_result[0] if plays_like_result and plays_like_result[0] else None
 
             # Build main message line
-            message = f"**Pick {self.bid_pick_number}:** {fs_emoji_str}select **{self.player_name.upper()}** ({self.pos}, {self.age} yo, {self.ovr} OVR)"
+            # If matched, F/S team selects. If not matched, bidding team selects.
+            selecting_emoji = fs_emoji_str if matched else bidding_emoji_str
+            message = f"**Pick {self.bid_pick_number}:** {selecting_emoji}select **{self.player_name.upper()}** ({self.pos}, {self.age} yo, {self.ovr} OVR)"
 
             # Add plays like on main line
             if plays_like:
@@ -2625,7 +2667,7 @@ class FatherSonMatchView(discord.ui.View):
                     picks_text = picks_list[0] if picks_list else ""
                 message += f"\n└ {fs_emoji_str}Matched using pick/s {picks_text}"
             else:
-                message += f"\n└ {bidding_emoji_str}Elected not to match"
+                message += f"\n└ {fs_emoji_str}Elected not to match"
 
             await draft_channel.send(message)
 

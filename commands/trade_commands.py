@@ -145,7 +145,7 @@ class TradeCommands(commands.Cog):
                 pick_display = self.format_pick_display(
                     pick_number, season_number, round_number, emoji_id, current_season
                 )
-                formatted_picks.append(f"**{pick_display}**")
+                formatted_picks.append(f"{pick_display}")
 
         return formatted_picks
 
@@ -292,7 +292,7 @@ class TradeCommands(commands.Cog):
                                     pick_display = self.format_pick_display(
                                         pick_number, season_number, round_number, emoji_id, current_season
                                     )
-                                    offering_items.append(f"**{pick_display}**")
+                                    offering_items.append(f"{pick_display}")
 
                         # Add initiating players
                         if init_players:
@@ -304,7 +304,7 @@ class TradeCommands(commands.Cog):
                                 player = await cursor.fetchone()
                                 if player:
                                     _, name, pos, ovr, age = player
-                                    offering_items.append(f"**{name}** ({pos}, {age}, {ovr})")
+                                    offering_items.append(f"{name} ({pos}, {age}, {ovr})")
 
                         # Add receiving picks
                         if recv_picks:
@@ -323,7 +323,7 @@ class TradeCommands(commands.Cog):
                                     pick_display = self.format_pick_display(
                                         pick_number, season_number, round_number, emoji_id, current_season
                                     )
-                                    receiving_items.append(f"**{pick_display}**")
+                                    receiving_items.append(f"{pick_display}")
 
                         # Add receiving players
                         if recv_players:
@@ -335,16 +335,16 @@ class TradeCommands(commands.Cog):
                                 player = await cursor.fetchone()
                                 if player:
                                     _, name, pos, ovr, age = player
-                                    receiving_items.append(f"**{name}** ({pos}, {age}, {ovr})")
+                                    receiving_items.append(f"{name} ({pos}, {age}, {ovr})")
 
                         embed.add_field(
-                            name=f"**{recv_emoji_str}receive:**",
+                            name=f"**{recv_emoji_str}RECEIVE:**",
                             value="\n".join(offering_items) if offering_items else "*Nothing*",
                             inline=True
                         )
 
                         embed.add_field(
-                            name=f"**{init_emoji_str}receive:**",
+                            name=f"**{init_emoji_str}RECEIVE:**",
                             value="\n".join(receiving_items) if receiving_items else "*Nothing*",
                             inline=True
                         )
@@ -696,7 +696,7 @@ class TradeMenuView(discord.ui.View):
                     f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                     init_players
                 )
-                init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                init_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             # Add picks you're offering
             if recv_picks_json:
@@ -710,16 +710,16 @@ class TradeMenuView(discord.ui.View):
                     f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                     recv_players
                 )
-                recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                recv_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             embed.add_field(
-                name=f"**{your_emoji_str}receive:**",
+                name=f"**{your_emoji_str}RECEIVE:**",
                 value="\n".join(init_items) if init_items else "*Nothing*",
                 inline=True
             )
 
             embed.add_field(
-                name=f"**{team_emoji_str}receive:**",
+                name=f"**{team_emoji_str}RECEIVE:**",
                 value="\n".join(recv_items) if recv_items else "*Nothing*",
                 inline=True
             )
@@ -809,7 +809,7 @@ class TradeMenuView(discord.ui.View):
                     f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                     init_players
                 )
-                init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                init_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             # Add picks they're offering
             if recv_picks_json:
@@ -823,16 +823,16 @@ class TradeMenuView(discord.ui.View):
                     f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                     recv_players
                 )
-                recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                recv_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             embed.add_field(
-                name=f"**{team_emoji_str}receive:**",
+                name=f"**{team_emoji_str}RECEIVE:**",
                 value="\n".join(init_items) if init_items else "*Nothing*",
                 inline=True
             )
 
             embed.add_field(
-                name=f"**{your_emoji_str}receive:**",
+                name=f"**{your_emoji_str}RECEIVE:**",
                 value="\n".join(recv_items) if recv_items else "*Nothing*",
                 inline=True
             )
@@ -898,7 +898,6 @@ class TradeMenuView(discord.ui.View):
 
             embed = discord.Embed(
                 title="⚖️ Trade Pending Mod Approval",
-                description=f"{init_emoji_str}**{init_team_name}** ↔️ {recv_emoji_str}**{recv_team_name}**",
                 color=discord.Color.gold()
             )
 
@@ -923,7 +922,7 @@ class TradeMenuView(discord.ui.View):
                     f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                     init_players
                 )
-                init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                init_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             # Add picks receiving team is offering
             if recv_picks_json:
@@ -937,16 +936,16 @@ class TradeMenuView(discord.ui.View):
                     f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                     recv_players
                 )
-                recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                recv_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             embed.add_field(
-                name=f"**{recv_emoji_str}receive:**",
+                name=f"**{recv_emoji_str}RECEIVE:**",
                 value="\n".join(init_items) if init_items else "*Nothing*",
                 inline=True
             )
 
             embed.add_field(
-                name=f"**{init_emoji_str}receive:**",
+                name=f"**{init_emoji_str}RECEIVE:**",
                 value="\n".join(recv_items) if recv_items else "*Nothing*",
                 inline=True
             )
@@ -1098,7 +1097,7 @@ class TradeMenuView(discord.ui.View):
                         f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                         init_players
                     )
-                    init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                    init_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
                 if recv_players:
                     placeholders = ','.join('?' * len(recv_players))
@@ -1106,7 +1105,7 @@ class TradeMenuView(discord.ui.View):
                         f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                         recv_players
                     )
-                    recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                    recv_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             # Update trade status
             await db.execute(
@@ -1146,13 +1145,13 @@ class TradeMenuView(discord.ui.View):
                 )
 
                 embed.add_field(
-                    name=f"**{recv_emoji_str}receive:**",
+                    name=f"**{recv_emoji_str}RECEIVE:**",
                     value="\n".join(init_items) if init_items else "*Nothing*",
                     inline=True
                 )
 
                 embed.add_field(
-                    name=f"**{init_emoji_str}receive:**",
+                    name=f"**{init_emoji_str}RECEIVE:**",
                     value="\n".join(recv_items) if recv_items else "*Nothing*",
                     inline=True
                 )
@@ -1223,7 +1222,7 @@ class TradeMenuView(discord.ui.View):
                         f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                         init_players
                     )
-                    init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                    init_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
                 if recv_players:
                     placeholders = ','.join('?' * len(recv_players))
@@ -1231,7 +1230,7 @@ class TradeMenuView(discord.ui.View):
                         f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                         recv_players
                     )
-                    recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                    recv_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             # Update status
             await db.execute(
@@ -1270,13 +1269,13 @@ class TradeMenuView(discord.ui.View):
                 )
 
                 embed.add_field(
-                    name=f"**{recv_emoji_str}receive:**",
+                    name=f"**{recv_emoji_str}RECEIVE:**",
                     value="\n".join(init_items) if init_items else "*Nothing*",
                     inline=True
                 )
 
                 embed.add_field(
-                    name=f"**{init_emoji_str}receive:**",
+                    name=f"**{init_emoji_str}RECEIVE:**",
                     value="\n".join(recv_items) if recv_items else "*Nothing*",
                     inline=True
                 )
@@ -1428,7 +1427,7 @@ class TradeMenuView(discord.ui.View):
                                 f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                                 init_players
                             )
-                            init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                            init_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
                         if recv_players:
                             placeholders = ','.join('?' * len(recv_players))
@@ -1436,7 +1435,7 @@ class TradeMenuView(discord.ui.View):
                                 f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                                 recv_players
                             )
-                            recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                            recv_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
                     embed = discord.Embed(
                         title=f"↩️ {init_emoji_str}**{init_team_name}** have withdrawn their trade offer!",
@@ -1444,13 +1443,13 @@ class TradeMenuView(discord.ui.View):
                     )
 
                     embed.add_field(
-                        name=f"**{recv_emoji_str}receive:**",
+                        name=f"**{recv_emoji_str}RECEIVE:**",
                         value="\n".join(init_items) if init_items else "*Nothing*",
                         inline=True
                     )
 
                     embed.add_field(
-                        name=f"**{init_emoji_str}receive:**",
+                        name=f"**{init_emoji_str}RECEIVE:**",
                         value="\n".join(recv_items) if recv_items else "*Nothing*",
                         inline=True
                     )
@@ -1538,7 +1537,6 @@ class PendingTradesView(discord.ui.View):
 
             embed = discord.Embed(
                 title="⚖️ Trade Pending Mod Approval",
-                description=f"{init_emoji_str}**{init_team_name}** ↔️ {recv_emoji_str}**{recv_team_name}**",
                 color=discord.Color.gold()
             )
 
@@ -1563,7 +1561,7 @@ class PendingTradesView(discord.ui.View):
                     f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                     init_players
                 )
-                init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                init_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             # Add picks receiving team is offering
             if recv_picks_json:
@@ -1577,16 +1575,16 @@ class PendingTradesView(discord.ui.View):
                     f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                     recv_players
                 )
-                recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                recv_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             embed.add_field(
-                name=f"**{recv_emoji_str}receive:**",
+                name=f"**{recv_emoji_str}RECEIVE:**",
                 value="\n".join(init_items) if init_items else "*Nothing*",
                 inline=True
             )
 
             embed.add_field(
-                name=f"**{init_emoji_str}receive:**",
+                name=f"**{init_emoji_str}RECEIVE:**",
                 value="\n".join(recv_items) if recv_items else "*Nothing*",
                 inline=True
             )
@@ -1718,7 +1716,7 @@ class PendingTradesView(discord.ui.View):
                         f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                         initiating_players
                     )
-                    init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                    init_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
                 # Get pick details for receiving team
                 if recv_picks_json:
@@ -1732,7 +1730,7 @@ class PendingTradesView(discord.ui.View):
                         f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                         receiving_players
                     )
-                    recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                    recv_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             await db.commit()
 
@@ -1765,13 +1763,13 @@ class PendingTradesView(discord.ui.View):
                     )
 
                     embed.add_field(
-                        name=f"**{recv_emoji_str}receive:**",
+                        name=f"**{recv_emoji_str}RECEIVE:**",
                         value="\n".join(init_items) if init_items else "*Nothing*",
                         inline=True
                     )
 
                     embed.add_field(
-                        name=f"**{init_emoji_str}receive:**",
+                        name=f"**{init_emoji_str}RECEIVE:**",
                         value="\n".join(recv_items) if recv_items else "*Nothing*",
                         inline=True
                     )
@@ -1790,13 +1788,13 @@ class PendingTradesView(discord.ui.View):
                     )
 
                     embed.add_field(
-                        name=f"**{recv_emoji_str}receive:**",
+                        name=f"**{recv_emoji_str}RECEIVE:**",
                         value="\n".join(init_items) if init_items else "*Nothing*",
                         inline=True
                     )
 
                     embed.add_field(
-                        name=f"**{init_emoji_str}receive:**",
+                        name=f"**{init_emoji_str}RECEIVE:**",
                         value="\n".join(recv_items) if recv_items else "*Nothing*",
                         inline=True
                     )
@@ -2020,7 +2018,7 @@ class TradeOfferView(discord.ui.View):
                     pick_display = self.parent_cog.format_pick_display(
                         pick_number, season_number, round_number, emoji_id, self.current_season
                     )
-                    offering_items.append(f"**{pick_display}**")
+                    offering_items.append(f"{pick_display}")
 
         # Add players
         if self.initiating_players:
@@ -2028,7 +2026,7 @@ class TradeOfferView(discord.ui.View):
                 player = next((p for p in self.initiating_roster if p[0] == player_id), None)
                 if player:
                     _, name, pos, ovr, age = player
-                    offering_items.append(f"**{name}** ({pos}, {age}, {ovr})")
+                    offering_items.append(f"{name} ({pos}, {age}, {ovr})")
 
         # Add receiving draft picks first (at top)
         if self.receiving_picks:
@@ -2039,7 +2037,7 @@ class TradeOfferView(discord.ui.View):
                     pick_display = self.parent_cog.format_pick_display(
                         pick_number, season_number, round_number, emoji_id, self.current_season
                     )
-                    receiving_items.append(f"**{pick_display}**")
+                    receiving_items.append(f"{pick_display}")
 
         # Add receiving players
         if self.receiving_players:
@@ -2047,20 +2045,20 @@ class TradeOfferView(discord.ui.View):
                 player = next((p for p in self.receiving_roster if p[0] == player_id), None)
                 if player:
                     _, name, pos, ovr, age = player
-                    receiving_items.append(f"**{name}** ({pos}, {age}, {ovr})")
+                    receiving_items.append(f"{name} ({pos}, {age}, {ovr})")
 
         # Show what each team receives (emoji only, or "Select team" if not selected)
         receiving_field_name = self.receiving_emoji if self.receiving_emoji else "Select team"
         initiating_field_name = self.initiating_emoji if self.initiating_emoji else self.initiating_team_name
 
         embed.add_field(
-            name=f"**{receiving_field_name} receive:**",
+            name=f"**{receiving_field_name} RECEIVE:**",
             value="\n".join(offering_items) if offering_items else "*Nothing selected*",
             inline=True
         )
 
         embed.add_field(
-            name=f"**{initiating_field_name} receive:**",
+            name=f"**{initiating_field_name} RECEIVE:**",
             value="\n".join(receiving_items) if receiving_items else "*Nothing selected*",
             inline=True
         )
@@ -2179,7 +2177,7 @@ class TradeOfferView(discord.ui.View):
                             pick_display = self.parent_cog.format_pick_display(
                                 pick_number, season_number, round_number, emoji_id, self.current_season
                             )
-                            offering_items.append(f"**{pick_display}**")
+                            offering_items.append(f"{pick_display}")
 
                 # Add initiating players
                 if self.initiating_players:
@@ -2187,7 +2185,7 @@ class TradeOfferView(discord.ui.View):
                         player = next((p for p in self.initiating_roster if p[0] == player_id), None)
                         if player:
                             _, name, pos, ovr, age = player
-                            offering_items.append(f"**{name}** ({pos}, {age}, {ovr})")
+                            offering_items.append(f"{name} ({pos}, {age}, {ovr})")
 
                 # Add receiving picks
                 if self.receiving_picks:
@@ -2198,7 +2196,7 @@ class TradeOfferView(discord.ui.View):
                             pick_display = self.parent_cog.format_pick_display(
                                 pick_number, season_number, round_number, emoji_id, self.current_season
                             )
-                            receiving_items.append(f"**{pick_display}**")
+                            receiving_items.append(f"{pick_display}")
 
                 # Add receiving players
                 if self.receiving_players:
@@ -2206,18 +2204,18 @@ class TradeOfferView(discord.ui.View):
                         player = next((p for p in self.receiving_roster if p[0] == player_id), None)
                         if player:
                             _, name, pos, ovr, age = player
-                            receiving_items.append(f"**{name}** ({pos}, {age}, {ovr})")
+                            receiving_items.append(f"{name} ({pos}, {age}, {ovr})")
 
                 receiving_emoji_str = f"{self.receiving_emoji} " if self.receiving_emoji else ""
 
                 embed.add_field(
-                    name=f"**{receiving_emoji_str}receive:**",
+                    name=f"**{receiving_emoji_str}RECEIVE:**",
                     value="\n".join(offering_items) if offering_items else "*Nothing*",
                     inline=True
                 )
 
                 embed.add_field(
-                    name=f"**{initiating_emoji_str}receive:**",
+                    name=f"**{initiating_emoji_str}RECEIVE:**",
                     value="\n".join(receiving_items) if receiving_items else "*Nothing*",
                     inline=True
                 )
@@ -2489,13 +2487,8 @@ class TradeResponseView(discord.ui.View):
     @discord.ui.button(label="Respond to Offer", style=discord.ButtonStyle.primary)
     async def respond_trade(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Check if user is admin
-        is_admin = False
-        if interaction.guild.owner_id == interaction.user.id:
-            is_admin = True
-        elif ADMIN_ROLE_ID:
-            admin_role_id = int(ADMIN_ROLE_ID) if isinstance(ADMIN_ROLE_ID, str) else ADMIN_ROLE_ID
-            if any(role.id == admin_role_id for role in interaction.user.roles):
-                is_admin = True
+        parent_cog = self.bot.get_cog('TradeCommands')
+        is_admin = await parent_cog.is_admin(interaction) if parent_cog else False
 
         # Verify user has the team role and get team info
         async with aiosqlite.connect(DB_PATH) as db:
@@ -2611,7 +2604,7 @@ class TradeResponseView(discord.ui.View):
                         f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                         initiating_players
                     )
-                    initiating_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                    initiating_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             # Get picks in receiving offer
             if receiving_picks_json:
@@ -2627,29 +2620,29 @@ class TradeResponseView(discord.ui.View):
                         f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                         receiving_players
                     )
-                    receiving_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                    receiving_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
         # Send to approval channel
         channel = self.bot.get_channel(approval_channel_id)
         if channel:
             embed = discord.Embed(
-                title=f"⚖️ Trade Pending Mod Approval: {init_emoji_str}**{init_team_name}** ↔️ {recv_emoji_str}**{recv_team_name}**",
+                title="⚖️ Trade Pending Mod Approval",
                 color=discord.Color.orange()
             )
 
             embed.add_field(
-                name=f"**{recv_emoji_str}receive:**",
+                name=f"**{recv_emoji_str}RECEIVE:**",
                 value="\n".join(initiating_items) if initiating_items else "*Nothing*",
                 inline=True
             )
 
             embed.add_field(
-                name=f"**{init_emoji_str}receive:**",
+                name=f"**{init_emoji_str}RECEIVE:**",
                 value="\n".join(receiving_items) if receiving_items else "*Nothing*",
                 inline=True
             )
 
-            embed.set_footer(text=f"Trade ID: {self.trade_id}")
+            embed.set_footer(text=f"Trade ID: {self.trade_id} • Use /pendingtrades if the buttons stop working")
 
             view = RespondToTradeView(self.trade_id, self.bot)
             await channel.send(embed=embed, view=view)
@@ -2703,15 +2696,8 @@ class ModeratorApprovalView(discord.ui.View):
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.green, custom_id="approve_trade")
     async def approve_trade(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Check if user is admin
-        is_admin = False
-        if interaction.guild.owner_id == interaction.user.id:
-            is_admin = True
-        elif ADMIN_ROLE_ID:
-            member = interaction.guild.get_member(interaction.user.id)
-            if member:
-                admin_role_id = int(ADMIN_ROLE_ID) if isinstance(ADMIN_ROLE_ID, str) else ADMIN_ROLE_ID
-                if any(role.id == admin_role_id for role in member.roles):
-                    is_admin = True
+        parent_cog = self.bot.get_cog('TradeCommands')
+        is_admin = await parent_cog.is_admin(interaction) if parent_cog else False
 
         if not is_admin:
             await interaction.response.send_message("❌ Only moderators can approve trades!", ephemeral=True)
@@ -2723,15 +2709,8 @@ class ModeratorApprovalView(discord.ui.View):
     @discord.ui.button(label="Veto", style=discord.ButtonStyle.red, custom_id="veto_trade")
     async def veto_trade(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Check if user is admin
-        is_admin = False
-        if interaction.guild.owner_id == interaction.user.id:
-            is_admin = True
-        elif ADMIN_ROLE_ID:
-            member = interaction.guild.get_member(interaction.user.id)
-            if member:
-                admin_role_id = int(ADMIN_ROLE_ID) if isinstance(ADMIN_ROLE_ID, str) else ADMIN_ROLE_ID
-                if any(role.id == admin_role_id for role in member.roles):
-                    is_admin = True
+        parent_cog = self.bot.get_cog('TradeCommands')
+        is_admin = await parent_cog.is_admin(interaction) if parent_cog else False
 
         if not is_admin:
             await interaction.response.send_message("❌ Only moderators can veto trades!", ephemeral=True)
@@ -2787,7 +2766,7 @@ class ModeratorApprovalView(discord.ui.View):
                         f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                         initiating_players
                     )
-                    init_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                    init_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
                 # Get pick details for receiving team
                 if recv_picks_json:
@@ -2801,7 +2780,7 @@ class ModeratorApprovalView(discord.ui.View):
                         f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                         receiving_players
                     )
-                    recv_items.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                    recv_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             await db.commit()
 
@@ -2834,13 +2813,13 @@ class ModeratorApprovalView(discord.ui.View):
                     )
 
                     embed.add_field(
-                        name=f"**{recv_emoji_str}receive:**",
+                        name=f"**{recv_emoji_str}RECEIVE:**",
                         value="\n".join(init_items) if init_items else "*Nothing*",
                         inline=True
                     )
 
                     embed.add_field(
-                        name=f"**{init_emoji_str}receive:**",
+                        name=f"**{init_emoji_str}RECEIVE:**",
                         value="\n".join(recv_items) if recv_items else "*Nothing*",
                         inline=True
                     )
@@ -2859,13 +2838,13 @@ class ModeratorApprovalView(discord.ui.View):
                     )
 
                     embed.add_field(
-                        name=f"**{recv_emoji_str}receive:**",
+                        name=f"**{recv_emoji_str}RECEIVE:**",
                         value="\n".join(init_items) if init_items else "*Nothing*",
                         inline=True
                     )
 
                     embed.add_field(
-                        name=f"**{init_emoji_str}receive:**",
+                        name=f"**{init_emoji_str}RECEIVE:**",
                         value="\n".join(recv_items) if recv_items else "*Nothing*",
                         inline=True
                     )
@@ -3029,7 +3008,7 @@ class ModeratorApprovalView(discord.ui.View):
                     f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                     recv_players
                 )
-                init_receiving.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                init_receiving.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             # Get picks that receiving team receives
             if init_picks_json:
@@ -3043,7 +3022,7 @@ class ModeratorApprovalView(discord.ui.View):
                     f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
                     init_players
                 )
-                recv_receiving.extend([f"**{name}** ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+                recv_receiving.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
             # Get trade log channel
             cursor = await db.execute(
@@ -3053,18 +3032,21 @@ class ModeratorApprovalView(discord.ui.View):
 
             await db.commit()
 
-            # Log to bot logs channel
-            if team_info:
-                bot_log_channel = await parent_cog.get_bot_logs_channel(db)
-                if bot_log_channel:
-                    log_init_team_name, log_init_channel_id, log_init_emoji_id, log_recv_team_name, log_recv_channel_id, log_recv_emoji_id = team_info
-                    init_emoji = self.bot.get_emoji(int(log_init_emoji_id)) if log_init_emoji_id else None
-                    recv_emoji = self.bot.get_emoji(int(log_recv_emoji_id)) if log_recv_emoji_id else None
-                    init_emoji_str = f"{init_emoji} " if init_emoji else ""
-                    recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
+            # Log to bot logs channel (best-effort - the trade above already succeeded)
+            try:
+                if team_info:
+                    bot_log_channel = await parent_cog.get_bot_logs_channel(db)
+                    if bot_log_channel:
+                        log_init_team_name, log_init_channel_id, log_init_emoji_id, log_recv_team_name, log_recv_channel_id, log_recv_emoji_id = team_info
+                        init_emoji = self.bot.get_emoji(int(log_init_emoji_id)) if log_init_emoji_id else None
+                        recv_emoji = self.bot.get_emoji(int(log_recv_emoji_id)) if log_recv_emoji_id else None
+                        init_emoji_str = f"{init_emoji} " if init_emoji else ""
+                        recv_emoji_str = f"{recv_emoji} " if recv_emoji else ""
 
-                    log_message = f"Admin approved trade between {init_emoji_str}and {recv_emoji_str}(Trade ID: {self.trade_id}) - {interaction.user.mention}"
-                    await bot_log_channel.send(log_message)
+                        log_message = f"Admin approved trade between {init_emoji_str}and {recv_emoji_str}(Trade ID: {self.trade_id}) - {interaction.user.mention}"
+                        await bot_log_channel.send(log_message)
+            except Exception as e:
+                print(f"Failed to log trade approval to bot logs channel: {e}")
 
         if not team_info:
             await interaction.response.send_message("❌ Team info not found!", ephemeral=True)
@@ -3085,31 +3067,41 @@ class ModeratorApprovalView(discord.ui.View):
         )
 
         embed.add_field(
-            name=f"**{init_emoji_str}receive:**",
+            name=f"**{init_emoji_str}RECEIVE:**",
             value="\n".join(init_receiving) if init_receiving else "*Nothing*",
             inline=True
         )
 
         embed.add_field(
-            name=f"**{recv_emoji_str}receive:**",
+            name=f"**{recv_emoji_str}RECEIVE:**",
             value="\n".join(recv_receiving) if recv_receiving else "*Nothing*",
             inline=True
         )
 
         embed.set_footer(text=f"Trade ID: {self.trade_id}")
 
-        # Send to trade log channel
-        if log_result and log_result[0]:
-            log_channel = self.bot.get_channel(int(log_result[0]))
-            if log_channel:
-                await log_channel.send(embed=embed)
+        # Announcements below are best-effort - the trade itself is already committed,
+        # so a failed send here must not be reported as the trade approval failing.
+        try:
+            # Send to trade log channel
+            if log_result and log_result[0]:
+                log_channel = self.bot.get_channel(int(log_result[0]))
+                if log_channel:
+                    message = await log_channel.send(embed=embed)
+                    # React with team emojis
+                    if init_emoji:
+                        await message.add_reaction(init_emoji)
+                    if recv_emoji:
+                        await message.add_reaction(recv_emoji)
 
-        # Send to both team channels
-        for channel_id in [init_channel_id, recv_channel_id]:
-            if channel_id:
-                channel = self.bot.get_channel(int(channel_id))
-                if channel:
-                    await channel.send(embed=embed)
+            # Send to both team channels
+            for channel_id in [init_channel_id, recv_channel_id]:
+                if channel_id:
+                    channel = self.bot.get_channel(int(channel_id))
+                    if channel:
+                        await channel.send(embed=embed)
+        except Exception as e:
+            print(f"Failed to send trade approval announcement: {e}")
 
         # Disable buttons
         for item in self.children:
