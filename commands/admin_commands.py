@@ -7,6 +7,7 @@ import io
 import json
 from config import DB_PATH, ADMIN_ROLE_ID
 from positions import validate_position, get_positions_string
+from utils import get_current_year, is_admin_user, get_team_emoji
 
 class AdminCommands(commands.Cog):
     def __init__(self, bot):
@@ -86,46 +87,19 @@ class AdminCommands(commands.Cog):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Check if user has admin permissions based on config"""
-        
-        # Check if user is server owner (always allowed)
-        if interaction.guild.owner_id == interaction.user.id:
+        if await is_admin_user(interaction):
             return True
-        
-        # If ADMIN_ROLE_ID is set, check for that specific role
+
         if ADMIN_ROLE_ID:
-            member = interaction.guild.get_member(interaction.user.id) or interaction.user
-            if member:
-                # Check if user has the admin role
-                admin_role_id = int(ADMIN_ROLE_ID) if isinstance(ADMIN_ROLE_ID, str) else ADMIN_ROLE_ID
-                if any(role.id == admin_role_id for role in member.roles):
-                    return True
-            
-            # If admin role is configured but user doesn't have it, deny access
             await interaction.response.send_message(
                 "❌ You need the admin role to use this command.",
                 ephemeral=True
             )
-            return False
-        
-        # Method 3: Fall back to administrator permissions if no admin role configured
-        try:
-            if interaction.user.guild_permissions.administrator:
-                return True
-        except:
-            pass
-        
-        # Method 4: Check roles directly for administrator permission
-        member = interaction.guild.get_member(interaction.user.id)
-        if member:
-            for role in member.roles:
-                if role.permissions.administrator:
-                    return True
-        
-        # If all methods fail
-        await interaction.response.send_message(
-            "❌ You need Administrator permissions to use this command.",
-            ephemeral=True
-        )
+        else:
+            await interaction.response.send_message(
+                "❌ You need Administrator permissions to use this command.",
+                ephemeral=True
+            )
         return False
 
     @app_commands.command(name="addteam", description="[ADMIN] Add a new team to the league")
@@ -555,26 +529,9 @@ class AdminCommands(commands.Cog):
                 team_id = team[0]
 
             # Calculate birth_year from age
-            cursor = await db.execute(
-                """SELECT season_number FROM seasons
-                   ORDER BY
-                       CASE status
-                           WHEN 'active' THEN 1
-                           WHEN 'offseason' THEN 2
-                           ELSE 3
-                       END,
-                       season_number DESC
-                   LIMIT 1"""
-            )
-            season_result = await cursor.fetchone()
-            current_season = season_result[0] if season_result else 1
-
-            cursor = await db.execute(
-                "SELECT setting_value FROM settings WHERE setting_key = 'season_1_year'"
-            )
-            setting_result = await cursor.fetchone()
-            season_1_year = int(setting_result[0]) if setting_result else current_season
-            current_year = season_1_year + (current_season - 1)
+            current_year = await get_current_year(db)
+            if current_year is None:
+                current_year = 1
             birth_year = current_year - age
 
             # Add player
@@ -720,26 +677,9 @@ class AdminCommands(commands.Cog):
 
             if age is not None:
                 # Calculate new birth_year from age
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                current_season = season_result[0] if season_result else 1
-
-                cursor = await db.execute(
-                    "SELECT setting_value FROM settings WHERE setting_key = 'season_1_year'"
-                )
-                setting_result = await cursor.fetchone()
-                season_1_year = int(setting_result[0]) if setting_result else current_season
-                current_year = season_1_year + (current_season - 1)
+                current_year = await get_current_year(db)
+                if current_year is None:
+                    current_year = 1
                 birth_year = current_year - age
 
                 updates.append("age = ?")
@@ -787,14 +727,8 @@ class AdminCommands(commands.Cog):
                     new_team_emoji_id = team_result[2]
 
                     # Get emoji for new team
-                    new_team_emoji = None
-                    if new_team_emoji_id:
-                        try:
-                            emoji_obj = interaction.client.get_emoji(int(new_team_emoji_id))
-                            if emoji_obj:
-                                new_team_emoji = str(emoji_obj)
-                        except:
-                            pass
+                    new_team_emoji_obj = get_team_emoji(interaction.client, new_team_emoji_id)
+                    new_team_emoji = str(new_team_emoji_obj) if new_team_emoji_obj else None
 
                     new_team_display = new_team_emoji if new_team_emoji else new_team_name
 
@@ -807,14 +741,8 @@ class AdminCommands(commands.Cog):
                     )
                     result = await cursor.fetchone()
                     if result and result[0]:
-                        try:
-                            emoji_obj = interaction.client.get_emoji(int(result[0]))
-                            if emoji_obj:
-                                old_team_display = str(emoji_obj)
-                            else:
-                                old_team_display = old_team_name
-                        except:
-                            old_team_display = old_team_name
+                        emoji_obj = get_team_emoji(interaction.client, result[0])
+                        old_team_display = str(emoji_obj) if emoji_obj else old_team_name
                     else:
                         old_team_display = old_team_name
 
@@ -1425,26 +1353,9 @@ class AdminCommands(commands.Cog):
                                 birth_year = int(row['Birth_Year'])
                             else:
                                 # Calculate birth_year from age
-                                cursor = await db.execute(
-                                    """SELECT season_number FROM seasons
-                                       ORDER BY
-                                           CASE status
-                                               WHEN 'active' THEN 1
-                                               WHEN 'offseason' THEN 2
-                                               ELSE 3
-                                           END,
-                                           season_number DESC
-                                       LIMIT 1"""
-                                )
-                                season_result = await cursor.fetchone()
-                                current_season = season_result[0] if season_result else 1
-
-                                cursor = await db.execute(
-                                    "SELECT setting_value FROM settings WHERE setting_key = 'season_1_year'"
-                                )
-                                setting_result = await cursor.fetchone()
-                                season_1_year = int(setting_result[0]) if setting_result else current_season
-                                current_year = season_1_year + (current_season - 1)
+                                current_year = await get_current_year(db)
+                                if current_year is None:
+                                    current_year = 1
                                 birth_year = current_year - age
 
                             # Get contract_expiry if present
@@ -1537,26 +1448,9 @@ class AdminCommands(commands.Cog):
                             age = int(row['Age'])
 
                             # Calculate birth_year from age
-                            cursor = await db.execute(
-                                """SELECT season_number FROM seasons
-                                   ORDER BY
-                                       CASE status
-                                           WHEN 'active' THEN 1
-                                           WHEN 'offseason' THEN 2
-                                           ELSE 3
-                                       END,
-                                       season_number DESC
-                                   LIMIT 1"""
-                            )
-                            season_result = await cursor.fetchone()
-                            current_season = season_result[0] if season_result else 1
-
-                            cursor = await db.execute(
-                                "SELECT setting_value FROM settings WHERE setting_key = 'season_1_year'"
-                            )
-                            setting_result = await cursor.fetchone()
-                            season_1_year = int(setting_result[0]) if setting_result else current_season
-                            current_year = season_1_year + (current_season - 1)
+                            current_year = await get_current_year(db)
+                            if current_year is None:
+                                current_year = 1
                             birth_year = current_year - age
 
                             # Get contract_expiry if present
@@ -1977,7 +1871,7 @@ class AdminCommands(commands.Cog):
                                     season_str = draft_name.split('Season')[1].split()[0]
                                     # Draft is for season_number + 1 (Season 9 Draft is for Season 10)
                                     season_number = int(season_str) + 1
-                                except:
+                                except Exception:
                                     pass
 
                             # Get or create draft_id
@@ -2128,7 +2022,7 @@ class AdminCommands(commands.Cog):
 
                         try:
                             age = int(float(age_str))  # Convert through float first to handle "19.0" format
-                        except:
+                        except Exception:
                             continue
 
                         # Process each OVR column
@@ -2142,7 +2036,7 @@ class AdminCommands(commands.Cog):
                                 # Column name might be int or string
                                 try:
                                     ovr = int(ovr_col)
-                                except:
+                                except Exception:
                                     ovr = int(float(str(ovr_col)))  # Handle string column names
                                 cell_map[(age, ovr)] = band
                             except Exception as e:

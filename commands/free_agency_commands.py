@@ -2,9 +2,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import aiosqlite
-from config import DB_PATH, ADMIN_ROLE_ID
-import json
-from datetime import datetime
+from config import DB_PATH
+from utils import get_current_season, is_admin_user, calculate_contract_expiry, get_team_emoji, get_team_emoji_str, get_user_team
 
 class FreeAgencyCommands(commands.Cog):
     def __init__(self, bot):
@@ -19,22 +18,10 @@ class FreeAgencyCommands(commands.Cog):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                if not season_result:
+                current_season = await get_current_season(db)
+                if current_season is None:
                     print("No active season found for view registration")
                     return
-                current_season = season_result[0]
 
                 # Check for active free agency period
                 cursor = await db.execute(
@@ -102,7 +89,7 @@ class FreeAgencyCommands(commands.Cog):
                     for team in teams
                     if current.lower() in team[0].lower()
                 ][:25]
-        except:
+        except Exception:
             return []
 
     async def free_agent_autocomplete(
@@ -114,21 +101,9 @@ class FreeAgencyCommands(commands.Cog):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season (active or offseason)
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                if not season_result:
+                current_season = await get_current_season(db)
+                if current_season is None:
                     return []
-                current_season = season_result[0]
 
                 # Get players whose contracts expired (contract_expiry = current season during offseason)
                 cursor = await db.execute(
@@ -148,7 +123,7 @@ class FreeAgencyCommands(commands.Cog):
                         choices.append(app_commands.Choice(name=display, value=str(player_id)))
 
                 return choices[:25]
-        except:
+        except Exception:
             return []
 
     async def get_auctions_log_channel(self, db):
@@ -160,7 +135,7 @@ class FreeAgencyCommands(commands.Cog):
         if result and result[0]:
             try:
                 return self.bot.get_channel(int(result[0]))
-            except:
+            except Exception:
                 return None
         return None
 
@@ -173,7 +148,7 @@ class FreeAgencyCommands(commands.Cog):
         if result and result[0]:
             try:
                 return self.bot.get_channel(int(result[0]))
-            except:
+            except Exception:
                 return None
         return None
 
@@ -214,9 +189,25 @@ class FreeAgencyCommands(commands.Cog):
         )
         free_agents = await cursor.fetchall()
 
+        # Load the compensation chart once and match bands in Python instead of
+        # issuing one query per free agent
+        cursor = await db.execute(
+            """SELECT min_age, max_age, min_ovr, max_ovr, compensation_band
+               FROM compensation_chart
+               ORDER BY compensation_band ASC"""
+        )
+        chart_rows = await cursor.fetchall()
+
+        def band_for(age, ovr):
+            for min_age, max_age, min_ovr, max_ovr, band in chart_rows:
+                if min_age <= age <= (max_age if max_age is not None else min_age) \
+                        and min_ovr <= ovr <= (max_ovr if max_ovr is not None else min_ovr):
+                    return band
+            return None
+
         credits = 0.0
         for player_id, age, ovr in free_agents:
-            band = await self.get_compensation_band(db, age, ovr)
+            band = band_for(age, ovr)
             if band == 1:
                 credits += 0.5
             elif band == 2:
@@ -251,7 +242,7 @@ class FreeAgencyCommands(commands.Cog):
             # Calculate new contract expiry
             # current_season is the season that just ended (Offseason 9 means Season 9 just ended)
             # Adding contract_years gives us the last season they'll play under the new contract
-            new_contract_expiry = current_season + contract_years
+            new_contract_expiry = calculate_contract_expiry(current_season, contract_years)
 
             # Update player's contract
             await db.execute(
@@ -292,14 +283,7 @@ class FreeAgencyCommands(commands.Cog):
         player_lines = []
         for name, pos, age, ovr, emoji_id, contract_expiry in resigns:
             # Get emoji
-            emoji_str = ""
-            if emoji_id:
-                try:
-                    emoji = self.bot.get_emoji(int(emoji_id))
-                    if emoji:
-                        emoji_str = f"{emoji} "
-                except:
-                    pass
+            emoji_str = get_team_emoji_str(self.bot, emoji_id)
 
             contract_years = contract_expiry - current_season
             player_lines.append(f"{emoji_str}**{name}** ({pos}, {age}, {ovr}) - **{contract_years} years**")
@@ -338,6 +322,14 @@ class FreeAgencyCommands(commands.Cog):
         except Exception as e:
             print(f"Error getting auctions log channel: {e}")
             return
+
+        # Get this period's auction points allowance
+        cursor = await db.execute(
+            "SELECT auction_points FROM free_agency_periods WHERE period_id = ?",
+            (period_id,)
+        )
+        period_result = await cursor.fetchone()
+        auction_points = period_result[0] if period_result else 300
 
         # Get all winning bids
         cursor = await db.execute(
@@ -379,28 +371,14 @@ class FreeAgencyCommands(commands.Cog):
                 (period_id, team_id, team_id)
             )
             spent = (await cursor.fetchone())[0]
-            team_points[team_id] = 300 - spent
+            team_points[team_id] = auction_points - spent
 
         player_lines = []
         for name, pos, age, ovr, orig_team, orig_emoji, bid_team, bid_emoji, winning_bid in winning_bids:
             # Get emojis
-            orig_emoji_str = ""
-            if orig_emoji:
-                try:
-                    emoji = self.bot.get_emoji(int(orig_emoji))
-                    if emoji:
-                        orig_emoji_str = f"{emoji} "
-                except:
-                    pass
+            orig_emoji_str = get_team_emoji_str(self.bot, orig_emoji)
 
-            bid_emoji_str = ""
-            if bid_emoji:
-                try:
-                    emoji = self.bot.get_emoji(int(bid_emoji))
-                    if emoji:
-                        bid_emoji_str = f"{emoji} "
-                except:
-                    pass
+            bid_emoji_str = get_team_emoji_str(self.bot, bid_emoji)
 
             # Check if RFA (can match at 80%)
             is_rfa = age <= 25
@@ -508,23 +486,13 @@ class FreeAgencyCommands(commands.Cog):
         movement_lines = []
         for name, pos, age, ovr, orig_emoji, new_emoji, comp_band, comp_pick_id in transfers:
             # Get emojis
-            orig_emoji_str = ""
-            if orig_emoji:
-                try:
-                    emoji = self.bot.get_emoji(int(orig_emoji))
-                    if emoji:
-                        orig_emoji_str = f"{emoji} "
-                except:
-                    pass
+            orig_emoji_str = get_team_emoji_str(self.bot, orig_emoji)
 
             new_emoji_str = ""
             if new_emoji:
-                try:
-                    emoji = self.bot.get_emoji(int(new_emoji))
-                    if emoji:
-                        new_emoji_str = f" → {emoji}"
-                except:
-                    pass
+                emoji = get_team_emoji(self.bot, new_emoji)
+                if emoji:
+                    new_emoji_str = f" → {emoji}"
 
             # Build player line (no team names)
             player_line = f"{orig_emoji_str}**{name}** ({pos}, {age}, {ovr}){new_emoji_str}"
@@ -601,23 +569,10 @@ class FreeAgencyCommands(commands.Cog):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season (active or offseason)
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                if not season_result:
+                current_season = await get_current_season(db)
+                if current_season is None:
                     await interaction.followup.send("❌ No active season found!")
                     return
-
-                current_season = season_result[0]
 
                 # Build query based on team filter
                 if team:
@@ -690,22 +645,10 @@ class FreeAgencyCommands(commands.Cog):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season (active or offseason)
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                if not season_result:
+                current_season = await get_current_season(db)
+                if current_season is None:
                     await interaction.followup.send("❌ No active season found!")
                     return
-                current_season = season_result[0]
 
                 # Check if there's an active bidding period
                 cursor = await db.execute(
@@ -743,16 +686,7 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Get user's team
-                user_team_id = None
-                for role in interaction.user.roles:
-                    cursor = await db.execute(
-                        "SELECT team_id FROM teams WHERE role_id = ?",
-                        (str(role.id),)
-                    )
-                    team_result = await cursor.fetchone()
-                    if team_result:
-                        user_team_id = team_result[0]
-                        break
+                user_team_id, _ = await get_user_team(db, interaction.user)
 
                 if not user_team_id:
                     await interaction.followup.send("❌ You don't have a team role!")
@@ -825,24 +759,10 @@ class FreeAgencyCommands(commands.Cog):
                         bidding_team_name = bidding_team_data[0] if bidding_team_data else "Unknown Team"
                         bidding_emoji_id = bidding_team_data[1] if bidding_team_data and bidding_team_data[1] else None
 
-                        bidding_emoji_str = ""
-                        if bidding_emoji_id:
-                            try:
-                                emoji = self.bot.get_emoji(int(bidding_emoji_id))
-                                if emoji:
-                                    bidding_emoji_str = f"{emoji} "
-                            except:
-                                pass
+                        bidding_emoji_str = get_team_emoji_str(self.bot, bidding_emoji_id)
 
                         # Get player's original team emoji
-                        original_emoji_str = ""
-                        if emoji_id:
-                            try:
-                                emoji = self.bot.get_emoji(int(emoji_id))
-                                if emoji:
-                                    original_emoji_str = f"{emoji} "
-                            except:
-                                pass
+                        original_emoji_str = get_team_emoji_str(self.bot, emoji_id)
 
                         action_text = "updated their bid on" if existing_bid else "placed a bid on"
                         await log_channel.send(f"💰 {bidding_emoji_str}**{bidding_team_name}** {action_text} {original_emoji_str}**{player_name}**: {amount}pts ({interaction.user.mention})")
@@ -850,14 +770,7 @@ class FreeAgencyCommands(commands.Cog):
                     print(f"Failed to log bid to bot logs channel: {e}")
 
                 # Get emoji
-                emoji_str = ""
-                if emoji_id:
-                    try:
-                        emoji = self.bot.get_emoji(int(emoji_id))
-                        if emoji:
-                            emoji_str = f"{emoji} "
-                    except:
-                        pass
+                emoji_str = get_team_emoji_str(self.bot, emoji_id)
 
                 # Calculate new remaining points after this bid
                 # spent_points already excludes the old bid if it existed
@@ -898,22 +811,10 @@ class FreeAgencyCommands(commands.Cog):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season (active or offseason)
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                if not season_result:
+                current_season = await get_current_season(db)
+                if current_season is None:
                     await interaction.followup.send("❌ No active season found!")
                     return
-                current_season = season_result[0]
 
                 # Check if there's an active bidding period
                 cursor = await db.execute(
@@ -933,17 +834,7 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Get user's team
-                user_team_id = None
-                user_team_name = None
-                for role in interaction.user.roles:
-                    cursor = await db.execute(
-                        "SELECT team_id, team_name FROM teams WHERE role_id = ?",
-                        (str(role.id),)
-                    )
-                    team_result = await cursor.fetchone()
-                    if team_result:
-                        user_team_id, user_team_name = team_result
-                        break
+                user_team_id, user_team_name = await get_user_team(db, interaction.user)
 
                 if not user_team_id:
                     await interaction.followup.send("❌ You don't have a team role!")
@@ -992,22 +883,9 @@ class FreeAgencyCommands(commands.Cog):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                if not season_result:
+                current_season = await get_current_season(db)
+                if current_season is None:
                     return [app_commands.Choice(name="Check Status", value="check_status")]
-
-                current_season = season_result[0]
 
                 # Check if there's an existing period
                 cursor = await db.execute(
@@ -1035,7 +913,7 @@ class FreeAgencyCommands(commands.Cog):
                         choices.append(app_commands.Choice(name="End Matching Period", value="end_matching"))
 
                 return choices
-        except:
+        except Exception:
             return [app_commands.Choice(name="Check Status", value="check_status")]
 
     @app_commands.command(name="freeagencyperiod", description="[ADMIN] Control free agency periods")
@@ -1043,7 +921,7 @@ class FreeAgencyCommands(commands.Cog):
     @app_commands.autocomplete(action=period_action_autocomplete)
     async def free_agency_period(self, interaction: discord.Interaction, action: str):
         # Check if user has admin role
-        if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
+        if not await is_admin_user(interaction):
             await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
             return
 
@@ -1071,22 +949,10 @@ class FreeAgencyCommands(commands.Cog):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                if not season_result:
+                current_season = await get_current_season(db)
+                if current_season is None:
                     await interaction.followup.send("❌ No active season found!")
                     return
-                current_season = season_result[0]
 
                 # Check if there's an existing period
                 cursor = await db.execute(
@@ -1214,22 +1080,10 @@ class FreeAgencyCommands(commands.Cog):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                if not season_result:
+                current_season = await get_current_season(db)
+                if current_season is None:
                     await interaction.followup.send("❌ No active season found!")
                     return
-                current_season = season_result[0]
 
                 # Check if there's an active resign period
                 cursor = await db.execute(
@@ -1308,22 +1162,10 @@ class FreeAgencyCommands(commands.Cog):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season (active or offseason)
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                if not season_result:
+                current_season = await get_current_season(db)
+                if current_season is None:
                     await interaction.followup.send("❌ No active season found!")
                     return
-                current_season = season_result[0]
 
                 # Check if period already exists
                 cursor = await db.execute(
@@ -1368,16 +1210,15 @@ class FreeAgencyCommands(commands.Cog):
 
                 # Send notifications to eligible teams
                 notifications_sent = 0
-                debug_info = []  # For debugging
+                skipped_teams = []  # Teams eligible but not notified, with a reason
 
                 for team_id, team_name, channel_id in teams_with_fas:
                     # Calculate how many free re-signs this team gets
                     allowance = await self.calculate_free_resign_allowance(db, team_id, current_season)
-                    debug_info.append(f"{team_name}: allowance={allowance}, channel_id={channel_id}")
 
                     if allowance > 0:
                         if not channel_id:
-                            debug_info.append(f"  → Skipped (no channel)")
+                            skipped_teams.append(f"{team_name}: no channel configured")
                             continue
 
                         # Get the team's free agents
@@ -1420,22 +1261,22 @@ class FreeAgencyCommands(commands.Cog):
                             if channel:
                                 await channel.send(embed=embed, view=view)
                                 notifications_sent += 1
-                                debug_info.append(f"  → Sent notification")
                             else:
-                                debug_info.append(f"  → Channel not found (ID: {channel_id})")
+                                skipped_teams.append(f"{team_name}: channel not found (ID: {channel_id})")
                         except Exception as e:
-                            debug_info.append(f"  → Error: {e}")
+                            skipped_teams.append(f"{team_name}: {e}")
                             print(f"Error sending notification to {team_name}: {e}")
 
-                # Build response with debug info
+                # Build response
                 response = (
                     f"✅ **Free Re-Sign Period Started!**\n\n"
                     f"Season: {current_season}\n"
                     f"Free Agents: {fa_count}\n"
                     f"Notifications sent: {notifications_sent} teams with free re-sign allowances\n\n"
-                    f"**Debug Info:**\n" + "\n".join(debug_info[:20]) + "\n\n"  # Limit to first 20 teams
-                    f"Once all teams have confirmed their free re-signs, you can start the bidding period."
                 )
+                if skipped_teams:
+                    response += f"⚠️ **Not notified:**\n" + "\n".join(skipped_teams[:20]) + "\n\n"
+                response += f"Once all teams have confirmed their free re-signs, you can start the bidding period."
 
                 await interaction.followup.send(response)
 
@@ -1447,22 +1288,10 @@ class FreeAgencyCommands(commands.Cog):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season (active or offseason)
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                if not season_result:
+                current_season = await get_current_season(db)
+                if current_season is None:
                     await interaction.followup.send("❌ No active season found!")
                     return
-                current_season = season_result[0]
 
                 # Check if period already exists
                 cursor = await db.execute(
@@ -1576,26 +1405,14 @@ class FreeAgencyCommands(commands.Cog):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season (active or offseason)
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                if not season_result:
+                current_season = await get_current_season(db)
+                if current_season is None:
                     await interaction.followup.send("❌ No active season found!")
                     return
-                current_season = season_result[0]
 
                 # Get period
                 cursor = await db.execute(
-                    "SELECT period_id, status FROM free_agency_periods WHERE season_number = ?",
+                    "SELECT period_id, status, auction_points FROM free_agency_periods WHERE season_number = ?",
                     (current_season,)
                 )
                 period_result = await cursor.fetchone()
@@ -1603,7 +1420,7 @@ class FreeAgencyCommands(commands.Cog):
                     await interaction.followup.send("❌ No free agency period found! Start bidding first.")
                     return
 
-                period_id, status = period_result
+                period_id, status, auction_points = period_result
                 if status != 'bidding':
                     await interaction.followup.send(f"❌ Period is not in bidding status (current: {status})")
                     return
@@ -1711,7 +1528,7 @@ class FreeAgencyCommands(commands.Cog):
                         player_bids = await cursor.fetchall()
 
                         if player_bids:
-                            # Calculate remaining points for this team (300 - winning bids on other teams' players)
+                            # Calculate remaining points for this team (auction_points - winning bids on other teams' players)
                             cursor = await db.execute(
                                 """SELECT COALESCE(SUM(b.bid_amount), 0)
                                    FROM free_agency_bids b
@@ -1721,7 +1538,7 @@ class FreeAgencyCommands(commands.Cog):
                                 (period_id, team_id, team_id)
                             )
                             winning_bid_total = (await cursor.fetchone())[0]
-                            remaining_points = 300 - winning_bid_total
+                            remaining_points = auction_points - winning_bid_total
 
                             channel = self.bot.get_channel(int(channel_id))
                             if channel:
@@ -1750,22 +1567,10 @@ class FreeAgencyCommands(commands.Cog):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                if not season_result:
+                current_season = await get_current_season(db)
+                if current_season is None:
                     await interaction.followup.send("❌ No active season found!")
                     return
-                current_season = season_result[0]
 
                 # Get period
                 cursor = await db.execute(
@@ -1795,26 +1600,14 @@ class FreeAgencyCommands(commands.Cog):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                if not season_result:
+                current_season = await get_current_season(db)
+                if current_season is None:
                     await interaction.followup.send("❌ No active season found!")
                     return
-                current_season = season_result[0]
 
                 # Get period
                 cursor = await db.execute(
-                    "SELECT period_id, status FROM free_agency_periods WHERE season_number = ?",
+                    "SELECT period_id, status, auction_points FROM free_agency_periods WHERE season_number = ?",
                     (current_season,)
                 )
                 period_result = await cursor.fetchone()
@@ -1822,7 +1615,7 @@ class FreeAgencyCommands(commands.Cog):
                     await interaction.followup.send("❌ No free agency period found!")
                     return
 
-                period_id, status = period_result
+                period_id, status, auction_points = period_result
                 if status != 'matching':
                     await interaction.followup.send(f"❌ Period is not in matching status (current: {status})")
                     return
@@ -1854,7 +1647,7 @@ class FreeAgencyCommands(commands.Cog):
                         player_bids = await cursor.fetchall()
 
                         if player_bids:
-                            # Calculate remaining points for this team (300 - winning bids on other teams' players)
+                            # Calculate remaining points for this team (auction_points - winning bids on other teams' players)
                             cursor = await db.execute(
                                 """SELECT COALESCE(SUM(b.bid_amount), 0)
                                    FROM free_agency_bids b
@@ -1864,7 +1657,7 @@ class FreeAgencyCommands(commands.Cog):
                                 (period_id, team_id, team_id)
                             )
                             winning_bid_total = (await cursor.fetchone())[0]
-                            remaining_points = 300 - winning_bid_total
+                            remaining_points = auction_points - winning_bid_total
 
                             channel = self.bot.get_channel(int(channel_id))
                             if channel:
@@ -1898,13 +1691,7 @@ class FreeAgencyCommands(commands.Cog):
                     continue
 
                 # Get team emoji
-                team_emoji = ""
-                if emoji_id:
-                    try:
-                        emoji = self.bot.get_emoji(int(emoji_id))
-                        team_emoji = str(emoji) + " " if emoji else ""
-                    except:
-                        pass
+                team_emoji = get_team_emoji_str(self.bot, emoji_id)
 
                 # Get players gained (won bids)
                 cursor = await db.execute(
@@ -1960,13 +1747,7 @@ class FreeAgencyCommands(commands.Cog):
                 gained_text = ""
                 if players_gained:
                     for player_name, pos, age, ovr, prev_emoji_id in players_gained:
-                        prev_emoji = ""
-                        if prev_emoji_id:
-                            try:
-                                emoji = self.bot.get_emoji(int(prev_emoji_id))
-                                prev_emoji = str(emoji) + " " if emoji else ""
-                            except:
-                                pass
+                        prev_emoji = get_team_emoji_str(self.bot, prev_emoji_id)
                         gained_text += f"{prev_emoji}**{player_name}** ({pos}, {age}, {ovr})\n"
                 else:
                     gained_text = "*None*"
@@ -1990,11 +1771,8 @@ class FreeAgencyCommands(commands.Cog):
                         # Get new team emoji
                         new_team_emoji = ""
                         if new_team_emoji_id:
-                            try:
-                                emoji = self.bot.get_emoji(int(new_team_emoji_id))
-                                new_team_emoji = " → " + str(emoji) if emoji else ""
-                            except:
-                                pass
+                            emoji = get_team_emoji(self.bot, new_team_emoji_id)
+                            new_team_emoji = " → " + str(emoji) if emoji else ""
 
                         lost_text += f"**{player_name}** ({pos}, {age}, {ovr}){new_team_emoji}\n"
                         if comp_band and pick_num:
@@ -2033,26 +1811,14 @@ class FreeAgencyCommands(commands.Cog):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season (active or offseason)
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                if not season_result:
+                current_season = await get_current_season(db)
+                if current_season is None:
                     await interaction.followup.send("❌ No active season found!")
                     return
-                current_season = season_result[0]
 
                 # Get period
                 cursor = await db.execute(
-                    "SELECT period_id, status FROM free_agency_periods WHERE season_number = ?",
+                    "SELECT period_id, status, auction_points FROM free_agency_periods WHERE season_number = ?",
                     (current_season,)
                 )
                 period_result = await cursor.fetchone()
@@ -2060,7 +1826,7 @@ class FreeAgencyCommands(commands.Cog):
                     await interaction.followup.send("❌ No free agency period found!")
                     return
 
-                period_id, status = period_result
+                period_id, status, auction_points = period_result
                 if status != 'matching':
                     await interaction.followup.send(f"❌ Period is not in matching status (current: {status})")
                     return
@@ -2122,7 +1888,7 @@ class FreeAgencyCommands(commands.Cog):
                     contract_years = await self.get_contract_years_for_age(db, age)
                     # current_season is the season that just ended (Offseason 9 means Season 9 just ended)
                     # Adding contract_years gives us the last season they'll play under the new contract
-                    new_contract_expiry = current_season + contract_years
+                    new_contract_expiry = calculate_contract_expiry(current_season, contract_years)
 
                     if winning_team_id is None:
                         # No bids - auto re-sign with original team
@@ -2353,17 +2119,7 @@ class FreeAgencyCommands(commands.Cog):
                 # If no team specified, get user's team
                 if team is None:
                     # Get user's team from roles
-                    user_team_id = None
-                    user_team_name = None
-                    for role in interaction.user.roles:
-                        cursor = await db.execute(
-                            "SELECT team_id, team_name FROM teams WHERE role_id = ?",
-                            (str(role.id),)
-                        )
-                        team_result = await cursor.fetchone()
-                        if team_result:
-                            user_team_id, user_team_name = team_result
-                            break
+                    user_team_id, user_team_name = await get_user_team(db, interaction.user)
 
                     if not user_team_id:
                         await interaction.followup.send("❌ You don't have a team role! Please specify a team.")
@@ -2580,14 +2336,7 @@ class FreeAgentsView(discord.ui.View):
             players = team_data['players']
 
             # Get emoji
-            emoji_str = ""
-            if team_data['emoji_id']:
-                try:
-                    emoji = self.bot.get_emoji(int(team_data['emoji_id']))
-                    if emoji:
-                        emoji_str = f"{emoji} "
-                except:
-                    pass
+            emoji_str = get_team_emoji_str(self.bot, team_data['emoji_id'])
 
             # Add all players from this team with team emoji and RFA status
             for name, pos, age, ovr in players:
@@ -2633,23 +2382,11 @@ class MatchingNotificationView(discord.ui.View):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                current_season = season_result[0] if season_result else None
+                current_season = await get_current_season(db)
 
                 # Check if period is still active
                 cursor = await db.execute(
-                    "SELECT status FROM free_agency_periods WHERE period_id = ?",
+                    "SELECT status, auction_points FROM free_agency_periods WHERE period_id = ?",
                     (self.period_id,)
                 )
                 period_result = await cursor.fetchone()
@@ -2659,6 +2396,7 @@ class MatchingNotificationView(discord.ui.View):
                         ephemeral=True
                     )
                     return
+                auction_points = period_result[1]
 
                 # Get team info
                 cursor = await db.execute(
@@ -2707,7 +2445,7 @@ class MatchingNotificationView(discord.ui.View):
                         (self.period_id, self.team_id, self.team_id)
                     )
                     winning_bid_total = (await cursor.fetchone())[0]
-                    remaining_points = 300 - winning_bid_total
+                    remaining_points = auction_points - winning_bid_total
 
                     # Create matching view and set it to confirmed state
                     # Remove the extra fields from player_bids tuples (matched and confirmed_at)
@@ -2752,7 +2490,7 @@ class MatchingNotificationView(discord.ui.View):
                         (self.period_id, self.team_id, self.team_id)
                     )
                     winning_bid_total = (await cursor.fetchone())[0]
-                    remaining_points = 300 - winning_bid_total
+                    remaining_points = auction_points - winning_bid_total
 
                     # Remove the extra fields from player_bids tuples (matched and confirmed_at)
                     cleaned_player_bids = [(pid, name, pos, age, ovr, wtid, tname, emoji, bid)
@@ -2785,14 +2523,7 @@ class MatchingNotificationView(discord.ui.View):
         player_lines = []
         for player_id, name, pos, age, ovr, winning_team_id, bidding_team, emoji_id, bid in player_bids:
             # Get emoji
-            emoji_str = ""
-            if emoji_id:
-                try:
-                    emoji = bot.get_emoji(int(emoji_id))
-                    if emoji:
-                        emoji_str = f"{emoji} "
-                except:
-                    pass
+            emoji_str = get_team_emoji_str(bot, emoji_id)
 
             # Check if RFA (age <= 25) and calculate match cost
             is_rfa = age <= 25
@@ -2928,33 +2659,32 @@ class MatchingView(discord.ui.View):
             inline=False
         )
 
-        # Get compensation bands for all players
+        # Get compensation bands for all players (load chart once, match in Python
+        # instead of one query per player)
         async with aiosqlite.connect(DB_PATH) as db:
-            compensation_bands = {}
-            for player_id, name, pos, age, ovr, winning_team_id, bidding_team, emoji_id, bid in self.player_bids:
-                cursor = await db.execute(
-                    """SELECT compensation_band FROM compensation_chart
-                       WHERE min_age <= ? AND COALESCE(max_age, min_age) >= ?
-                       AND min_ovr <= ? AND COALESCE(max_ovr, min_ovr) >= ?
-                       ORDER BY compensation_band ASC
-                       LIMIT 1""",
-                    (age, age, ovr, ovr)
-                )
-                result = await cursor.fetchone()
-                compensation_bands[player_id] = result[0] if result else None
+            cursor = await db.execute(
+                """SELECT min_age, max_age, min_ovr, max_ovr, compensation_band
+                   FROM compensation_chart
+                   ORDER BY compensation_band ASC"""
+            )
+            chart_rows = await cursor.fetchall()
+
+        def band_for(age, ovr):
+            for min_age, max_age, min_ovr, max_ovr, band in chart_rows:
+                if min_age <= age <= (max_age if max_age is not None else min_age) \
+                        and min_ovr <= ovr <= (max_ovr if max_ovr is not None else min_ovr):
+                    return band
+            return None
+
+        compensation_bands = {}
+        for player_id, name, pos, age, ovr, winning_team_id, bidding_team, emoji_id, bid in self.player_bids:
+            compensation_bands[player_id] = band_for(age, ovr)
 
         # List each player with current match status
         player_lines = []
         for player_id, name, pos, age, ovr, winning_team_id, bidding_team, emoji_id, bid in self.player_bids:
             # Get emoji
-            emoji_str = ""
-            if emoji_id:
-                try:
-                    emoji = self.bot.get_emoji(int(emoji_id))
-                    if emoji:
-                        emoji_str = f"{emoji} "
-                except:
-                    pass
+            emoji_str = get_team_emoji_str(self.bot, emoji_id)
 
             is_matched = self.matches.get(player_id, False)
             status = "✅ MATCH" if is_matched else "❌ LET GO"
@@ -3077,14 +2807,7 @@ class MatchingView(discord.ui.View):
                         team_name = team_data[0] if team_data else "Unknown Team"
                         emoji_id = team_data[1] if team_data and team_data[1] else None
 
-                        emoji_str = ""
-                        if emoji_id:
-                            try:
-                                emoji = self.bot.get_emoji(int(emoji_id))
-                                if emoji:
-                                    emoji_str = f"{emoji} "
-                            except:
-                                pass
+                        emoji_str = get_team_emoji_str(self.bot, emoji_id)
 
                         matched_count = sum(1 for m in self.matches.values() if m)
                         let_go_count = len(self.matches) - matched_count
@@ -3274,14 +2997,7 @@ class AuctionsMenuView(discord.ui.View):
             bid_lines = []
             for bid_id, player_id, amount, player_name, pos, age, ovr, team_name_player, emoji_id in self.bids:
                 # Get emoji
-                emoji_str = ""
-                if emoji_id:
-                    try:
-                        emoji = self.bot.get_emoji(int(emoji_id))
-                        if emoji:
-                            emoji_str = f"{emoji} "
-                    except:
-                        pass
+                emoji_str = get_team_emoji_str(self.bot, emoji_id)
 
                 bid_lines.append(f"• {emoji_str}**{player_name}** ({pos}, {age}, {ovr}) - {team_name_player} - **{amount} pts**")
 
@@ -3346,14 +3062,7 @@ class AuctionsMenuView(discord.ui.View):
                         team_name = team_data[0] if team_data else "Unknown Team"
                         emoji_id = team_data[1] if team_data and team_data[1] else None
 
-                        emoji_str = ""
-                        if emoji_id:
-                            try:
-                                emoji = self.bot.get_emoji(int(emoji_id))
-                                if emoji:
-                                    emoji_str = f"{emoji} "
-                            except:
-                                pass
+                        emoji_str = get_team_emoji_str(self.bot, emoji_id)
 
                         # Get withdrawn bids for logging
                         withdrawn_bids_temp = [b for b in self.bids if b[0] in selected_bid_ids]
@@ -3438,7 +3147,7 @@ class AuctionsMenuView(discord.ui.View):
             async with aiosqlite.connect(DB_PATH) as db:
                 # Check if period is still in matching status
                 cursor = await db.execute(
-                    "SELECT status FROM free_agency_periods WHERE period_id = ?",
+                    "SELECT status, auction_points FROM free_agency_periods WHERE period_id = ?",
                     (self.period_id,)
                 )
                 period_status = await cursor.fetchone()
@@ -3448,6 +3157,7 @@ class AuctionsMenuView(discord.ui.View):
                         ephemeral=True
                     )
                     return
+                auction_points = period_status[1]
 
                 # Get winning bids on this team's players
                 cursor = await db.execute(
@@ -3469,7 +3179,7 @@ class AuctionsMenuView(discord.ui.View):
                     )
                     return
 
-                # Calculate remaining points for this team (300 - winning bids on other teams' players)
+                # Calculate remaining points for this team (auction_points - winning bids on other teams' players)
                 cursor = await db.execute(
                     """SELECT COALESCE(SUM(b.bid_amount), 0)
                        FROM free_agency_bids b
@@ -3479,7 +3189,7 @@ class AuctionsMenuView(discord.ui.View):
                     (self.period_id, self.team_id, self.team_id)
                 )
                 winning_bid_total = (await cursor.fetchone())[0]
-                remaining_points = 300 - winning_bid_total
+                remaining_points = auction_points - winning_bid_total
 
                 # Create matching view
                 matching_view = MatchingView(self.bot, self.period_id, self.team_id, self.team_name, player_bids, self.season_number, remaining_points)
@@ -3545,19 +3255,7 @@ class FreeResignButtonView(discord.ui.View):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get current season
-                cursor = await db.execute(
-                    """SELECT season_number FROM seasons
-                       ORDER BY
-                           CASE status
-                               WHEN 'active' THEN 1
-                               WHEN 'offseason' THEN 2
-                               ELSE 3
-                           END,
-                           season_number DESC
-                       LIMIT 1"""
-                )
-                season_result = await cursor.fetchone()
-                current_season = season_result[0] if season_result else None
+                current_season = await get_current_season(db)
 
                 # Get current period_id dynamically (don't rely on stored value)
                 cursor = await db.execute(
@@ -3722,14 +3420,7 @@ class FreeResignSelectionView(discord.ui.View):
                     team_name = team_data[0] if team_data else "Unknown Team"
                     emoji_id = team_data[1] if team_data and team_data[1] else None
 
-                    emoji_str = ""
-                    if emoji_id:
-                        try:
-                            emoji = self.bot.get_emoji(int(emoji_id))
-                            if emoji:
-                                emoji_str = f"{emoji} "
-                        except:
-                            pass
+                    emoji_str = get_team_emoji_str(self.bot, emoji_id)
 
                     if self.selected_players:
                         player_names = []

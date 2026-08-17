@@ -2,7 +2,8 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import aiosqlite
-from config import DB_PATH, ADMIN_ROLE_ID
+from config import DB_PATH
+from utils import is_admin_user, assign_drafted_player, get_team_emoji, get_team_emoji_str
 
 class DraftCommands(commands.Cog):
     def __init__(self, bot):
@@ -72,7 +73,7 @@ class DraftCommands(commands.Cog):
                     choices.append(app_commands.Choice(name=draft_name, value=draft_name))
 
             return choices[:25]
-        except:
+        except Exception:
             return []
 
     async def team_autocomplete(
@@ -94,7 +95,7 @@ class DraftCommands(commands.Cog):
                     choices.append(app_commands.Choice(name=team_name, value=team_name))
 
             return choices[:25]
-        except:
+        except Exception:
             return []
 
     @app_commands.command(name="createdraft", description="[ADMIN] Create a draft (season-linked or manual)")
@@ -109,7 +110,7 @@ class DraftCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         # Check if user has admin role
-        if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
+        if not await is_admin_user(interaction):
             await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
             return
 
@@ -215,7 +216,7 @@ class DraftCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         # Check if user has admin role
-        if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
+        if not await is_admin_user(interaction):
             await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
             return
 
@@ -361,7 +362,7 @@ class DraftCommands(commands.Cog):
                     choices.append(app_commands.Choice(name=draft_name, value=draft_name))
 
             return choices[:25]
-        except:
+        except Exception:
             return []
 
     async def pick_identifier_autocomplete(
@@ -415,7 +416,7 @@ class DraftCommands(commands.Cog):
                         choices.append(app_commands.Choice(name=display_name, value=value))
 
                 return choices[:25]
-        except:
+        except Exception:
             return []
 
     @app_commands.command(name="transferpick", description="[ADMIN] Transfer a draft pick to another team")
@@ -429,7 +430,7 @@ class DraftCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         # Check if user has admin role
-        if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
+        if not await is_admin_user(interaction):
             await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
             return
 
@@ -567,7 +568,7 @@ class DraftCommands(commands.Cog):
             emoji_result = await cursor.fetchone()
             team_emoji = None
             if emoji_result and emoji_result[0]:
-                team_emoji = self.bot.get_emoji(int(emoji_result[0]))
+                team_emoji = get_team_emoji(self.bot, emoji_result[0])
 
             # Get current active season
             cursor = await db.execute(
@@ -627,7 +628,7 @@ class DraftCommands(commands.Cog):
                         round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_num, f"{round_num}th")
                         orig_emoji = None
                         if orig_emoji_id:
-                            orig_emoji = self.bot.get_emoji(int(orig_emoji_id))
+                            orig_emoji = get_team_emoji(self.bot, orig_emoji_id)
                         emoji_str = f"{orig_emoji} " if orig_emoji else ""
                         # Use season_num - 1 for display (draft naming convention)
                         all_pick_lines.append(f"Future {round_suffix} ({emoji_str}S{season_num - 1})")
@@ -656,7 +657,7 @@ class DraftCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         # Check if user has admin role
-        if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
+        if not await is_admin_user(interaction):
             await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
             return
 
@@ -746,7 +747,7 @@ class DraftCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         # Check if user has admin role
-        if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
+        if not await is_admin_user(interaction):
             await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
             return
 
@@ -802,7 +803,7 @@ class DraftCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         # Check if user has admin role
-        if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
+        if not await is_admin_user(interaction):
             await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
             return
 
@@ -958,7 +959,7 @@ class DraftCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         # Check if user has admin role
-        if not any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles):
+        if not await is_admin_user(interaction):
             await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
             return
 
@@ -1168,11 +1169,7 @@ class DraftCommands(commands.Cog):
             emoji_result = await cursor.fetchone()
             team_emoji = ""
             if emoji_result and emoji_result[0]:
-                try:
-                    emoji = self.bot.get_emoji(int(emoji_result[0]))
-                    team_emoji = str(emoji) + " " if emoji else ""
-                except:
-                    pass
+                team_emoji = get_team_emoji_str(self.bot, emoji_result[0])
 
             # Get draft channel
             cursor = await db.execute(
@@ -1606,13 +1603,7 @@ class DraftOrderView(discord.ui.View):
 
     def get_emoji(self, emoji_id):
         """Convert emoji_id to Discord emoji or return empty string"""
-        if not emoji_id:
-            return ""
-        try:
-            emoji = self.guild.get_emoji(int(emoji_id))
-            return str(emoji) + " " if emoji else ""
-        except:
-            return ""
+        return get_team_emoji_str(self.guild, emoji_id)
 
     def create_embed(self):
         embed = discord.Embed(
@@ -1708,12 +1699,7 @@ class DraftPickView(discord.ui.View):
         # Get emoji
         emoji_str = ""
         if emoji_id:
-            try:
-                emoji = self.bot.get_emoji(int(emoji_id))
-                if emoji:
-                    emoji_str = f"{emoji} "
-            except:
-                pass
+            emoji_str = get_team_emoji_str(self.bot, emoji_id)
 
         # Get ALL available players from Draft Pool
         cursor = await db.execute(
@@ -1899,13 +1885,7 @@ class DraftPickView(discord.ui.View):
             )
 
             # Assign player to team
-            contract_expiry = season_number + rookie_years
-            await db.execute(
-                """UPDATE players
-                   SET team_id = ?, contract_expiry = ?
-                   WHERE player_id = ?""",
-                (self.team_id, contract_expiry, player_id)
-            )
+            await assign_drafted_player(db, self.team_id, player_id, season_number, rookie_years)
 
         await db.commit()
 
@@ -2088,21 +2068,11 @@ class DraftPickView(discord.ui.View):
             # Get emojis
             bidding_emoji_str = ""
             if bidding_emoji_id:
-                try:
-                    emoji = self.bot.get_emoji(int(bidding_emoji_id))
-                    if emoji:
-                        bidding_emoji_str = f"{emoji} "
-                except:
-                    pass
+                bidding_emoji_str = get_team_emoji_str(self.bot, bidding_emoji_id)
 
             fs_emoji_str = ""
             if fs_emoji_id:
-                try:
-                    emoji = self.bot.get_emoji(int(fs_emoji_id))
-                    if emoji:
-                        fs_emoji_str = f"{emoji} "
-                except:
-                    pass
+                fs_emoji_str = get_team_emoji_str(self.bot, fs_emoji_id)
 
             message = f"{bidding_emoji_str}Bid pending..."
             await draft_channel.send(message)
@@ -2130,11 +2100,7 @@ class DraftPickView(discord.ui.View):
         )
 
         # Assign player to bidding team
-        contract_expiry = season_number + rookie_years
-        await db.execute(
-            "UPDATE players SET team_id = ?, contract_expiry = ? WHERE player_id = ?",
-            (self.team_id, contract_expiry, player_id)
-        )
+        await assign_drafted_player(db, self.team_id, player_id, season_number, rookie_years)
 
         await db.commit()
 
@@ -2150,21 +2116,11 @@ class DraftPickView(discord.ui.View):
                     # Get emojis
                     bidding_emoji_str = ""
                     if bidding_emoji_id:
-                        try:
-                            emoji = self.bot.get_emoji(int(bidding_emoji_id))
-                            if emoji:
-                                bidding_emoji_str = f"{emoji} "
-                        except:
-                            pass
+                        bidding_emoji_str = get_team_emoji_str(self.bot, bidding_emoji_id)
 
                     fs_emoji_str = ""
                     if fs_emoji_id:
-                        try:
-                            emoji = self.bot.get_emoji(int(fs_emoji_id))
-                            if emoji:
-                                fs_emoji_str = f"{emoji} "
-                        except:
-                            pass
+                        fs_emoji_str = get_team_emoji_str(self.bot, fs_emoji_id)
 
                     # Get plays_like info
                     cursor = await db.execute(
@@ -2234,12 +2190,7 @@ class DraftPickView(discord.ui.View):
             # Get emoji
             emoji_str = ""
             if emoji_id:
-                try:
-                    emoji = self.bot.get_emoji(int(emoji_id))
-                    if emoji:
-                        emoji_str = f"{emoji} "
-                except:
-                    pass
+                emoji_str = get_team_emoji_str(self.bot, emoji_id)
 
             # Check if this is the first pick of a new round (post round header)
             if is_pass:
@@ -2515,11 +2466,7 @@ class FatherSonMatchView(discord.ui.View):
                 )
 
         # Step 5: Assign player to father/son club
-        contract_expiry = season_number + rookie_years
-        await db.execute(
-            "UPDATE players SET team_id = ?, contract_expiry = ? WHERE player_id = ?",
-            (self.fs_team_id, contract_expiry, self.player_id)
-        )
+        await assign_drafted_player(db, self.fs_team_id, self.player_id, season_number, rookie_years)
 
         await db.commit()
 
@@ -2552,11 +2499,7 @@ class FatherSonMatchView(discord.ui.View):
         )
 
         # Assign player to bidding team
-        contract_expiry = season_number + rookie_years
-        await db.execute(
-            "UPDATE players SET team_id = ?, contract_expiry = ? WHERE player_id = ?",
-            (self.bidding_team_id, contract_expiry, self.player_id)
-        )
+        await assign_drafted_player(db, self.bidding_team_id, self.player_id, season_number, rookie_years)
 
         await db.commit()
 
@@ -2570,29 +2513,6 @@ class FatherSonMatchView(discord.ui.View):
 
         # Continue with next pick
         await self.continue_draft(db)
-
-    async def renumber_picks_after_deletion(self, db):
-        """Renumber all picks after picks are deleted, shifting everything forward"""
-        # Get all remaining picks ordered by pick_number
-        cursor = await db.execute(
-            """SELECT pick_id, pick_number FROM draft_picks
-               WHERE draft_id = ?
-               ORDER BY pick_number ASC""",
-            (self.draft_id,)
-        )
-        all_picks = await cursor.fetchall()
-
-        # Renumber sequentially
-        new_pick_number = 1
-        for pick_id, old_pick_number in all_picks:
-            if new_pick_number != old_pick_number:
-                await db.execute(
-                    "UPDATE draft_picks SET pick_number = ? WHERE pick_id = ?",
-                    (new_pick_number, pick_id)
-                )
-            new_pick_number += 1
-
-        await db.commit()
 
     async def post_match_result_to_draft_channel(self, db, matched):
         """Post the match/pass result to draft channel"""
@@ -2618,12 +2538,7 @@ class FatherSonMatchView(discord.ui.View):
             bidding_emoji_id = bidding_result[0] if bidding_result else None
             bidding_emoji_str = ""
             if bidding_emoji_id:
-                try:
-                    emoji = self.bot.get_emoji(int(bidding_emoji_id))
-                    if emoji:
-                        bidding_emoji_str = f"{emoji} "
-                except:
-                    pass
+                bidding_emoji_str = get_team_emoji_str(self.bot, bidding_emoji_id)
 
             cursor = await db.execute(
                 "SELECT emoji_id FROM teams WHERE team_id = ?",
@@ -2633,12 +2548,7 @@ class FatherSonMatchView(discord.ui.View):
             fs_emoji_id = fs_result[0] if fs_result else None
             fs_emoji_str = ""
             if fs_emoji_id:
-                try:
-                    emoji = self.bot.get_emoji(int(fs_emoji_id))
-                    if emoji:
-                        fs_emoji_str = f"{emoji} "
-                except:
-                    pass
+                fs_emoji_str = get_team_emoji_str(self.bot, fs_emoji_id)
 
             # Get plays_like info
             cursor = await db.execute(
@@ -2709,13 +2619,7 @@ class DraftPointsCalculatorView(discord.ui.View):
 
     def get_emoji(self, emoji_id):
         """Convert emoji_id to Discord emoji or return empty string"""
-        if not emoji_id:
-            return ""
-        try:
-            emoji = self.guild.get_emoji(int(emoji_id))
-            return str(emoji) + " " if emoji else ""
-        except:
-            return ""
+        return get_team_emoji_str(self.guild, emoji_id)
 
     def create_embed(self):
         """Create the calculator embed"""
@@ -2855,10 +2759,7 @@ class DraftPointsCalculatorView(discord.ui.View):
             # Get emoji object for the SelectOption emoji parameter
             pick_emoji = None
             if emoji_id:
-                try:
-                    pick_emoji = self.guild.get_emoji(int(emoji_id))
-                except:
-                    pass
+                pick_emoji = get_team_emoji(self.guild, emoji_id)
 
             options.append(
                 discord.SelectOption(

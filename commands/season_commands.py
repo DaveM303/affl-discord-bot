@@ -3,6 +3,7 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH, ADMIN_ROLE_ID
+from utils import is_admin_user
 
 # Finals structure - added after regular season
 FINALS_ROUNDS = [
@@ -109,39 +110,19 @@ class SeasonCommands(commands.Cog):
         if interaction.command.name in ['currentseason']:
             return True
 
-        # Admin check for other commands
-        if interaction.guild.owner_id == interaction.user.id:
+        if await is_admin_user(interaction):
             return True
 
         if ADMIN_ROLE_ID:
-            member = interaction.guild.get_member(interaction.user.id) or interaction.user
-            if member:
-                admin_role_id = int(ADMIN_ROLE_ID) if isinstance(ADMIN_ROLE_ID, str) else ADMIN_ROLE_ID
-                if any(role.id == admin_role_id for role in member.roles):
-                    return True
-
             await interaction.response.send_message(
                 "❌ You need the admin role to use this command.",
                 ephemeral=True
             )
-            return False
-
-        try:
-            if interaction.user.guild_permissions.administrator:
-                return True
-        except:
-            pass
-
-        member = interaction.guild.get_member(interaction.user.id)
-        if member:
-            for role in member.roles:
-                if role.permissions.administrator:
-                    return True
-
-        await interaction.response.send_message(
-            "❌ You need Administrator permissions to use this command.",
-            ephemeral=True
-        )
+        else:
+            await interaction.response.send_message(
+                "❌ You need Administrator permissions to use this command.",
+                ephemeral=True
+            )
         return False
 
     @app_commands.command(name="migratedb", description="[ADMIN] Migrate database tables (run once after updates)")
@@ -567,371 +548,382 @@ class SeasonCommands(commands.Cog):
     ):
         await interaction.response.defer(ephemeral=True)
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Check if season already exists
-            cursor = await db.execute(
-                "SELECT season_id FROM seasons WHERE season_number = ?",
-                (season_number,)
-            )
-            existing = await cursor.fetchone()
-
-            if existing:
-                await interaction.followup.send(
-                    f"❌ Season {season_number} already exists!",
-                    ephemeral=True
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Check if season already exists
+                cursor = await db.execute(
+                    "SELECT season_id FROM seasons WHERE season_number = ?",
+                    (season_number,)
                 )
-                return
+                existing = await cursor.fetchone()
 
-            # Total rounds = regular season + finals (5 rounds)
-            total_rounds = regular_rounds + len(FINALS_ROUNDS)
+                if existing:
+                    await interaction.followup.send(
+                        f"❌ Season {season_number} already exists!",
+                        ephemeral=True
+                    )
+                    return
 
-            # Create the season
-            await db.execute(
-                """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
-                   VALUES (?, 0, ?, ?, 'Offseason', 'offseason')""",
-                (season_number, regular_rounds, total_rounds)
-            )
-            await db.commit()
+                # Total rounds = regular season + finals (5 rounds)
+                total_rounds = regular_rounds + len(FINALS_ROUNDS)
 
-            message = f"✅ Created **Season {season_number}** with {regular_rounds} rounds"
+                # Create the season
+                await db.execute(
+                    """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
+                       VALUES (?, 0, ?, ?, 'Offseason', 'offseason')""",
+                    (season_number, regular_rounds, total_rounds)
+                )
+                await db.commit()
 
-            # Auto-create future seasons if requested
-            if auto_create_futures:
-                created_seasons = await ensure_future_seasons_exist(db, season_number, num_future=2)
-                if created_seasons:
-                    message += f"\n\n🔮 **Auto-created future seasons:**"
-                    for future_season in created_seasons:
-                        draft_name = f"Season {future_season - 1} National Draft"
-                        message += f"\n• Season {future_season} with **{draft_name}**"
+                message = f"✅ Created **Season {season_number}** with {regular_rounds} rounds"
 
-            message += f"\n\nUse `/startseason` to begin the season."
+                # Auto-create future seasons if requested
+                if auto_create_futures:
+                    created_seasons = await ensure_future_seasons_exist(db, season_number, num_future=2)
+                    if created_seasons:
+                        message += f"\n\n🔮 **Auto-created future seasons:**"
+                        for future_season in created_seasons:
+                            draft_name = f"Season {future_season - 1} National Draft"
+                            message += f"\n• Season {future_season} with **{draft_name}**"
 
-            await interaction.followup.send(message, ephemeral=True)
+                message += f"\n\nUse `/startseason` to begin the season."
+
+                await interaction.followup.send(message, ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
     @app_commands.command(name="startseason", description="[ADMIN] End the current off-season and begin the next season")
     @app_commands.describe(offseason_weeks="Number of weeks in offseason (default: 23)")
     async def start_season(self, interaction: discord.Interaction, offseason_weeks: int = 23):
         await interaction.response.defer(ephemeral=True)
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Find the offseason
-            cursor = await db.execute(
-                """SELECT season_id, season_number, regular_rounds, total_rounds FROM seasons
-                   WHERE status = 'offseason'
-                   ORDER BY season_number DESC LIMIT 1"""
-            )
-            season = await cursor.fetchone()
-
-            if not season:
-                await interaction.followup.send(
-                    "❌ No offseason found! Create a season first with `/createseason`.",
-                    ephemeral=True
-                )
-                return
-
-            season_id, season_number, regular_rounds, total_rounds = season
-
-            # Get previous season's final round to calculate injury carryover
-            cursor = await db.execute(
-                """SELECT season_id, total_rounds FROM seasons
-                   WHERE status = 'completed'
-                   ORDER BY season_number DESC LIMIT 1"""
-            )
-            prev_season = await cursor.fetchone()
-
-            carried_over = 0
-            healed_during_offseason = 0
-            suspensions_carried_over = 0
-            suspensions_completed_offseason = 0
-
-            if prev_season:
-                prev_season_id, prev_total_rounds = prev_season
-
-                # Find injuries that were still active at end of previous season
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Find the offseason
                 cursor = await db.execute(
-                    """SELECT injury_id, player_id, injury_type, return_round
-                       FROM injuries
-                       WHERE status = 'injured' AND return_round > ?""",
-                    (prev_total_rounds,)
+                    """SELECT season_id, season_number, regular_rounds, total_rounds FROM seasons
+                       WHERE status = 'offseason'
+                       ORDER BY season_number DESC LIMIT 1"""
                 )
-                active_injuries = await cursor.fetchall()
+                season = await cursor.fetchone()
 
-                for injury_id, player_id, injury_type, old_return_round in active_injuries:
-                    # Calculate weeks remaining from end of last season
-                    weeks_remaining = old_return_round - prev_total_rounds
-
-                    # Subtract offseason weeks
-                    weeks_into_new_season = weeks_remaining - offseason_weeks
-
-                    if weeks_into_new_season <= 0:
-                        # Injury healed during offseason
-                        await db.execute(
-                            "UPDATE injuries SET status = 'recovered' WHERE injury_id = ?",
-                            (injury_id,)
-                        )
-                        healed_during_offseason += 1
-                    else:
-                        # Injury carries over - update return round for new season
-                        new_return_round = weeks_into_new_season
-                        await db.execute(
-                            """UPDATE injuries
-                               SET return_round = ?
-                               WHERE injury_id = ?""",
-                            (new_return_round, injury_id)
-                        )
-                        carried_over += 1
-
-                # Find suspensions that were still active at end of previous season
-                cursor = await db.execute(
-                    """SELECT suspension_id, player_id, suspension_reason, return_round
-                       FROM suspensions
-                       WHERE status = 'suspended' AND return_round > ?""",
-                    (prev_total_rounds,)
-                )
-                active_suspensions = await cursor.fetchall()
-
-                for suspension_id, player_id, suspension_reason, old_return_round in active_suspensions:
-                    # Calculate games remaining from end of last season
-                    games_remaining = old_return_round - prev_total_rounds
-
-                    # Subtract offseason weeks
-                    games_into_new_season = games_remaining - offseason_weeks
-
-                    if games_into_new_season <= 0:
-                        # Suspension completed during offseason
-                        await db.execute(
-                            "UPDATE suspensions SET status = 'completed' WHERE suspension_id = ?",
-                            (suspension_id,)
-                        )
-                        suspensions_completed_offseason += 1
-                    else:
-                        # Suspension carries over - update return round for new season
-                        new_return_round = games_into_new_season
-                        await db.execute(
-                            """UPDATE suspensions
-                               SET return_round = ?
-                               WHERE suspension_id = ?""",
-                            (new_return_round, suspension_id)
-                        )
-                        suspensions_carried_over += 1
-
-                await db.commit()
-
-            # Update player ages at START of new season
-            # The new season (season_number + 1) is starting, so age players for that year
-            cursor = await db.execute(
-                "SELECT setting_value FROM settings WHERE setting_key = 'season_1_year'"
-            )
-            setting_result = await cursor.fetchone()
-            if setting_result:
-                season_1_year = int(setting_result[0])
-                # Calculate the year for the NEW season that's about to start
-                new_season_year = season_1_year + season_number  # season_number is the offseason, +1 is the new season
-                await db.execute(
-                    "UPDATE players SET age = ? - birth_year WHERE birth_year IS NOT NULL",
-                    (new_season_year,)
-                )
-
-            # Mark the offseason season as completed
-            await db.execute(
-                """UPDATE seasons
-                   SET status = 'completed', round_name = 'Season Complete'
-                   WHERE season_id = ?""",
-                (season_id,)
-            )
-
-            # Get or create the NEXT season (season_number + 1)
-            next_season_num = season_number + 1
-            cursor = await db.execute(
-                "SELECT season_id, status, regular_rounds FROM seasons WHERE season_number = ?",
-                (next_season_num,)
-            )
-            next_season_result = await cursor.fetchone()
-
-            if not next_season_result:
-                # Next season doesn't exist, create it
-                await db.execute(
-                    """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
-                       VALUES (?, 1, 24, 29, 'Round 1', 'active')""",
-                    (next_season_num,)
-                )
-                next_season_id = cursor.lastrowid
-                next_regular_rounds = 24
-            else:
-                next_season_id, next_status, next_regular_rounds = next_season_result
-                if next_status != 'future':
+                if not season:
                     await interaction.followup.send(
-                        f"❌ Season {next_season_num} has unexpected status '{next_status}' (expected 'future')",
+                        "❌ No offseason found! Create a season first with `/createseason`.",
                         ephemeral=True
                     )
                     return
 
-            # Start the next season
-            round_name = get_round_name(1, next_regular_rounds)
-            await db.execute(
-                """UPDATE seasons
-                   SET current_round = 1, round_name = ?, status = 'active'
-                   WHERE season_id = ?""",
-                (round_name, next_season_id)
-            )
-            await db.commit()
+                season_id, season_number, regular_rounds, total_rounds = season
 
-            # Ensure next 2 future seasons exist for draft pick trading
-            created_seasons = await ensure_future_seasons_exist(db, next_season_num, num_future=2)
+                # Get previous season's final round to calculate injury carryover
+                cursor = await db.execute(
+                    """SELECT season_id, total_rounds FROM seasons
+                       WHERE status = 'completed'
+                       ORDER BY season_number DESC LIMIT 1"""
+                )
+                prev_season = await cursor.fetchone()
 
-            message = f"✅ **Season {next_season_num}** has started!\nCurrent: {round_name}\n"
-            message += f"**Previous:** Offseason {season_number} → Completed"
+                carried_over = 0
+                healed_during_offseason = 0
+                suspensions_carried_over = 0
+                suspensions_completed_offseason = 0
 
-            if created_seasons:
-                message += f"\n\n🔮 **Auto-created future seasons for trading:**"
-                for future_season in created_seasons:
-                    draft_name = f"Season {future_season - 1} National Draft"
-                    message += f"\n• Season {future_season} with **{draft_name}**"
+                if prev_season:
+                    prev_season_id, prev_total_rounds = prev_season
 
-            if carried_over > 0 or healed_during_offseason > 0:
-                message += f"\n\n**Injury Updates:**"
-                if healed_during_offseason > 0:
-                    message += f"\n• {healed_during_offseason} player(s) healed during offseason"
-                if carried_over > 0:
-                    message += f"\n• {carried_over} injury(ies) carried over to new season"
+                    # Find injuries that were still active at end of previous season
+                    cursor = await db.execute(
+                        """SELECT injury_id, player_id, injury_type, return_round
+                           FROM injuries
+                           WHERE status = 'injured' AND return_round > ?""",
+                        (prev_total_rounds,)
+                    )
+                    active_injuries = await cursor.fetchall()
 
-            if suspensions_carried_over > 0 or suspensions_completed_offseason > 0:
-                message += f"\n\n**Suspension Updates:**"
-                if suspensions_completed_offseason > 0:
-                    message += f"\n• {suspensions_completed_offseason} suspension(s) completed during offseason"
-                if suspensions_carried_over > 0:
-                    message += f"\n• {suspensions_carried_over} suspension(s) carried over to new season"
+                    for injury_id, player_id, injury_type, old_return_round in active_injuries:
+                        # Calculate weeks remaining from end of last season
+                        weeks_remaining = old_return_round - prev_total_rounds
 
-            # Post injury list to configured channel
-            cursor = await db.execute(
-                "SELECT setting_value FROM settings WHERE setting_key = 'injury_list_channel_id'"
-            )
-            result = await cursor.fetchone()
-            if result and result[0]:
-                injury_commands = self.bot.get_cog('InjuryCommands')
-                if injury_commands:
-                    await injury_commands.post_injury_list_to_channel(db, int(result[0]))
+                        # Subtract offseason weeks
+                        weeks_into_new_season = weeks_remaining - offseason_weeks
 
-            await interaction.followup.send(message, ephemeral=True)
+                        if weeks_into_new_season <= 0:
+                            # Injury healed during offseason
+                            await db.execute(
+                                "UPDATE injuries SET status = 'recovered' WHERE injury_id = ?",
+                                (injury_id,)
+                            )
+                            healed_during_offseason += 1
+                        else:
+                            # Injury carries over - update return round for new season
+                            new_return_round = weeks_into_new_season
+                            await db.execute(
+                                """UPDATE injuries
+                                   SET return_round = ?
+                                   WHERE injury_id = ?""",
+                                (new_return_round, injury_id)
+                            )
+                            carried_over += 1
+
+                    # Find suspensions that were still active at end of previous season
+                    cursor = await db.execute(
+                        """SELECT suspension_id, player_id, suspension_reason, return_round
+                           FROM suspensions
+                           WHERE status = 'suspended' AND return_round > ?""",
+                        (prev_total_rounds,)
+                    )
+                    active_suspensions = await cursor.fetchall()
+
+                    for suspension_id, player_id, suspension_reason, old_return_round in active_suspensions:
+                        # Calculate games remaining from end of last season
+                        games_remaining = old_return_round - prev_total_rounds
+
+                        # Subtract offseason weeks
+                        games_into_new_season = games_remaining - offseason_weeks
+
+                        if games_into_new_season <= 0:
+                            # Suspension completed during offseason
+                            await db.execute(
+                                "UPDATE suspensions SET status = 'completed' WHERE suspension_id = ?",
+                                (suspension_id,)
+                            )
+                            suspensions_completed_offseason += 1
+                        else:
+                            # Suspension carries over - update return round for new season
+                            new_return_round = games_into_new_season
+                            await db.execute(
+                                """UPDATE suspensions
+                                   SET return_round = ?
+                                   WHERE suspension_id = ?""",
+                                (new_return_round, suspension_id)
+                            )
+                            suspensions_carried_over += 1
+
+                    await db.commit()
+
+                # Update player ages at START of new season
+                # The new season (season_number + 1) is starting, so age players for that year
+                cursor = await db.execute(
+                    "SELECT setting_value FROM settings WHERE setting_key = 'season_1_year'"
+                )
+                setting_result = await cursor.fetchone()
+                if setting_result:
+                    season_1_year = int(setting_result[0])
+                    # Calculate the year for the NEW season that's about to start
+                    new_season_year = season_1_year + season_number  # season_number is the offseason, +1 is the new season
+                    await db.execute(
+                        "UPDATE players SET age = ? - birth_year WHERE birth_year IS NOT NULL",
+                        (new_season_year,)
+                    )
+
+                # Mark the offseason season as completed
+                await db.execute(
+                    """UPDATE seasons
+                       SET status = 'completed', round_name = 'Season Complete'
+                       WHERE season_id = ?""",
+                    (season_id,)
+                )
+
+                # Get or create the NEXT season (season_number + 1)
+                next_season_num = season_number + 1
+                cursor = await db.execute(
+                    "SELECT season_id, status, regular_rounds FROM seasons WHERE season_number = ?",
+                    (next_season_num,)
+                )
+                next_season_result = await cursor.fetchone()
+
+                if not next_season_result:
+                    # Next season doesn't exist, create it
+                    await db.execute(
+                        """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
+                           VALUES (?, 1, 24, 29, 'Round 1', 'active')""",
+                        (next_season_num,)
+                    )
+                    next_season_id = cursor.lastrowid
+                    next_regular_rounds = 24
+                else:
+                    next_season_id, next_status, next_regular_rounds = next_season_result
+                    if next_status != 'future':
+                        await interaction.followup.send(
+                            f"❌ Season {next_season_num} has unexpected status '{next_status}' (expected 'future')",
+                            ephemeral=True
+                        )
+                        return
+
+                # Start the next season
+                round_name = get_round_name(1, next_regular_rounds)
+                await db.execute(
+                    """UPDATE seasons
+                       SET current_round = 1, round_name = ?, status = 'active'
+                       WHERE season_id = ?""",
+                    (round_name, next_season_id)
+                )
+                await db.commit()
+
+                # Ensure next 2 future seasons exist for draft pick trading
+                created_seasons = await ensure_future_seasons_exist(db, next_season_num, num_future=2)
+
+                message = f"✅ **Season {next_season_num}** has started!\nCurrent: {round_name}\n"
+                message += f"**Previous:** Offseason {season_number} → Completed"
+
+                if created_seasons:
+                    message += f"\n\n🔮 **Auto-created future seasons for trading:**"
+                    for future_season in created_seasons:
+                        draft_name = f"Season {future_season - 1} National Draft"
+                        message += f"\n• Season {future_season} with **{draft_name}**"
+
+                if carried_over > 0 or healed_during_offseason > 0:
+                    message += f"\n\n**Injury Updates:**"
+                    if healed_during_offseason > 0:
+                        message += f"\n• {healed_during_offseason} player(s) healed during offseason"
+                    if carried_over > 0:
+                        message += f"\n• {carried_over} injury(ies) carried over to new season"
+
+                if suspensions_carried_over > 0 or suspensions_completed_offseason > 0:
+                    message += f"\n\n**Suspension Updates:**"
+                    if suspensions_completed_offseason > 0:
+                        message += f"\n• {suspensions_completed_offseason} suspension(s) completed during offseason"
+                    if suspensions_carried_over > 0:
+                        message += f"\n• {suspensions_carried_over} suspension(s) carried over to new season"
+
+                # Post injury list to configured channel
+                cursor = await db.execute(
+                    "SELECT setting_value FROM settings WHERE setting_key = 'injury_list_channel_id'"
+                )
+                result = await cursor.fetchone()
+                if result and result[0]:
+                    injury_commands = self.bot.get_cog('InjuryCommands')
+                    if injury_commands:
+                        await injury_commands.post_injury_list_to_channel(db, int(result[0]))
+
+                await interaction.followup.send(message, ephemeral=True)
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
     @app_commands.command(name="nextround", description="[ADMIN] Advance to the next round")
     async def next_round(self, interaction: discord.Interaction):
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Get active season
-            cursor = await db.execute(
-                """SELECT season_id, season_number, current_round, regular_rounds, total_rounds
-                   FROM seasons WHERE status = 'active' LIMIT 1"""
-            )
-            season = await cursor.fetchone()
-
-            if not season:
-                await interaction.response.send_message(
-                    "❌ No active season! Start a season first with `/startseason`.",
-                    ephemeral=True
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get active season
+                cursor = await db.execute(
+                    """SELECT season_id, season_number, current_round, regular_rounds, total_rounds
+                       FROM seasons WHERE status = 'active' LIMIT 1"""
                 )
-                return
+                season = await cursor.fetchone()
 
-            season_id, season_number, current_round, regular_rounds, total_rounds = season
+                if not season:
+                    await interaction.response.send_message(
+                        "❌ No active season! Start a season first with `/startseason`.",
+                        ephemeral=True
+                    )
+                    return
 
-            # Check if season is complete
-            if current_round >= total_rounds:
-                await interaction.response.send_message(
-                    f"❌ Season {season_number} is complete! Use `/endseason` to finish it.",
-                    ephemeral=True
-                )
-                return
+                season_id, season_number, current_round, regular_rounds, total_rounds = season
 
-            # Advance to next round
-            next_round_num = current_round + 1
-            next_round_name = get_round_name(next_round_num, regular_rounds)
+                # Check if season is complete
+                if current_round >= total_rounds:
+                    await interaction.response.send_message(
+                        f"❌ Season {season_number} is complete! Use `/endseason` to finish it.",
+                        ephemeral=True
+                    )
+                    return
 
-            await db.execute(
-                """UPDATE seasons
-                   SET current_round = ?, round_name = ?
-                   WHERE season_id = ?""",
-                (next_round_num, next_round_name, season_id)
-            )
-            await db.commit()
+                # Advance to next round
+                next_round_num = current_round + 1
+                next_round_name = get_round_name(next_round_num, regular_rounds)
 
-            # Check for players who have recovered from injuries
-            cursor = await db.execute(
-                """SELECT i.injury_id, p.name, p.team_id, t.channel_id
-                   FROM injuries i
-                   JOIN players p ON i.player_id = p.player_id
-                   LEFT JOIN teams t ON p.team_id = t.team_id
-                   WHERE i.status = 'injured' AND i.return_round <= ?""",
-                (next_round_num,)
-            )
-            recovered_players = await cursor.fetchall()
-
-            # Mark recovered players and send notifications
-            for injury_id, player_name, team_id, channel_id in recovered_players:
-                # Mark as recovered
                 await db.execute(
-                    "UPDATE injuries SET status = 'recovered' WHERE injury_id = ?",
-                    (injury_id,)
+                    """UPDATE seasons
+                       SET current_round = ?, round_name = ?
+                       WHERE season_id = ?""",
+                    (next_round_num, next_round_name, season_id)
                 )
-
-                # Notify team channel
-                if team_id and channel_id:
-                    channel = self.bot.get_channel(int(channel_id))
-                    if channel:
-                        await channel.send(
-                            f"✅ **Recovery Update**\n"
-                            f"**{player_name}** has recovered from injury and is available for selection!"
-                        )
-
-            if recovered_players:
                 await db.commit()
 
-            # Check for players whose suspensions are complete
-            cursor = await db.execute(
-                """SELECT s.suspension_id, p.name, p.team_id, t.channel_id
-                   FROM suspensions s
-                   JOIN players p ON s.player_id = p.player_id
-                   LEFT JOIN teams t ON p.team_id = t.team_id
-                   WHERE s.status = 'suspended' AND s.return_round <= ?""",
-                (next_round_num,)
-            )
-            completed_suspensions = await cursor.fetchall()
-
-            # Mark suspensions as completed and send notifications
-            for suspension_id, player_name, team_id, channel_id in completed_suspensions:
-                # Mark as completed
-                await db.execute(
-                    "UPDATE suspensions SET status = 'completed' WHERE suspension_id = ?",
-                    (suspension_id,)
+                # Check for players who have recovered from injuries
+                cursor = await db.execute(
+                    """SELECT i.injury_id, p.name, p.team_id, t.channel_id
+                       FROM injuries i
+                       JOIN players p ON i.player_id = p.player_id
+                       LEFT JOIN teams t ON p.team_id = t.team_id
+                       WHERE i.status = 'injured' AND i.return_round <= ?""",
+                    (next_round_num,)
                 )
+                recovered_players = await cursor.fetchall()
 
-                # Notify team channel
-                if team_id and channel_id:
-                    channel = self.bot.get_channel(int(channel_id))
-                    if channel:
-                        await channel.send(
-                            f"✅ **Suspension Update**\n"
-                            f"**{player_name}**'s suspension has been lifted and they are available for selection!"
-                        )
+                # Mark recovered players and send notifications
+                for injury_id, player_name, team_id, channel_id in recovered_players:
+                    # Mark as recovered
+                    await db.execute(
+                        "UPDATE injuries SET status = 'recovered' WHERE injury_id = ?",
+                        (injury_id,)
+                    )
 
-            if completed_suspensions:
-                await db.commit()
+                    # Notify team channel
+                    if team_id and channel_id:
+                        channel = self.bot.get_channel(int(channel_id))
+                        if channel:
+                            await channel.send(
+                                f"✅ **Recovery Update**\n"
+                                f"**{player_name}** has recovered from injury and is available for selection!"
+                            )
 
-            # Post injury list to configured channel
-            cursor = await db.execute(
-                "SELECT setting_value FROM settings WHERE setting_key = 'injury_list_channel_id'"
-            )
-            result = await cursor.fetchone()
-            if result and result[0]:
-                injury_commands = self.bot.get_cog('InjuryCommands')
-                if injury_commands:
-                    await injury_commands.post_injury_list_to_channel(db, int(result[0]))
+                if recovered_players:
+                    await db.commit()
 
-            response = f"✅ Advanced to **{next_round_name}** of Season {season_number}"
-            if recovered_players:
-                response += f"\n\n🏥 {len(recovered_players)} player(s) recovered from injury"
-            if completed_suspensions:
-                response += f"\n🚫 {len(completed_suspensions)} suspension(s) completed"
+                # Check for players whose suspensions are complete
+                cursor = await db.execute(
+                    """SELECT s.suspension_id, p.name, p.team_id, t.channel_id
+                       FROM suspensions s
+                       JOIN players p ON s.player_id = p.player_id
+                       LEFT JOIN teams t ON p.team_id = t.team_id
+                       WHERE s.status = 'suspended' AND s.return_round <= ?""",
+                    (next_round_num,)
+                )
+                completed_suspensions = await cursor.fetchall()
 
-            await interaction.response.send_message(response)
+                # Mark suspensions as completed and send notifications
+                for suspension_id, player_name, team_id, channel_id in completed_suspensions:
+                    # Mark as completed
+                    await db.execute(
+                        "UPDATE suspensions SET status = 'completed' WHERE suspension_id = ?",
+                        (suspension_id,)
+                    )
+
+                    # Notify team channel
+                    if team_id and channel_id:
+                        channel = self.bot.get_channel(int(channel_id))
+                        if channel:
+                            await channel.send(
+                                f"✅ **Suspension Update**\n"
+                                f"**{player_name}**'s suspension has been lifted and they are available for selection!"
+                            )
+
+                if completed_suspensions:
+                    await db.commit()
+
+                # Post injury list to configured channel
+                cursor = await db.execute(
+                    "SELECT setting_value FROM settings WHERE setting_key = 'injury_list_channel_id'"
+                )
+                result = await cursor.fetchone()
+                if result and result[0]:
+                    injury_commands = self.bot.get_cog('InjuryCommands')
+                    if injury_commands:
+                        await injury_commands.post_injury_list_to_channel(db, int(result[0]))
+
+                response = f"✅ Advanced to **{next_round_name}** of Season {season_number}"
+                if recovered_players:
+                    response += f"\n\n🏥 {len(recovered_players)} player(s) recovered from injury"
+                if completed_suspensions:
+                    response += f"\n🚫 {len(completed_suspensions)} suspension(s) completed"
+
+                await interaction.response.send_message(response)
+
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
     @app_commands.command(name="editseason", description="[ADMIN] Edit a season's settings")
     @app_commands.describe(
@@ -944,205 +936,217 @@ class SeasonCommands(commands.Cog):
         season_number: int,
         regular_rounds: int
     ):
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Find the season
-            cursor = await db.execute(
-                "SELECT season_id, status FROM seasons WHERE season_number = ?",
-                (season_number,)
-            )
-            season = await cursor.fetchone()
-
-            if not season:
-                await interaction.response.send_message(
-                    f"❌ Season {season_number} not found!",
-                    ephemeral=True
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Find the season
+                cursor = await db.execute(
+                    "SELECT season_id, status FROM seasons WHERE season_number = ?",
+                    (season_number,)
                 )
-                return
+                season = await cursor.fetchone()
 
-            season_id, status = season
+                if not season:
+                    await interaction.response.send_message(
+                        f"❌ Season {season_number} not found!",
+                        ephemeral=True
+                    )
+                    return
 
-            # Calculate new total rounds
-            total_rounds = regular_rounds + len(FINALS_ROUNDS)
+                season_id, status = season
 
-            # Update the season
-            await db.execute(
-                """UPDATE seasons
-                   SET regular_rounds = ?, total_rounds = ?
-                   WHERE season_id = ?""",
-                (regular_rounds, total_rounds, season_id)
-            )
-            await db.commit()
+                # Calculate new total rounds
+                total_rounds = regular_rounds + len(FINALS_ROUNDS)
 
-            await interaction.response.send_message(
-                f"✅ Updated **Season {season_number}** to {regular_rounds} rounds"
-            )
+                # Update the season
+                await db.execute(
+                    """UPDATE seasons
+                       SET regular_rounds = ?, total_rounds = ?
+                       WHERE season_id = ?""",
+                    (regular_rounds, total_rounds, season_id)
+                )
+                await db.commit()
+
+                await interaction.response.send_message(
+                    f"✅ Updated **Season {season_number}** to {regular_rounds} rounds"
+                )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
     @app_commands.command(name="setround", description="[ADMIN] Skip to a specific round")
     @app_commands.describe(round_number="Round number to skip to")
     async def set_round(self, interaction: discord.Interaction, round_number: int):
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Get active season
-            cursor = await db.execute(
-                """SELECT season_id, season_number, regular_rounds, total_rounds
-                   FROM seasons WHERE status = 'active' LIMIT 1"""
-            )
-            season = await cursor.fetchone()
-
-            if not season:
-                await interaction.response.send_message(
-                    "❌ No active season! Start a season first with `/startseason`.",
-                    ephemeral=True
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get active season
+                cursor = await db.execute(
+                    """SELECT season_id, season_number, regular_rounds, total_rounds
+                       FROM seasons WHERE status = 'active' LIMIT 1"""
                 )
-                return
+                season = await cursor.fetchone()
 
-            season_id, season_number, regular_rounds, total_rounds = season
+                if not season:
+                    await interaction.response.send_message(
+                        "❌ No active season! Start a season first with `/startseason`.",
+                        ephemeral=True
+                    )
+                    return
 
-            # Validate round number
-            if round_number < 1 or round_number > total_rounds:
-                await interaction.response.send_message(
-                    f"❌ Round number must be between 1 and {total_rounds}!",
-                    ephemeral=True
+                season_id, season_number, regular_rounds, total_rounds = season
+
+                # Validate round number
+                if round_number < 1 or round_number > total_rounds:
+                    await interaction.response.send_message(
+                        f"❌ Round number must be between 1 and {total_rounds}!",
+                        ephemeral=True
+                    )
+                    return
+
+                # Set the round
+                round_name = get_round_name(round_number, regular_rounds)
+
+                await db.execute(
+                    """UPDATE seasons
+                       SET current_round = ?, round_name = ?
+                       WHERE season_id = ?""",
+                    (round_number, round_name, season_id)
                 )
-                return
+                await db.commit()
 
-            # Set the round
-            round_name = get_round_name(round_number, regular_rounds)
-
-            await db.execute(
-                """UPDATE seasons
-                   SET current_round = ?, round_name = ?
-                   WHERE season_id = ?""",
-                (round_number, round_name, season_id)
-            )
-            await db.commit()
-
-            await interaction.response.send_message(
-                f"✅ Skipped to **{round_name}** of Season {season_number}"
-            )
+                await interaction.response.send_message(
+                    f"✅ Skipped to **{round_name}** of Season {season_number}"
+                )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
     @app_commands.command(name="endseason", description="[ADMIN] End the current season and create offseason")
     @app_commands.describe(
         next_season_rounds="Number of rounds for next season (default: same as current season)"
     )
     async def end_season(self, interaction: discord.Interaction, next_season_rounds: int = None):
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Get active season
-            cursor = await db.execute(
-                """SELECT season_id, season_number, regular_rounds FROM seasons
-                   WHERE status = 'active' LIMIT 1"""
-            )
-            season = await cursor.fetchone()
-
-            if not season:
-                await interaction.response.send_message(
-                    "❌ No active season to end!",
-                    ephemeral=True
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get active season
+                cursor = await db.execute(
+                    """SELECT season_id, season_number, regular_rounds FROM seasons
+                       WHERE status = 'active' LIMIT 1"""
                 )
-                return
+                season = await cursor.fetchone()
 
-            season_id, season_number, current_regular_rounds = season
+                if not season:
+                    await interaction.response.send_message(
+                        "❌ No active season to end!",
+                        ephemeral=True
+                    )
+                    return
 
-            # Use current season's rounds if not specified
-            if next_season_rounds is None:
-                next_season_rounds = current_regular_rounds
+                season_id, season_number, current_regular_rounds = season
 
-            # End the current season (set to offseason, not completed)
-            # Note: Player ages will be updated when the new season STARTS (in /startseason)
-            await db.execute(
-                """UPDATE seasons
-                   SET status = 'offseason', round_name = 'Offseason'
-                   WHERE season_id = ?""",
-                (season_id,)
-            )
+                # Use current season's rounds if not specified
+                if next_season_rounds is None:
+                    next_season_rounds = current_regular_rounds
 
-            # Check if next season already exists
-            next_season_num = season_number + 1
-            cursor = await db.execute(
-                "SELECT season_id, status FROM seasons WHERE season_number = ?",
-                (next_season_num,)
-            )
-            existing = await cursor.fetchone()
-
-            message = f"✅ **Season {season_number}** has ended and is now in offseason!"
-
-            if existing:
-                existing_id, existing_status = existing
-                # Next season already exists - should be 'future'
-                if existing_status != 'future':
-                    message += f"\n⚠️ Season {next_season_num} already exists with status '{existing_status}' (expected 'future')"
-                else:
-                    message += f"\n✅ **Season {next_season_num}** is ready as a future season"
-            else:
-                # Create next season as 'future' status
-                total_rounds = next_season_rounds + len(FINALS_ROUNDS)
+                # End the current season (set to offseason, not completed)
+                # Note: Player ages will be updated when the new season STARTS (in /startseason)
                 await db.execute(
-                    """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
-                       VALUES (?, 0, ?, ?, 'Future', 'future')""",
-                    (next_season_num, next_season_rounds, total_rounds)
+                    """UPDATE seasons
+                       SET status = 'offseason', round_name = 'Offseason'
+                       WHERE season_id = ?""",
+                    (season_id,)
                 )
-                message += f"\n✅ **Season {next_season_num}** created as future season ({next_season_rounds} rounds)"
 
-            await db.commit()
+                # Check if next season already exists
+                next_season_num = season_number + 1
+                cursor = await db.execute(
+                    "SELECT season_id, status FROM seasons WHERE season_number = ?",
+                    (next_season_num,)
+                )
+                existing = await cursor.fetchone()
 
-            # Ensure 2 more future seasons exist beyond the next season
-            created_seasons = await ensure_future_seasons_exist(db, next_season_num, num_future=2)
+                message = f"✅ **Season {season_number}** has ended and is now in offseason!"
 
-            if created_seasons:
-                message += f"\n\n🔮 **Auto-created future seasons:**"
-                for future_season in created_seasons:
-                    draft_name = f"Season {future_season - 1} National Draft"
-                    message += f"\n• Season {future_season} with **{draft_name}**"
+                if existing:
+                    existing_id, existing_status = existing
+                    # Next season already exists - should be 'future'
+                    if existing_status != 'future':
+                        message += f"\n⚠️ Season {next_season_num} already exists with status '{existing_status}' (expected 'future')"
+                    else:
+                        message += f"\n✅ **Season {next_season_num}** is ready as a future season"
+                else:
+                    # Create next season as 'future' status
+                    total_rounds = next_season_rounds + len(FINALS_ROUNDS)
+                    await db.execute(
+                        """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
+                           VALUES (?, 0, ?, ?, 'Future', 'future')""",
+                        (next_season_num, next_season_rounds, total_rounds)
+                    )
+                    message += f"\n✅ **Season {next_season_num}** created as future season ({next_season_rounds} rounds)"
 
-            message += f"\n\n**Current Status:** Offseason {season_number}"
-            message += f"\n\nUse `/startseason` when ready to begin Season {next_season_num}."
+                await db.commit()
 
-            await interaction.response.send_message(message, ephemeral=True)
+                # Ensure 2 more future seasons exist beyond the next season
+                created_seasons = await ensure_future_seasons_exist(db, next_season_num, num_future=2)
+
+                if created_seasons:
+                    message += f"\n\n🔮 **Auto-created future seasons:**"
+                    for future_season in created_seasons:
+                        draft_name = f"Season {future_season - 1} National Draft"
+                        message += f"\n• Season {future_season} with **{draft_name}**"
+
+                message += f"\n\n**Current Status:** Offseason {season_number}"
+                message += f"\n\nUse `/startseason` when ready to begin Season {next_season_num}."
+
+                await interaction.response.send_message(message, ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
     @app_commands.command(name="currentseason", description="View the current season status")
     async def current_season(self, interaction: discord.Interaction):
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Get active or most recent season
-            cursor = await db.execute(
-                """SELECT season_number, current_round, total_rounds, round_name, status
-                   FROM seasons
-                   ORDER BY
-                       CASE status
-                           WHEN 'active' THEN 1
-                           WHEN 'offseason' THEN 2
-                           ELSE 3
-                       END,
-                       season_number DESC
-                   LIMIT 1"""
-            )
-            season = await cursor.fetchone()
-
-            if not season:
-                await interaction.response.send_message(
-                    "No seasons created yet! An admin can create one with `/createseason`."
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Get active or most recent season
+                cursor = await db.execute(
+                    """SELECT season_number, current_round, total_rounds, round_name, status
+                       FROM seasons
+                       ORDER BY
+                           CASE status
+                               WHEN 'active' THEN 1
+                               WHEN 'offseason' THEN 2
+                               ELSE 3
+                           END,
+                           season_number DESC
+                       LIMIT 1"""
                 )
-                return
+                season = await cursor.fetchone()
 
-            season_number, current_round, total_rounds, round_name, status = season
+                if not season:
+                    await interaction.response.send_message(
+                        "No seasons created yet! An admin can create one with `/createseason`."
+                    )
+                    return
 
-            # Build embed
-            if status == 'active':
-                color = discord.Color.green()
-                status_text = "🟢 Active"
-            elif status == 'offseason':
-                color = discord.Color.blue()
-                status_text = "🔵 Offseason"
-            else:
-                color = discord.Color.grey()
-                status_text = "⚫ Completed"
+                season_number, current_round, total_rounds, round_name, status = season
 
-            embed = discord.Embed(
-                title=f"Season {season_number}",
-                color=color
-            )
-            embed.add_field(name="Status", value=status_text, inline=True)
-            embed.add_field(name="Current", value=round_name, inline=True)
+                # Build embed
+                if status == 'active':
+                    color = discord.Color.green()
+                    status_text = "🟢 Active"
+                elif status == 'offseason':
+                    color = discord.Color.blue()
+                    status_text = "🔵 Offseason"
+                else:
+                    color = discord.Color.grey()
+                    status_text = "⚫ Completed"
 
-            await interaction.response.send_message(embed=embed)
+                embed = discord.Embed(
+                    title=f"Season {season_number}",
+                    color=color
+                )
+                embed.add_field(name="Status", value=status_text, inline=True)
+                embed.add_field(name="Current", value=round_name, inline=True)
+
+                await interaction.response.send_message(embed=embed)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
 async def setup(bot):
     await bot.add_cog(SeasonCommands(bot))

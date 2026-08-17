@@ -4,6 +4,7 @@ from discord import app_commands
 import aiosqlite
 from config import DB_PATH, ADMIN_ROLE_ID
 from commands.season_commands import get_round_name
+from utils import is_admin_user, get_team_emoji_str
 
 class InjuryCommands(commands.Cog):
     def __init__(self, bot):
@@ -77,39 +78,19 @@ class InjuryCommands(commands.Cog):
         if interaction.command.name in ['injurylist']:
             return True
 
-        # Admin check for other commands
-        if interaction.guild.owner_id == interaction.user.id:
+        if await is_admin_user(interaction):
             return True
 
         if ADMIN_ROLE_ID:
-            member = interaction.guild.get_member(interaction.user.id) or interaction.user
-            if member:
-                admin_role_id = int(ADMIN_ROLE_ID) if isinstance(ADMIN_ROLE_ID, str) else ADMIN_ROLE_ID
-                if any(role.id == admin_role_id for role in member.roles):
-                    return True
-
             await interaction.response.send_message(
                 "❌ You need the admin role to use this command.",
                 ephemeral=True
             )
-            return False
-
-        try:
-            if interaction.user.guild_permissions.administrator:
-                return True
-        except:
-            pass
-
-        member = interaction.guild.get_member(interaction.user.id)
-        if member:
-            for role in member.roles:
-                if role.permissions.administrator:
-                    return True
-
-        await interaction.response.send_message(
-            "❌ You need Administrator permissions to use this command.",
-            ephemeral=True
-        )
+        else:
+            await interaction.response.send_message(
+                "❌ You need Administrator permissions to use this command.",
+                ephemeral=True
+            )
         return False
 
     async def get_current_round(self, db):
@@ -355,13 +336,7 @@ class InjuryCommands(commands.Cog):
                     # Get team emoji
                     team_display = ""
                     if team_name:
-                        try:
-                            if emoji_id:
-                                emoji = self.bot.get_emoji(int(emoji_id))
-                                if emoji:
-                                    team_display = f"{emoji} "
-                        except:
-                            pass
+                        team_display = get_team_emoji_str(self.bot, emoji_id)
 
                     if weeks_left <= 0:
                         status = "✅ Ready to return"
@@ -387,13 +362,7 @@ class InjuryCommands(commands.Cog):
                     # Get team emoji
                     team_display = ""
                     if team_name:
-                        try:
-                            if emoji_id:
-                                emoji = self.bot.get_emoji(int(emoji_id))
-                                if emoji:
-                                    team_display = f"{emoji} "
-                        except:
-                            pass
+                        team_display = get_team_emoji_str(self.bot, emoji_id)
 
                     if games_left <= 0:
                         status = "✅ Ready to return"
@@ -468,13 +437,7 @@ class InjuryCommands(commands.Cog):
                 # Get team emoji
                 team_display = ""
                 if team_name:
-                    try:
-                        if emoji_id:
-                            emoji = self.bot.get_emoji(int(emoji_id))
-                            if emoji:
-                                team_display = f"{emoji} "
-                    except:
-                        pass
+                    team_display = get_team_emoji_str(self.bot, emoji_id)
 
                 if weeks_left <= 0:
                     status = "✅ Ready to return"
@@ -500,13 +463,7 @@ class InjuryCommands(commands.Cog):
                 # Get team emoji
                 team_display = ""
                 if team_name:
-                    try:
-                        if emoji_id:
-                            emoji = self.bot.get_emoji(int(emoji_id))
-                            if emoji:
-                                team_display = f"{emoji} "
-                    except:
-                        pass
+                    team_display = get_team_emoji_str(self.bot, emoji_id)
 
                 if games_left <= 0:
                     status = "✅ Ready to return"

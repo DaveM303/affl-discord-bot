@@ -4,6 +4,7 @@ from discord import app_commands
 import aiosqlite
 from config import DB_PATH, ADMIN_ROLE_ID
 from commands.season_commands import get_round_name
+from utils import is_admin_user
 
 class SuspensionCommands(commands.Cog):
     def __init__(self, bot):
@@ -73,39 +74,19 @@ class SuspensionCommands(commands.Cog):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Check if user has admin permissions for admin commands"""
-        # Admin check for all commands
-        if interaction.guild.owner_id == interaction.user.id:
+        if await is_admin_user(interaction):
             return True
 
         if ADMIN_ROLE_ID:
-            member = interaction.guild.get_member(interaction.user.id) or interaction.user
-            if member:
-                admin_role_id = int(ADMIN_ROLE_ID) if isinstance(ADMIN_ROLE_ID, str) else ADMIN_ROLE_ID
-                if any(role.id == admin_role_id for role in member.roles):
-                    return True
-
             await interaction.response.send_message(
                 "❌ You need the admin role to use this command.",
                 ephemeral=True
             )
-            return False
-
-        try:
-            if interaction.user.guild_permissions.administrator:
-                return True
-        except:
-            pass
-
-        member = interaction.guild.get_member(interaction.user.id)
-        if member:
-            for role in member.roles:
-                if role.permissions.administrator:
-                    return True
-
-        await interaction.response.send_message(
-            "❌ You need Administrator permissions to use this command.",
-            ephemeral=True
-        )
+        else:
+            await interaction.response.send_message(
+                "❌ You need Administrator permissions to use this command.",
+                ephemeral=True
+            )
         return False
 
     async def get_current_round(self, db):

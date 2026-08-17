@@ -5,6 +5,7 @@ import aiosqlite
 import json
 from config import DB_PATH
 from commands.season_commands import get_round_name
+from utils import is_admin_user, get_team_emoji, get_team_emoji_str
 
 # AFL lineup structure with 18 positions + 5 interchange
 AFL_POSITIONS = [
@@ -43,23 +44,7 @@ class LineupCommands(commands.Cog):
 
     async def is_admin(self, interaction: discord.Interaction) -> bool:
         """Check if user is admin (owner or has admin role/permissions)"""
-        from config import ADMIN_ROLE_ID
-
-        if interaction.guild.owner_id == interaction.user.id:
-            return True
-
-        if ADMIN_ROLE_ID:
-            admin_role_id = int(ADMIN_ROLE_ID) if isinstance(ADMIN_ROLE_ID, str) else ADMIN_ROLE_ID
-            if any(role.id == admin_role_id for role in interaction.user.roles):
-                return True
-
-        try:
-            if interaction.user.guild_permissions.administrator:
-                return True
-        except:
-            pass
-
-        return False
+        return await is_admin_user(interaction)
 
     async def team_autocomplete(
         self,
@@ -250,15 +235,8 @@ class LineupCommands(commands.Cog):
             emoji_id = result[0] if result else None
         
         # Get emoji
-        emoji = ""
-        if emoji_id:
-            try:
-                emoji_obj = interaction.client.get_emoji(int(emoji_id))
-                if emoji_obj:
-                    emoji = f"{emoji_obj} "
-            except:
-                pass
-        
+        emoji = get_team_emoji_str(interaction.client, emoji_id)
+
         # Create embed
         embed = discord.Embed(
             title=f"{emoji}{team_name} Lineup",
@@ -810,33 +788,27 @@ class TeamLineupMenu(discord.ui.View):
                     )
                     out_players = await cursor.fetchall()
 
-                    # Check injury/suspension status for each player
+                    # Batch-check injury status for all outs at once
+                    cursor = await db.execute(
+                        f"""SELECT player_id FROM injuries
+                            WHERE player_id IN ({placeholders}) AND status = 'injured' AND return_round > ?""",
+                        list(outs) + [current_round]
+                    )
+                    injured_ids = {row[0] for row in await cursor.fetchall()}
+
+                    # Batch-check suspension status for all outs at once
+                    cursor = await db.execute(
+                        f"""SELECT player_id FROM suspensions
+                            WHERE player_id IN ({placeholders}) AND status = 'suspended' AND return_round > ?""",
+                        list(outs) + [current_round]
+                    )
+                    suspended_ids = {row[0] for row in await cursor.fetchall()}
+
+                    # Build name with status
                     for player_id, name, ovr in out_players:
-                        status = None
-
-                        # Check if injured
-                        cursor = await db.execute(
-                            """SELECT 1 FROM injuries
-                               WHERE player_id = ? AND status = 'injured' AND return_round > ?""",
-                            (player_id, current_round)
-                        )
-                        if await cursor.fetchone():
-                            status = "injured"
-
-                        # Check if suspended (only if not injured)
-                        if not status:
-                            cursor = await db.execute(
-                                """SELECT 1 FROM suspensions
-                                   WHERE player_id = ? AND status = 'suspended' AND return_round > ?""",
-                                (player_id, current_round)
-                            )
-                            if await cursor.fetchone():
-                                status = "suspended"
-
-                        # Build name with status
-                        if status == "injured":
+                        if player_id in injured_ids:
                             outs_names.append(f"{name} ({ovr}) (injured)")
-                        elif status == "suspended":
+                        elif player_id in suspended_ids:
                             outs_names.append(f"{name} ({ovr}) (suspended)")
                         else:
                             outs_names.append(f"{name} ({ovr}) (omitted)")
@@ -844,11 +816,7 @@ class TeamLineupMenu(discord.ui.View):
         # Build lineup embed
         round_display = get_round_name(current_round, regular_rounds) if current_round > 0 else "Offseason"
 
-        emoji = ""
-        if self.emoji_id:
-            emoji_obj = self.bot.get_emoji(int(self.emoji_id))
-            if emoji_obj:
-                emoji = f"{emoji_obj} "
+        emoji = get_team_emoji_str(self.bot, self.emoji_id)
 
         embed = discord.Embed(
             title=f"{emoji}{self.team_name} - {round_display} Lineup",
@@ -921,7 +889,7 @@ class TeamLineupMenu(discord.ui.View):
     async def save_starting_lineup_callback(self, interaction: discord.Interaction):
         """Save current lineup as starting lineup - show confirmation first"""
         # Create confirmation view
-        confirmation_view = ConfirmSaveStartingLineupView(self)
+        confirmation_view = ConfirmActionView(self, 'do_save_starting_lineup', discord.ButtonStyle.success)
 
         if self.has_starting_lineup:
             message = "⚠️ **Are you sure?**\n\nThis will overwrite your previously saved starting lineup with your current lineup."
@@ -1026,7 +994,7 @@ class TeamLineupMenu(discord.ui.View):
     async def clear_lineup_callback(self, interaction: discord.Interaction):
         """Clear the entire lineup - show confirmation first"""
         # Create confirmation view
-        confirmation_view = ConfirmClearLineupView(self)
+        confirmation_view = ConfirmActionView(self, 'do_clear_lineup', discord.ButtonStyle.danger)
         message = "⚠️ **Clear Lineup?**\n\nThis will remove all players from your lineup. This action cannot be undone."
 
         await interaction.response.send_message(message, view=confirmation_view, ephemeral=True)
@@ -1084,7 +1052,7 @@ class TeamLineupMenu(discord.ui.View):
         player_lookup = {pid: (name, pos, rating) for pid, name, pos, rating in players}
 
         # Create embed for starting lineup
-        emoji = self.bot.get_emoji(int(self.emoji_id)) if self.emoji_id else ""
+        emoji = get_team_emoji_str(self.bot, self.emoji_id)
         embed = discord.Embed(
             title=f"{emoji}{self.team_name} - Starting Lineup",
             color=discord.Color.gold()
@@ -1142,11 +1110,7 @@ class TeamLineupMenu(discord.ui.View):
         # Update warnings before creating embed
         await self.update_warnings()
 
-        emoji = ""
-        if self.emoji_id:
-            emoji_obj = self.bot.get_emoji(int(self.emoji_id))
-            if emoji_obj:
-                emoji = f"{emoji_obj} "
+        emoji = get_team_emoji_str(self.bot, self.emoji_id)
 
         embed = discord.Embed(
             title=f"{emoji}{self.team_name} - Lineup Management",
@@ -1197,11 +1161,13 @@ class TeamLineupMenu(discord.ui.View):
         return embed
 
 
-class ConfirmSaveStartingLineupView(discord.ui.View):
-    """Confirmation view for saving starting lineup"""
-    def __init__(self, parent_menu):
+class ConfirmActionView(discord.ui.View):
+    """Generic confirm/cancel view that calls a named async method on the parent menu when confirmed"""
+    def __init__(self, parent_menu, action_method_name, confirm_style=discord.ButtonStyle.success):
         super().__init__(timeout=60)
         self.parent_menu = parent_menu
+        self.action_method_name = action_method_name
+        self.confirm_button.style = confirm_style
 
     @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.success)
     async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1210,32 +1176,9 @@ class ConfirmSaveStartingLineupView(discord.ui.View):
             item.disabled = True
         await interaction.response.edit_message(view=self)
 
-        # Call the parent's do_save method
-        await self.parent_menu.do_save_starting_lineup(interaction)
-
-    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Disable all buttons
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(content="❌ Cancelled.", view=self)
-
-
-class ConfirmClearLineupView(discord.ui.View):
-    """Confirmation view for clearing lineup"""
-    def __init__(self, parent_menu):
-        super().__init__(timeout=60)
-        self.parent_menu = parent_menu
-
-    @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.danger)
-    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Disable all buttons and respond to interaction
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(view=self)
-
-        # Call the parent's do_clear method
-        await self.parent_menu.do_clear_lineup(interaction)
+        # Call the parent's action method
+        action = getattr(self.parent_menu, self.action_method_name)
+        await action(interaction)
 
     @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1274,16 +1217,18 @@ class LineupView(discord.ui.View):
     async def refresh_lineup_ids(self):
         """Get player IDs for current lineup players"""
         async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """SELECT l.position_name, p.player_id FROM lineups l
+                   JOIN players p ON l.player_id = p.player_id
+                   WHERE l.team_id = ?""",
+                (self.team_id,)
+            )
+            rows = await cursor.fetchall()
+            player_id_by_position = {pos_name: player_id for pos_name, player_id in rows}
+
             for pos_name in self.lineup:
-                cursor = await db.execute(
-                    """SELECT p.player_id FROM lineups l
-                       JOIN players p ON l.player_id = p.player_id
-                       WHERE l.team_id = ? AND l.position_name = ?""",
-                    (self.team_id, pos_name)
-                )
-                result = await cursor.fetchone()
-                if result:
-                    self.lineup[pos_name]['player_id'] = result[0]
+                if pos_name in player_id_by_position:
+                    self.lineup[pos_name]['player_id'] = player_id_by_position[pos_name]
     
     def add_position_buttons(self):
         """Add buttons for current position group"""
@@ -1481,15 +1426,8 @@ class LineupView(discord.ui.View):
         ]
         
         # Get team emoji
-        emoji = ""
-        if self.emoji_id:
-            try:
-                emoji_obj = self.bot.get_emoji(int(self.emoji_id))
-                if emoji_obj:
-                    emoji = f"{emoji_obj} "
-            except:
-                pass
-        
+        emoji = get_team_emoji_str(self.bot, self.emoji_id)
+
         title = f"{emoji}{self.team_name} - Lineup Editor"
         
         embed = discord.Embed(

@@ -3,6 +3,7 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH
+from utils import get_team_emoji_str
 
 class PlayerCommands(commands.Cog):
     def __init__(self, bot):
@@ -10,14 +11,7 @@ class PlayerCommands(commands.Cog):
 
     def get_team_emoji(self, emoji_id: str) -> str:
         """Get server emoji by ID, return empty string if not found."""
-        if not emoji_id:
-            return ""
-        try:
-            # Server emojis are accessed via bot.get_emoji(id)
-            emoji = self.bot.get_emoji(int(emoji_id))
-            return str(emoji) if emoji else ""
-        except:
-            return ""
+        return get_team_emoji_str(self.bot, emoji_id, trailing_space=False)
 
     async def player_name_autocomplete(
         self,
