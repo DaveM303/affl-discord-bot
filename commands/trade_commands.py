@@ -6,6 +6,14 @@ import json
 from config import DB_PATH
 from utils import is_admin_user, get_team_emoji, get_team_emoji_str
 
+# Canonical embed color per trade state, used by build_trade_embed() so every
+# trade-detail embed renders consistently regardless of which flow built it
+TRADE_COLOR_OFFERED = discord.Color.gold()      # new offer / awaiting response
+TRADE_COLOR_PENDING_APPROVAL = discord.Color.orange()  # awaiting moderator approval
+TRADE_COLOR_APPROVED = discord.Color.green()    # accepted / approved
+TRADE_COLOR_REJECTED = discord.Color.red()      # declined / vetoed
+TRADE_COLOR_WITHDRAWN = discord.Color.dark_gray()  # cancelled by the offering team
+
 class TradeCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -120,6 +128,53 @@ class TradeCommands(commands.Cog):
 
         return formatted_picks
 
+    def build_trade_embed(self, title, color, init_emoji_str, recv_emoji_str,
+                           init_items, recv_items, trade_id,
+                           description=None, footer_prefix=None, footer_suffix=None):
+        """
+        Build the two-sided "who receives what" embed shared by every trade-detail
+        view (offer, incoming/outgoing, mod approval, accepted/declined/vetoed, etc).
+
+        Args:
+            title: Embed title
+            color: discord.Color - use one of the TRADE_COLOR_* constants
+            init_emoji_str/recv_emoji_str: Pre-formatted team emoji strings (with
+                trailing space), as returned by utils.get_team_emoji_str
+            init_items/recv_items: Lists of formatted strings (players/picks) each
+                side receives
+            trade_id: Trade ID, shown in the footer
+            description: Optional embed description
+            footer_prefix: Optional text before "Trade ID: ...", e.g. "Offer 1 of 3 • "
+            footer_suffix: Optional text appended to the footer after the trade ID,
+                e.g. " • Use /pendingtrades if the buttons stop working"
+
+        Returns:
+            discord.Embed
+        """
+        embed = discord.Embed(title=title, color=color)
+        if description:
+            embed.description = description
+
+        embed.add_field(
+            name=f"**{recv_emoji_str}RECEIVE:**",
+            value="\n".join(init_items) if init_items else "*Nothing*",
+            inline=True
+        )
+        embed.add_field(
+            name=f"**{init_emoji_str}RECEIVE:**",
+            value="\n".join(recv_items) if recv_items else "*Nothing*",
+            inline=True
+        )
+
+        footer = f"Trade ID: {trade_id}"
+        if footer_prefix:
+            footer = footer_prefix + footer
+        if footer_suffix:
+            footer += footer_suffix
+        embed.set_footer(text=footer)
+
+        return embed
+
     async def get_user_team(self, user_id, guild):
         """Get the team associated with a user based on their role"""
         async with aiosqlite.connect(DB_PATH) as db:
@@ -162,21 +217,27 @@ class TradeCommands(commands.Cog):
                     ("trade_period_active", "1")
                 )
                 await db.commit()
-                await interaction.response.send_message("✅ **Trade period has been opened!** Coaches can now submit trade offers.")
+                await interaction.response.send_message("✅ **Trade period has been opened!** Coaches can now submit trade offers.", ephemeral=True)
 
             elif action == "end":
-                await db.execute(
-                    "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
-                    ("trade_period_active", "0")
-                )
+                # Trades awaiting moderator approval aren't resolved yet - warn before
+                # force-vetoing them and wiping the trades table
+                cursor = await db.execute("SELECT COUNT(*) FROM trades WHERE status = 'accepted'")
+                accepted_count = (await cursor.fetchone())[0]
 
-                # Mark all active trade offers as expired
-                await db.execute(
-                    "UPDATE trades SET status = 'expired' WHERE status = 'pending'"
-                )
+                if accepted_count > 0:
+                    view = ConfirmEndTradePeriodView(self)
+                    await interaction.response.send_message(
+                        f"⚠️ **{accepted_count} trade{'s' if accepted_count != 1 else ''} still awaiting moderator approval.**\n\n"
+                        f"Closing the trade period now will **auto-veto** {'these' if accepted_count != 1 else 'it'} "
+                        f"(no players/picks will move) and permanently delete all trade history for this period.\n\n"
+                        f"Proceed anyway?",
+                        view=view,
+                        ephemeral=True
+                    )
+                    return
 
-                await db.commit()
-                await interaction.response.send_message("✅ **Trade period has been closed!** Coaches can no longer submit trade offers. All pending trade offers have been marked as expired.")
+                await self.close_trade_period(interaction, db)
 
             elif action == "resend":
                 # Validate trade_id parameter
@@ -234,11 +295,6 @@ class TradeCommands(commands.Cog):
                         # Get emojis
                         init_emoji_str = get_team_emoji_str(self.bot, init_emoji_id)
                         recv_emoji_str = get_team_emoji_str(self.bot, recv_emoji_id)
-
-                        embed = discord.Embed(
-                            title=f"{init_emoji_str}**{init_team_name}** have sent you a trade offer!",
-                            color=discord.Color.gold()
-                        )
 
                         # Build what each team receives
                         offering_items = []
@@ -306,19 +362,16 @@ class TradeCommands(commands.Cog):
                                     _, name, pos, ovr, age = player
                                     receiving_items.append(f"{name} ({pos}, {age}, {ovr})")
 
-                        embed.add_field(
-                            name=f"**{recv_emoji_str}RECEIVE:**",
-                            value="\n".join(offering_items) if offering_items else "*Nothing*",
-                            inline=True
+                        embed = self.build_trade_embed(
+                            title=f"{init_emoji_str}**{init_team_name}** have sent you a trade offer!",
+                            color=TRADE_COLOR_OFFERED,
+                            init_emoji_str=init_emoji_str,
+                            recv_emoji_str=recv_emoji_str,
+                            init_items=offering_items,
+                            recv_items=receiving_items,
+                            trade_id=trade_id,
+                            footer_suffix=" • Use /trademenu if the button stops working"
                         )
-
-                        embed.add_field(
-                            name=f"**{init_emoji_str}RECEIVE:**",
-                            value="\n".join(receiving_items) if receiving_items else "*Nothing*",
-                            inline=True
-                        )
-
-                        embed.set_footer(text=f"Trade ID: {trade_id} • Use /trademenu if the button stops working")
 
                         # Add response buttons
                         view = TradeResponseView(trade_id, self.bot)
@@ -330,6 +383,123 @@ class TradeCommands(commands.Cog):
                         await interaction.followup.send(f"❌ Could not find channel for {recv_team_name}!", ephemeral=True)
                 else:
                     await interaction.followup.send(f"❌ No channel configured for {recv_team_name}!", ephemeral=True)
+
+    async def close_trade_period(self, interaction: discord.Interaction, db=None):
+        """Close the trade period: expire pending offers, auto-veto anything still
+        awaiting moderator approval (notifying both teams), then clear all trade
+        history for the period - nothing in the bot reads a completed trade again
+        once it's resolved, so there's no reason to keep it around."""
+        own_connection = db is None
+        if own_connection:
+            db = await aiosqlite.connect(DB_PATH)
+
+        try:
+            await db.execute(
+                "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
+                ("trade_period_active", "0")
+            )
+
+            # Mark all still-pending trade offers as expired
+            await db.execute(
+                "UPDATE trades SET status = 'expired' WHERE status = 'pending'"
+            )
+
+            # Force-veto any trade still awaiting moderator approval, notifying both
+            # teams the same way a manual veto does
+            cursor = await db.execute(
+                """SELECT trade_id, initiating_team_id, receiving_team_id,
+                          initiating_players, receiving_players, initiating_picks, receiving_picks
+                   FROM trades WHERE status = 'accepted'"""
+            )
+            accepted_trades = await cursor.fetchall()
+
+            for (trade_id, init_team_id, recv_team_id, init_players_json,
+                 recv_players_json, init_picks_json, recv_picks_json) in accepted_trades:
+                await db.execute(
+                    "UPDATE trades SET status = 'vetoed' WHERE trade_id = ?",
+                    (trade_id,)
+                )
+
+                try:
+                    cursor = await db.execute(
+                        "SELECT channel_id, team_name, emoji_id FROM teams WHERE team_id = ?",
+                        (init_team_id,)
+                    )
+                    init_team = await cursor.fetchone()
+                    cursor = await db.execute(
+                        "SELECT channel_id, team_name, emoji_id FROM teams WHERE team_id = ?",
+                        (recv_team_id,)
+                    )
+                    recv_team = await cursor.fetchone()
+
+                    if init_team and recv_team:
+                        init_channel_id, init_team_name, init_emoji_id = init_team
+                        recv_channel_id, recv_team_name, recv_emoji_id = recv_team
+
+                        init_players = json.loads(init_players_json) if init_players_json else []
+                        recv_players = json.loads(recv_players_json) if recv_players_json else []
+
+                        init_items = []
+                        recv_items = []
+
+                        if init_picks_json:
+                            init_items.extend(await self.format_picks_for_display(db, init_picks_json))
+                        if init_players:
+                            placeholders = ','.join('?' * len(init_players))
+                            cursor = await db.execute(
+                                f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                                init_players
+                            )
+                            init_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+
+                        if recv_picks_json:
+                            recv_items.extend(await self.format_picks_for_display(db, recv_picks_json))
+                        if recv_players:
+                            placeholders = ','.join('?' * len(recv_players))
+                            cursor = await db.execute(
+                                f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                                recv_players
+                            )
+                            recv_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
+
+                        recv_emoji_str = get_team_emoji_str(self.bot, recv_emoji_id)
+                        init_emoji_str = get_team_emoji_str(self.bot, init_emoji_id)
+
+                        embed = self.build_trade_embed(
+                            title="Trade auto-vetoed: trade period closed before moderator review",
+                            color=TRADE_COLOR_REJECTED,
+                            init_emoji_str=init_emoji_str,
+                            recv_emoji_str=recv_emoji_str,
+                            init_items=init_items,
+                            recv_items=recv_items,
+                            trade_id=trade_id
+                        )
+
+                        for channel_id in (init_channel_id, recv_channel_id):
+                            if channel_id:
+                                channel = self.bot.get_channel(int(channel_id))
+                                if channel:
+                                    await channel.send(embed=embed)
+                except Exception as e:
+                    print(f"Failed to notify teams of auto-vetoed trade {trade_id}: {e}")
+
+            # Nothing in the bot reads a trade again once it's no longer pending/accepted -
+            # clear the table entirely rather than accumulating dead history
+            await db.execute("DELETE FROM trades")
+
+            await db.commit()
+
+            message = "✅ **Trade period has been closed!** Coaches can no longer submit trade offers. All pending trade offers have been marked as expired."
+            if accepted_trades:
+                message += f"\n⚠️ {len(accepted_trades)} trade{'s' if len(accepted_trades) != 1 else ''} awaiting moderator approval {'were' if len(accepted_trades) != 1 else 'was'} auto-vetoed."
+
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        finally:
+            if own_connection:
+                await db.close()
 
     async def team_autocomplete(
         self,
@@ -643,11 +813,6 @@ class TradeMenuView(discord.ui.View):
             team_emoji_str = get_team_emoji_str(self.bot, team_emoji_id)
             your_emoji_str = get_team_emoji_str(self.bot, your_emoji_id)
 
-            embed = discord.Embed(
-                title=f"{team_emoji_str}**{team_name}** have sent you a trade offer!",
-                color=discord.Color.gold()
-            )
-
             # Build what each team receives (picks + players)
             init_players = json.loads(init_players_json) if init_players_json else []
             recv_players = json.loads(recv_players_json) if recv_players_json else []
@@ -685,19 +850,16 @@ class TradeMenuView(discord.ui.View):
                 )
                 recv_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
-            embed.add_field(
-                name=f"**{your_emoji_str}RECEIVE:**",
-                value="\n".join(init_items) if init_items else "*Nothing*",
-                inline=True
+            embed = self.parent_cog.build_trade_embed(
+                title=f"{team_emoji_str}**{team_name}** have sent you a trade offer!",
+                color=TRADE_COLOR_OFFERED,
+                init_emoji_str=team_emoji_str,
+                recv_emoji_str=your_emoji_str,
+                init_items=init_items,
+                recv_items=recv_items,
+                trade_id=current_trade_id,
+                footer_prefix=f"Offer {self.incoming_page + 1} of {len(self.incoming_trades)} • "
             )
-
-            embed.add_field(
-                name=f"**{team_emoji_str}RECEIVE:**",
-                value="\n".join(recv_items) if recv_items else "*Nothing*",
-                inline=True
-            )
-
-            embed.set_footer(text=f"Offer {self.incoming_page + 1} of {len(self.incoming_trades)} • Trade ID: {current_trade_id}")
 
         return embed
 
@@ -754,11 +916,6 @@ class TradeMenuView(discord.ui.View):
             team_emoji_str = get_team_emoji_str(self.bot, team_emoji_id)
             your_emoji_str = get_team_emoji_str(self.bot, your_emoji_id)
 
-            embed = discord.Embed(
-                title=f"📤 Trade Offer to {team_emoji_str}**{team_name}**",
-                color=discord.Color.orange()
-            )
-
             # Build what each team receives (picks + players)
             init_players = json.loads(init_players_json) if init_players_json else []
             recv_players = json.loads(recv_players_json) if recv_players_json else []
@@ -796,19 +953,16 @@ class TradeMenuView(discord.ui.View):
                 )
                 recv_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
-            embed.add_field(
-                name=f"**{team_emoji_str}RECEIVE:**",
-                value="\n".join(init_items) if init_items else "*Nothing*",
-                inline=True
+            embed = self.parent_cog.build_trade_embed(
+                title=f"📤 Trade Offer to {team_emoji_str}**{team_name}**",
+                color=TRADE_COLOR_OFFERED,
+                init_emoji_str=your_emoji_str,
+                recv_emoji_str=team_emoji_str,
+                init_items=init_items,
+                recv_items=recv_items,
+                trade_id=current_trade_id,
+                footer_prefix=f"Offer {self.outgoing_page + 1} of {len(self.outgoing_trades)} • "
             )
-
-            embed.add_field(
-                name=f"**{your_emoji_str}RECEIVE:**",
-                value="\n".join(recv_items) if recv_items else "*Nothing*",
-                inline=True
-            )
-
-            embed.set_footer(text=f"Offer {self.outgoing_page + 1} of {len(self.outgoing_trades)} • Trade ID: {current_trade_id}")
 
         return embed
 
@@ -865,11 +1019,6 @@ class TradeMenuView(discord.ui.View):
             init_emoji_str = get_team_emoji_str(self.bot, init_emoji_id)
             recv_emoji_str = get_team_emoji_str(self.bot, recv_emoji_id)
 
-            embed = discord.Embed(
-                title="⚖️ Trade Pending Mod Approval",
-                color=discord.Color.gold()
-            )
-
             # Build what each team receives (picks + players)
             init_players = json.loads(init_players_json) if init_players_json else []
             recv_players = json.loads(recv_players_json) if recv_players_json else []
@@ -907,19 +1056,16 @@ class TradeMenuView(discord.ui.View):
                 )
                 recv_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
-            embed.add_field(
-                name=f"**{recv_emoji_str}RECEIVE:**",
-                value="\n".join(init_items) if init_items else "*Nothing*",
-                inline=True
+            embed = self.parent_cog.build_trade_embed(
+                title="⚖️ Trade Pending Mod Approval",
+                color=TRADE_COLOR_PENDING_APPROVAL,
+                init_emoji_str=init_emoji_str,
+                recv_emoji_str=recv_emoji_str,
+                init_items=init_items,
+                recv_items=recv_items,
+                trade_id=trade_id,
+                footer_prefix=f"Trade {self.approval_page + 1} of {len(self.approval_trades)} • "
             )
-
-            embed.add_field(
-                name=f"**{init_emoji_str}RECEIVE:**",
-                value="\n".join(recv_items) if recv_items else "*Nothing*",
-                inline=True
-            )
-
-            embed.set_footer(text=f"Trade {self.approval_page + 1} of {len(self.approval_trades)} • Trade ID: {trade_id}")
 
         return embed
 
@@ -1103,25 +1249,16 @@ class TradeMenuView(discord.ui.View):
                 init_emoji_str = get_team_emoji_str(self.bot, init_emoji_id)
                 recv_emoji_str = get_team_emoji_str(self.bot, recv_emoji_id)
 
-                embed = discord.Embed(
+                embed = self.parent_cog.build_trade_embed(
                     title=f"✅ {recv_emoji_str}**{self.team_name}** have accepted your trade offer!",
-                    description="*Awaiting moderator approval*",
-                    color=discord.Color.green()
+                    color=TRADE_COLOR_PENDING_APPROVAL,
+                    init_emoji_str=init_emoji_str,
+                    recv_emoji_str=recv_emoji_str,
+                    init_items=init_items,
+                    recv_items=recv_items,
+                    trade_id=trade_id,
+                    description="*Awaiting moderator approval*"
                 )
-
-                embed.add_field(
-                    name=f"**{recv_emoji_str}RECEIVE:**",
-                    value="\n".join(init_items) if init_items else "*Nothing*",
-                    inline=True
-                )
-
-                embed.add_field(
-                    name=f"**{init_emoji_str}RECEIVE:**",
-                    value="\n".join(recv_items) if recv_items else "*Nothing*",
-                    inline=True
-                )
-
-                embed.set_footer(text=f"Trade ID: {trade_id}")
 
                 await channel.send(embed=embed)
 
@@ -1224,24 +1361,15 @@ class TradeMenuView(discord.ui.View):
                 init_emoji_str = get_team_emoji_str(self.bot, init_emoji_id)
                 recv_emoji_str = get_team_emoji_str(self.bot, recv_emoji_id)
 
-                embed = discord.Embed(
+                embed = self.parent_cog.build_trade_embed(
                     title=f"❌ {recv_emoji_str}**{self.team_name}** have declined your trade offer!",
-                    color=discord.Color.red()
+                    color=TRADE_COLOR_REJECTED,
+                    init_emoji_str=init_emoji_str,
+                    recv_emoji_str=recv_emoji_str,
+                    init_items=init_items,
+                    recv_items=recv_items,
+                    trade_id=trade_id
                 )
-
-                embed.add_field(
-                    name=f"**{recv_emoji_str}RECEIVE:**",
-                    value="\n".join(init_items) if init_items else "*Nothing*",
-                    inline=True
-                )
-
-                embed.add_field(
-                    name=f"**{init_emoji_str}RECEIVE:**",
-                    value="\n".join(recv_items) if recv_items else "*Nothing*",
-                    inline=True
-                )
-
-                embed.set_footer(text=f"Trade ID: {trade_id}")
 
                 await channel.send(embed=embed)
 
@@ -1394,24 +1522,15 @@ class TradeMenuView(discord.ui.View):
                             )
                             recv_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
-                    embed = discord.Embed(
+                    embed = self.parent_cog.build_trade_embed(
                         title=f"↩️ {init_emoji_str}**{init_team_name}** have withdrawn their trade offer!",
-                        color=discord.Color.dark_gray()
+                        color=TRADE_COLOR_WITHDRAWN,
+                        init_emoji_str=init_emoji_str,
+                        recv_emoji_str=recv_emoji_str,
+                        init_items=init_items,
+                        recv_items=recv_items,
+                        trade_id=trade_id
                     )
-
-                    embed.add_field(
-                        name=f"**{recv_emoji_str}RECEIVE:**",
-                        value="\n".join(init_items) if init_items else "*Nothing*",
-                        inline=True
-                    )
-
-                    embed.add_field(
-                        name=f"**{init_emoji_str}RECEIVE:**",
-                        value="\n".join(recv_items) if recv_items else "*Nothing*",
-                        inline=True
-                    )
-
-                    embed.set_footer(text=f"Trade ID: {trade_id}")
 
                     await channel.send(embed=embed)
 
@@ -1490,11 +1609,6 @@ class PendingTradesView(discord.ui.View):
             init_emoji_str = get_team_emoji_str(self.bot, init_emoji_id)
             recv_emoji_str = get_team_emoji_str(self.bot, recv_emoji_id)
 
-            embed = discord.Embed(
-                title="⚖️ Trade Pending Mod Approval",
-                color=discord.Color.gold()
-            )
-
             # Build what each team receives (picks + players)
             init_players = json.loads(init_players_json) if init_players_json else []
             recv_players = json.loads(recv_players_json) if recv_players_json else []
@@ -1532,19 +1646,16 @@ class PendingTradesView(discord.ui.View):
                 )
                 recv_items.extend([f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()])
 
-            embed.add_field(
-                name=f"**{recv_emoji_str}RECEIVE:**",
-                value="\n".join(init_items) if init_items else "*Nothing*",
-                inline=True
+            embed = self.parent_cog.build_trade_embed(
+                title="⚖️ Trade Pending Mod Approval",
+                color=TRADE_COLOR_PENDING_APPROVAL,
+                init_emoji_str=init_emoji_str,
+                recv_emoji_str=recv_emoji_str,
+                init_items=init_items,
+                recv_items=recv_items,
+                trade_id=trade_id,
+                footer_prefix=f"Trade {self.current_page + 1} of {len(self.pending_trades)} • "
             )
-
-            embed.add_field(
-                name=f"**{init_emoji_str}RECEIVE:**",
-                value="\n".join(recv_items) if recv_items else "*Nothing*",
-                inline=True
-            )
-
-            embed.set_footer(text=f"Trade {self.current_page + 1} of {len(self.pending_trades)} • Trade ID: {trade_id}")
 
         return embed
 
@@ -1995,11 +2106,6 @@ class TradeOfferView(discord.ui.View):
                 else:
                     title = f"{initiating_emoji_str}**{self.initiating_team_name}** have sent you a counter-offer!"
 
-                embed = discord.Embed(
-                    title=title,
-                    color=discord.Color.gold()
-                )
-
                 # Build what each team receives (picks + players)
                 offering_items = []
                 receiving_items = []
@@ -2044,19 +2150,16 @@ class TradeOfferView(discord.ui.View):
 
                 receiving_emoji_str = f"{self.receiving_emoji} " if self.receiving_emoji else ""
 
-                embed.add_field(
-                    name=f"**{receiving_emoji_str}RECEIVE:**",
-                    value="\n".join(offering_items) if offering_items else "*Nothing*",
-                    inline=True
+                embed = self.parent_cog.build_trade_embed(
+                    title=title,
+                    color=TRADE_COLOR_OFFERED,
+                    init_emoji_str=initiating_emoji_str,
+                    recv_emoji_str=receiving_emoji_str,
+                    init_items=offering_items,
+                    recv_items=receiving_items,
+                    trade_id=trade_id,
+                    footer_suffix=" • Use /trademenu if the button stops working"
                 )
-
-                embed.add_field(
-                    name=f"**{initiating_emoji_str}RECEIVE:**",
-                    value="\n".join(receiving_items) if receiving_items else "*Nothing*",
-                    inline=True
-                )
-
-                embed.set_footer(text=f"Trade ID: {trade_id} • Use /trademenu if the button stops working")
 
                 # Add response buttons
                 view = TradeResponseView(trade_id, self.bot)
@@ -2449,24 +2552,16 @@ class TradeResponseView(discord.ui.View):
         # Send to approval channel
         channel = self.bot.get_channel(approval_channel_id)
         if channel:
-            embed = discord.Embed(
+            embed = parent_cog.build_trade_embed(
                 title="⚖️ Trade Pending Mod Approval",
-                color=discord.Color.orange()
+                color=TRADE_COLOR_PENDING_APPROVAL,
+                init_emoji_str=init_emoji_str,
+                recv_emoji_str=recv_emoji_str,
+                init_items=initiating_items,
+                recv_items=receiving_items,
+                trade_id=self.trade_id,
+                footer_suffix=" • Use /pendingtrades if the buttons stop working"
             )
-
-            embed.add_field(
-                name=f"**{recv_emoji_str}RECEIVE:**",
-                value="\n".join(initiating_items) if initiating_items else "*Nothing*",
-                inline=True
-            )
-
-            embed.add_field(
-                name=f"**{init_emoji_str}RECEIVE:**",
-                value="\n".join(receiving_items) if receiving_items else "*Nothing*",
-                inline=True
-            )
-
-            embed.set_footer(text=f"Trade ID: {self.trade_id} • Use /pendingtrades if the buttons stop working")
 
             view = RespondToTradeView(self.trade_id, self.bot)
             await channel.send(embed=embed, view=view)
@@ -2627,55 +2722,22 @@ class ModeratorApprovalView(discord.ui.View):
             init_emoji_str = get_team_emoji_str(self.bot, init_emoji_id)
             recv_emoji_str = get_team_emoji_str(self.bot, recv_emoji_id)
 
-            # Notify initiating team
-            if init_channel_id:
-                channel = self.bot.get_channel(int(init_channel_id))
-                if channel:
-                    embed = discord.Embed(
-                        title=f"Your trade with **{recv_team_name}** was vetoed by the league commission.",
-                        color=discord.Color.red()
-                    )
-
-                    embed.add_field(
-                        name=f"**{recv_emoji_str}RECEIVE:**",
-                        value="\n".join(init_items) if init_items else "*Nothing*",
-                        inline=True
-                    )
-
-                    embed.add_field(
-                        name=f"**{init_emoji_str}RECEIVE:**",
-                        value="\n".join(recv_items) if recv_items else "*Nothing*",
-                        inline=True
-                    )
-
-                    embed.set_footer(text=f"Trade ID: {self.trade_id}")
-
-                    await channel.send(embed=embed)
-
-            # Notify receiving team
-            if recv_channel_id:
-                channel = self.bot.get_channel(int(recv_channel_id))
-                if channel:
-                    embed = discord.Embed(
-                        title=f"Your trade with **{init_team_name}** was vetoed by the league commission.",
-                        color=discord.Color.red()
-                    )
-
-                    embed.add_field(
-                        name=f"**{recv_emoji_str}RECEIVE:**",
-                        value="\n".join(init_items) if init_items else "*Nothing*",
-                        inline=True
-                    )
-
-                    embed.add_field(
-                        name=f"**{init_emoji_str}RECEIVE:**",
-                        value="\n".join(recv_items) if recv_items else "*Nothing*",
-                        inline=True
-                    )
-
-                    embed.set_footer(text=f"Trade ID: {self.trade_id}")
-
-                    await channel.send(embed=embed)
+            # Notify both teams - same embed content, just a different "who was
+            # trading with whom" title and destination channel per team
+            for channel_id, other_team_name in ((init_channel_id, recv_team_name), (recv_channel_id, init_team_name)):
+                if channel_id:
+                    channel = self.bot.get_channel(int(channel_id))
+                    if channel:
+                        embed = parent_cog.build_trade_embed(
+                            title=f"Your trade with **{other_team_name}** was vetoed by the league commission.",
+                            color=TRADE_COLOR_REJECTED,
+                            init_emoji_str=init_emoji_str,
+                            recv_emoji_str=recv_emoji_str,
+                            init_items=init_items,
+                            recv_items=recv_items,
+                            trade_id=self.trade_id
+                        )
+                        await channel.send(embed=embed)
 
         # Disable buttons
         for item in self.children:
@@ -2775,6 +2837,26 @@ class ModeratorApprovalView(discord.ui.View):
                     )
                     return
 
+            async def remove_from_starting_lineup(old_team_id, traded_player_ids):
+                """Strip traded players out of the old team's saved starting lineup, if any."""
+                cursor = await db.execute(
+                    "SELECT lineup_data FROM starting_lineups WHERE team_id = ?",
+                    (old_team_id,)
+                )
+                result = await cursor.fetchone()
+                if not result:
+                    return
+
+                lineup_data = json.loads(result[0])
+                traded_ids_str = {str(pid) for pid in traded_player_ids}
+                remaining = {pos: pid for pos, pid in lineup_data.items() if str(pid) not in traded_ids_str}
+
+                if len(remaining) != len(lineup_data):
+                    await db.execute(
+                        "UPDATE starting_lineups SET lineup_data = ? WHERE team_id = ?",
+                        (json.dumps(remaining), old_team_id)
+                    )
+
             # Transfer players
             if init_players:
                 placeholders = ','.join('?' * len(init_players))
@@ -2782,6 +2864,12 @@ class ModeratorApprovalView(discord.ui.View):
                     f"UPDATE players SET team_id = ? WHERE player_id IN ({placeholders})",
                     [recv_team_id] + init_players
                 )
+                # Remove from the old team's saved lineup - they no longer play for them
+                await db.execute(
+                    f"DELETE FROM lineups WHERE player_id IN ({placeholders})",
+                    init_players
+                )
+                await remove_from_starting_lineup(init_team_id, init_players)
 
             if recv_players:
                 placeholders = ','.join('?' * len(recv_players))
@@ -2789,6 +2877,12 @@ class ModeratorApprovalView(discord.ui.View):
                     f"UPDATE players SET team_id = ? WHERE player_id IN ({placeholders})",
                     [init_team_id] + recv_players
                 )
+                # Remove from the old team's saved lineup - they no longer play for them
+                await db.execute(
+                    f"DELETE FROM lineups WHERE player_id IN ({placeholders})",
+                    recv_players
+                )
+                await remove_from_starting_lineup(recv_team_id, recv_players)
 
             # Transfer draft picks
             if init_picks:
@@ -2889,24 +2983,19 @@ class ModeratorApprovalView(discord.ui.View):
         recv_emoji_str = get_team_emoji_str(self.bot, recv_emoji_id)
 
         # Create trade announcement embed
-        embed = discord.Embed(
+        # Note: init_receiving/recv_receiving already mean "what that team receives"
+        # (opposite of build_trade_embed's init_items/recv_items, which pair with the
+        # OTHER team's emoji) - swap which side is passed as init/recv so the emoji
+        # label still lines up with the correct content.
+        embed = parent_cog.build_trade_embed(
             title="Trade approved!",
-            color=discord.Color.green()
+            color=TRADE_COLOR_APPROVED,
+            init_emoji_str=recv_emoji_str,
+            recv_emoji_str=init_emoji_str,
+            init_items=init_receiving,
+            recv_items=recv_receiving,
+            trade_id=self.trade_id
         )
-
-        embed.add_field(
-            name=f"**{init_emoji_str}RECEIVE:**",
-            value="\n".join(init_receiving) if init_receiving else "*Nothing*",
-            inline=True
-        )
-
-        embed.add_field(
-            name=f"**{recv_emoji_str}RECEIVE:**",
-            value="\n".join(recv_receiving) if recv_receiving else "*Nothing*",
-            inline=True
-        )
-
-        embed.set_footer(text=f"Trade ID: {self.trade_id}")
 
         # Announcements below are best-effort - the trade itself is already committed,
         # so a failed send here must not be reported as the trade approval failing.
@@ -2936,6 +3025,27 @@ class ModeratorApprovalView(discord.ui.View):
             item.disabled = True
 
         await interaction.edit_original_response(content="✅ Trade approved and executed!", view=self)
+
+
+class ConfirmEndTradePeriodView(discord.ui.View):
+    """Confirmation prompt shown when closing the trade period would auto-veto
+    trades still awaiting moderator approval"""
+    def __init__(self, trade_cog):
+        super().__init__(timeout=120)
+        self.trade_cog = trade_cog
+
+    @discord.ui.button(label="Close Trade Period", style=discord.ButtonStyle.danger)
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+        await self.trade_cog.close_trade_period(interaction)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="❌ Cancelled. Trade period remains open.", view=self)
 
 
 async def setup(bot):

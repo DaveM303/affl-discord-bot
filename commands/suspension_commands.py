@@ -3,7 +3,6 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH, ADMIN_ROLE_ID
-from commands.season_commands import get_round_name
 from utils import is_admin_user
 
 class SuspensionCommands(commands.Cog):
@@ -97,20 +96,6 @@ class SuspensionCommands(commands.Cog):
         result = await cursor.fetchone()
         return result[0] if result else 0
 
-    async def notify_team_channel(self, team_id, message):
-        """Send notification to team channel"""
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT channel_id FROM teams WHERE team_id = ?",
-                (team_id,)
-            )
-            result = await cursor.fetchone()
-
-            if result and result[0]:
-                channel = self.bot.get_channel(int(result[0]))
-                if channel:
-                    await channel.send(message)
-
     @app_commands.command(name="addsuspension", description="[ADMIN] Add a suspension to a player")
     @app_commands.describe(
         player_name="Player name",
@@ -137,10 +122,7 @@ class SuspensionCommands(commands.Cog):
                 return
 
             cursor = await db.execute(
-                """SELECT p.player_id, p.name, p.team_id, t.team_name
-                   FROM players p
-                   LEFT JOIN teams t ON p.team_id = t.team_id
-                   WHERE p.player_id = ?""",
+                "SELECT player_id, name FROM players WHERE player_id = ?",
                 (player_id,)
             )
             player = await cursor.fetchone()
@@ -152,7 +134,7 @@ class SuspensionCommands(commands.Cog):
                 )
                 return
 
-            player_id, p_name, team_id, team_name = player
+            player_id, p_name = player
 
             # Check if player is already suspended
             cursor = await db.execute(
@@ -179,57 +161,21 @@ class SuspensionCommands(commands.Cog):
                 )
                 return
 
-            # Calculate return round
-            return_round = current_round + games_missed
-
             # Add suspension
             await db.execute(
-                """INSERT INTO suspensions (player_id, suspension_reason, suspension_round, games_missed, return_round, status)
+                """INSERT INTO suspensions (player_id, suspension_reason, suspension_round, games_missed, games_remaining, status)
                    VALUES (?, ?, ?, ?, ?, 'suspended')""",
-                (player_id, suspension_reason, current_round, games_missed, return_round)
+                (player_id, suspension_reason, current_round, games_missed, games_missed)
             )
             await db.commit()
-
-            # Get total rounds and regular_rounds to check if season-ending
-            cursor = await db.execute(
-                "SELECT total_rounds, regular_rounds FROM seasons WHERE status = 'active' LIMIT 1"
-            )
-            season_info = await cursor.fetchone()
-            total_rounds = season_info[0] if season_info else 0
-            regular_rounds = season_info[1] if season_info else 24
-
-            # Format expected return
-            if return_round > total_rounds:
-                expected_return = "SEASON"
-            else:
-                expected_return = get_round_name(return_round, regular_rounds)
 
             # Send response
             await interaction.response.send_message(
                 f"🚫 **{p_name}** has been suspended!\n"
                 f"• Reason: {suspension_reason}\n"
-                f"• Games missed: {games_missed} game{'s' if games_missed != 1 else ''}\n"
-                f"• Expected return: {expected_return}",
+                f"• Games missed: {games_missed} game{'s' if games_missed != 1 else ''}",
                 ephemeral=True
             )
-
-            # Notify team channel
-            if team_id:
-                team_display = team_name if team_name else "Delisted"
-                game_text = "game" if games_missed == 1 else "games"
-
-                # Format expected return for channel notification
-                if return_round > total_rounds:
-                    return_text = "SEASON"
-                else:
-                    return_text = get_round_name(return_round, regular_rounds)
-
-                await self.notify_team_channel(
-                    team_id,
-                    f"🚫 **Suspension Update**\n"
-                    f"**{p_name}** has been suspended for **{suspension_reason}** and will miss **{games_missed} {game_text}**.\n"
-                    f"Expected return: {return_text}"
-                )
 
     @app_commands.command(name="editsuspension", description="[ADMIN] Edit a player's suspension")
     @app_commands.describe(
@@ -275,7 +221,7 @@ class SuspensionCommands(commands.Cog):
 
             # Find active suspension
             cursor = await db.execute(
-                """SELECT suspension_id, suspension_reason, suspension_round, games_missed, return_round
+                """SELECT suspension_id, suspension_reason, suspension_round, games_missed, games_remaining
                    FROM suspensions
                    WHERE player_id = ? AND status = 'suspended'""",
                 (player_id,)
@@ -289,17 +235,7 @@ class SuspensionCommands(commands.Cog):
                 )
                 return
 
-            suspension_id, old_suspension_reason, suspension_round, old_games_missed, old_return_round = suspension
-
-            # Get current round
-            cursor = await db.execute(
-                "SELECT current_round FROM seasons WHERE status = 'active' LIMIT 1"
-            )
-            season_info = await cursor.fetchone()
-            current_round = season_info[0] if season_info else 0
-
-            # Calculate current games remaining
-            old_games_remaining = old_return_round - current_round
+            suspension_id, old_suspension_reason, suspension_round, old_games_missed, old_games_remaining = suspension
 
             # Update fields
             updates = []
@@ -312,13 +248,15 @@ class SuspensionCommands(commands.Cog):
                 changes.append(f"Reason: {old_suspension_reason} → {new_suspension_reason}")
 
             if new_games_missed:
-                # Calculate return round from current round, not suspension round
-                new_return_round = current_round + new_games_missed
-                updates.append("games_missed = ?, return_round = ?")
-                values.extend([new_games_missed, new_return_round])
-                old_game_text = "game" if old_games_remaining == 1 else "games"
+                updates.append("games_missed = ?, games_remaining = ?")
+                values.extend([new_games_missed, new_games_missed])
+                # old_games_remaining is NULL when this is a still-TBC
+                # report-driven suspension (see season_commands.py's
+                # _roll_pending_report_suspensions) - shown as "TBC" rather
+                # than a raw None, same as /editinjury's equivalent case.
+                old_display = "TBC" if old_games_remaining is None else f"{old_games_remaining} {'game' if old_games_remaining == 1 else 'games'}"
                 new_game_text = "game" if new_games_missed == 1 else "games"
-                changes.append(f"Games remaining: {old_games_remaining} {old_game_text} → {new_games_missed} {new_game_text}")
+                changes.append(f"Games remaining: {old_display} → {new_games_missed} {new_game_text}")
 
             if not updates:
                 await interaction.response.send_message(
@@ -355,10 +293,7 @@ class SuspensionCommands(commands.Cog):
                 return
 
             cursor = await db.execute(
-                """SELECT p.player_id, p.name, p.team_id, t.team_name
-                   FROM players p
-                   LEFT JOIN teams t ON p.team_id = t.team_id
-                   WHERE p.player_id = ?""",
+                "SELECT player_id, name FROM players WHERE player_id = ?",
                 (player_id,)
             )
             player = await cursor.fetchone()
@@ -370,7 +305,7 @@ class SuspensionCommands(commands.Cog):
                 )
                 return
 
-            player_id, p_name, team_id, team_name = player
+            player_id, p_name = player
 
             # Find and remove active suspension
             cursor = await db.execute(
@@ -387,9 +322,9 @@ class SuspensionCommands(commands.Cog):
                 )
                 return
 
-            # Mark as completed
+            # Completed - remove the suspension record
             await db.execute(
-                "UPDATE suspensions SET status = 'completed' WHERE suspension_id = ?",
+                "DELETE FROM suspensions WHERE suspension_id = ?",
                 (suspension[0],)
             )
             await db.commit()
@@ -398,15 +333,6 @@ class SuspensionCommands(commands.Cog):
                 f"✅ **{p_name}**'s suspension has been lifted!",
                 ephemeral=True
             )
-
-            # Notify team channel
-            if team_id:
-                team_display = team_name if team_name else "Delisted"
-                await self.notify_team_channel(
-                    team_id,
-                    f"✅ **Suspension Update**\n"
-                    f"**{p_name}**'s suspension has been lifted and they are available for selection!"
-                )
 
 
 async def setup(bot):

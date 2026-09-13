@@ -4,6 +4,76 @@ from discord.ext import commands
 import aiosqlite
 from config import DB_PATH
 from utils import get_current_season, is_admin_user, calculate_contract_expiry, get_team_emoji, get_team_emoji_str, get_user_team
+from compensation_image import render_compensation_chart_image
+
+
+DEFAULT_AUCTION_POINTS = 300
+
+
+async def get_fa_period(db):
+    """Read the current free agency period from the settings table.
+
+    Returns (status, season_number, auction_points). status/season_number are
+    None when no period has ever been started.
+    """
+    cursor = await db.execute(
+        """SELECT setting_key, setting_value FROM settings
+           WHERE setting_key IN ('fa_period_status', 'fa_period_season', 'fa_period_auction_points')"""
+    )
+    rows = await cursor.fetchall()
+    values = {key: value for key, value in rows}
+
+    status = values.get('fa_period_status') or None
+
+    season_number = None
+    if values.get('fa_period_season') not in (None, ''):
+        try:
+            season_number = int(values['fa_period_season'])
+        except (TypeError, ValueError):
+            season_number = None
+
+    auction_points = DEFAULT_AUCTION_POINTS
+    if values.get('fa_period_auction_points') not in (None, ''):
+        try:
+            auction_points = int(values['fa_period_auction_points'])
+        except (TypeError, ValueError):
+            auction_points = DEFAULT_AUCTION_POINTS
+
+    return status, season_number, auction_points
+
+
+async def get_fa_period_for_season(db, season_number):
+    """Read the current free agency period, but only if it belongs to the given
+    season. Returns (status, auction_points) or (None, DEFAULT_AUCTION_POINTS)."""
+    status, period_season, auction_points = await get_fa_period(db)
+    if status is None or period_season != season_number:
+        return None, DEFAULT_AUCTION_POINTS
+    return status, auction_points
+
+
+async def set_fa_period(db, status, season_number, auction_points=DEFAULT_AUCTION_POINTS):
+    """Write the current free agency period to the settings table."""
+    await db.execute(
+        "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
+        ("fa_period_status", str(status))
+    )
+    await db.execute(
+        "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
+        ("fa_period_season", str(season_number))
+    )
+    await db.execute(
+        "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
+        ("fa_period_auction_points", str(auction_points))
+    )
+
+
+async def set_fa_period_status(db, status):
+    """Update only the status of the current free agency period."""
+    await db.execute(
+        "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
+        ("fa_period_status", str(status))
+    )
+
 
 class FreeAgencyCommands(commands.Cog):
     def __init__(self, bot):
@@ -24,15 +94,9 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Check for active free agency period
-                cursor = await db.execute(
-                    "SELECT period_id, status FROM free_agency_periods WHERE season_number = ?",
-                    (current_season,)
-                )
-                period_result = await cursor.fetchone()
+                status, _ = await get_fa_period_for_season(db, current_season)
 
-                if period_result:
-                    period_id, status = period_result
-
+                if status:
                     # Re-register free re-sign button views
                     if status == 'resign':
                         cursor = await db.execute(
@@ -47,7 +111,7 @@ class FreeAgencyCommands(commands.Cog):
                         for (team_id,) in teams_with_free_agents:
                             allowance = await self.calculate_free_resign_allowance(db, team_id, current_season)
                             if allowance > 0:
-                                view = FreeResignButtonView(self.bot, period_id, team_id, allowance)
+                                view = FreeResignButtonView(self.bot, current_season, team_id, allowance)
                                 self.bot.add_view(view)
 
                         print(f"Re-registered {len(teams_with_free_agents)} free re-sign button views")
@@ -58,13 +122,13 @@ class FreeAgencyCommands(commands.Cog):
                             """SELECT DISTINCT t.team_id
                                FROM free_agency_results r
                                JOIN teams t ON r.original_team_id = t.team_id
-                               WHERE r.period_id = ? AND r.winning_team_id IS NOT NULL""",
-                            (period_id,)
+                               WHERE r.season_number = ? AND r.winning_team_id IS NOT NULL""",
+                            (current_season,)
                         )
                         teams_with_losses = await cursor.fetchall()
 
                         for (team_id,) in teams_with_losses:
-                            view = MatchingNotificationView(self.bot, period_id, team_id)
+                            view = MatchingNotificationView(self.bot, current_season, team_id)
                             self.bot.add_view(view)
 
                         print(f"Re-registered {len(teams_with_losses)} matching notification views")
@@ -223,15 +287,15 @@ class FreeAgencyCommands(commands.Cog):
             # Otherwise, round to nearest
             return round(credits)
 
-    async def process_free_resigns(self, db, period_id, current_season):
+    async def process_free_resigns(self, db, season_number):
         """Process all confirmed free re-signs and assign contracts"""
         # Get all confirmed free re-signs
         cursor = await db.execute(
             """SELECT r.player_id, p.age
                FROM free_agency_resigns r
                JOIN players p ON r.player_id = p.player_id
-               WHERE r.period_id = ? AND r.confirmed = 1""",
-            (period_id,)
+               WHERE r.season_number = ? AND r.confirmed = 1""",
+            (season_number,)
         )
         resigns = await cursor.fetchall()
 
@@ -240,9 +304,9 @@ class FreeAgencyCommands(commands.Cog):
             contract_years = await self.get_contract_years_for_age(db, age)
 
             # Calculate new contract expiry
-            # current_season is the season that just ended (Offseason 9 means Season 9 just ended)
+            # season_number is the season that just ended (Offseason 9 means Season 9 just ended)
             # Adding contract_years gives us the last season they'll play under the new contract
-            new_contract_expiry = calculate_contract_expiry(current_season, contract_years)
+            new_contract_expiry = calculate_contract_expiry(season_number, contract_years)
 
             # Update player's contract
             await db.execute(
@@ -252,7 +316,7 @@ class FreeAgencyCommands(commands.Cog):
 
         await db.commit()
 
-    async def log_free_resign_results(self, db, period_id, current_season):
+    async def log_free_resign_results(self, db, season_number):
         """Log free re-sign results to auctions channel"""
         log_channel = await self.get_auctions_log_channel(db)
         if not log_channel:
@@ -264,9 +328,9 @@ class FreeAgencyCommands(commands.Cog):
                FROM free_agency_resigns r
                JOIN players p ON r.player_id = p.player_id
                JOIN teams t ON p.team_id = t.team_id
-               WHERE r.period_id = ? AND r.confirmed = 1
+               WHERE r.season_number = ? AND r.confirmed = 1
                ORDER BY t.team_name, p.name""",
-            (period_id,)
+            (season_number,)
         )
         resigns = await cursor.fetchall()
 
@@ -275,7 +339,7 @@ class FreeAgencyCommands(commands.Cog):
 
         # Build embed
         embed = discord.Embed(
-            title=f"Season {current_season} Auctions - Free Re-Signs",
+            title=f"Season {season_number} Auctions - Free Re-Signs",
             color=discord.Color.blue()
         )
 
@@ -285,7 +349,7 @@ class FreeAgencyCommands(commands.Cog):
             # Get emoji
             emoji_str = get_team_emoji_str(self.bot, emoji_id)
 
-            contract_years = contract_expiry - current_season
+            contract_years = contract_expiry - season_number
             player_lines.append(f"{emoji_str}**{name}** ({pos}, {age}, {ovr}) - **{contract_years} years**")
 
         # Split into fields if needed (max 1024 chars per field)
@@ -312,7 +376,7 @@ class FreeAgencyCommands(commands.Cog):
         except Exception as e:
             print(f"Error logging free re-sign results: {e}")
 
-    async def log_winning_bids(self, db, period_id, current_season):
+    async def log_winning_bids(self, db, season_number):
         """Log winning bids to auctions channel"""
         try:
             log_channel = await self.get_auctions_log_channel(db)
@@ -324,12 +388,7 @@ class FreeAgencyCommands(commands.Cog):
             return
 
         # Get this period's auction points allowance
-        cursor = await db.execute(
-            "SELECT auction_points FROM free_agency_periods WHERE period_id = ?",
-            (period_id,)
-        )
-        period_result = await cursor.fetchone()
-        auction_points = period_result[0] if period_result else 300
+        _, auction_points = await get_fa_period_for_season(db, season_number)
 
         # Get all winning bids
         cursor = await db.execute(
@@ -341,9 +400,9 @@ class FreeAgencyCommands(commands.Cog):
                JOIN players p ON r.player_id = p.player_id
                JOIN teams orig_team ON r.original_team_id = orig_team.team_id
                LEFT JOIN teams bid_team ON r.winning_team_id = bid_team.team_id
-               WHERE r.period_id = ? AND r.winning_team_id IS NOT NULL
+               WHERE r.season_number = ? AND r.winning_team_id IS NOT NULL
                ORDER BY r.winning_bid DESC, p.name""",
-            (period_id,)
+            (season_number,)
         )
         winning_bids = await cursor.fetchall()
 
@@ -366,9 +425,9 @@ class FreeAgencyCommands(commands.Cog):
                 """SELECT COALESCE(SUM(b.bid_amount), 0)
                    FROM free_agency_bids b
                    JOIN players p ON b.player_id = p.player_id
-                   WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
+                   WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'winning'
                    AND p.team_id != ?""",
-                (period_id, team_id, team_id)
+                (season_number, team_id, team_id)
             )
             spent = (await cursor.fetchone())[0]
             team_points[team_id] = auction_points - spent
@@ -407,7 +466,7 @@ class FreeAgencyCommands(commands.Cog):
         if player_lines:
             embeds = []
             current_embed = discord.Embed(
-                title=f"Season {current_season} Auctions - Matching Period",
+                title=f"Season {season_number} Auctions - Matching Period",
                 description="**Winning bids:**",
                 color=discord.Color.gold()
             )
@@ -425,7 +484,7 @@ class FreeAgencyCommands(commands.Cog):
 
                     # Start new embed
                     current_embed = discord.Embed(
-                        title=f"Season {current_season} Auctions - Matching Period (cont.)",
+                        title=f"Season {season_number} Auctions - Matching Period (cont.)",
                         description="**Winning bids (continued):**",
                         color=discord.Color.gold()
                     )
@@ -449,7 +508,7 @@ class FreeAgencyCommands(commands.Cog):
                 import traceback
                 traceback.print_exc()
 
-    async def log_final_movements(self, db, period_id, current_season):
+    async def log_final_movements(self, db, season_number):
         """Log final player movements and compensation picks to auctions channel"""
         log_channel = await self.get_auctions_log_channel(db)
         if not log_channel:
@@ -466,9 +525,9 @@ class FreeAgencyCommands(commands.Cog):
                JOIN players p ON r.player_id = p.player_id
                JOIN teams orig_team ON r.original_team_id = orig_team.team_id
                LEFT JOIN teams new_team ON r.winning_team_id = new_team.team_id
-               WHERE r.period_id = ? AND r.matched = 0 AND r.winning_team_id IS NOT NULL
+               WHERE r.season_number = ? AND r.matched = 0 AND r.winning_team_id IS NOT NULL
                ORDER BY p.name""",
-            (period_id,)
+            (season_number,)
         )
         transfers = await cursor.fetchall()
 
@@ -478,7 +537,7 @@ class FreeAgencyCommands(commands.Cog):
 
         # Build embed
         embed = discord.Embed(
-            title=f"Season {current_season} Free Agency Player Movements",
+            title=f"Season {season_number} Free Agency Player Movements",
             color=discord.Color.green()
         )
 
@@ -651,17 +710,10 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Check if there's an active bidding period
-                cursor = await db.execute(
-                    """SELECT period_id, auction_points FROM free_agency_periods
-                       WHERE season_number = ? AND status = 'bidding'""",
-                    (current_season,)
-                )
-                period_result = await cursor.fetchone()
-                if not period_result:
+                period_status, max_points = await get_fa_period_for_season(db, current_season)
+                if period_status != 'bidding':
                     await interaction.followup.send("❌ No active bidding period!")
                     return
-
-                period_id, max_points = period_result
 
                 # Get player details
                 player_id = int(player)
@@ -705,17 +757,17 @@ class FreeAgencyCommands(commands.Cog):
                 # Calculate user's remaining points (excluding current player)
                 cursor = await db.execute(
                     """SELECT COALESCE(SUM(bid_amount), 0) FROM free_agency_bids
-                       WHERE period_id = ? AND team_id = ? AND status = 'active'
+                       WHERE season_number = ? AND team_id = ? AND status = 'active'
                        AND player_id != ?""",
-                    (period_id, user_team_id, player_id)
+                    (current_season, user_team_id, player_id)
                 )
                 spent_points = (await cursor.fetchone())[0]
 
                 # Check if user already has a bid on this player (for validation)
                 cursor = await db.execute(
                     """SELECT bid_amount FROM free_agency_bids
-                       WHERE period_id = ? AND team_id = ? AND player_id = ?""",
-                    (period_id, user_team_id, player_id)
+                       WHERE season_number = ? AND team_id = ? AND player_id = ?""",
+                    (current_season, user_team_id, player_id)
                 )
                 existing_bid = await cursor.fetchone()
 
@@ -735,15 +787,15 @@ class FreeAgencyCommands(commands.Cog):
                     await db.execute(
                         """UPDATE free_agency_bids
                            SET bid_amount = ?, updated_at = CURRENT_TIMESTAMP
-                           WHERE period_id = ? AND team_id = ? AND player_id = ?""",
-                        (amount, period_id, user_team_id, player_id)
+                           WHERE season_number = ? AND team_id = ? AND player_id = ?""",
+                        (amount, current_season, user_team_id, player_id)
                     )
                     action = "Updated"
                 else:
                     await db.execute(
-                        """INSERT INTO free_agency_bids (period_id, team_id, player_id, bid_amount)
+                        """INSERT INTO free_agency_bids (season_number, team_id, player_id, bid_amount)
                            VALUES (?, ?, ?, ?)""",
-                        (period_id, user_team_id, player_id, amount)
+                        (current_season, user_team_id, player_id, amount)
                     )
                     action = "Placed"
 
@@ -817,17 +869,10 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Check if there's an active bidding period
-                cursor = await db.execute(
-                    """SELECT period_id, auction_points, status FROM free_agency_periods
-                       WHERE season_number = ?""",
-                    (current_season,)
-                )
-                period_result = await cursor.fetchone()
-                if not period_result:
+                period_status, max_points = await get_fa_period_for_season(db, current_season)
+                if not period_status:
                     await interaction.followup.send("❌ No free agency period active!")
                     return
-
-                period_id, max_points, period_status = period_result
 
                 if period_status not in ('bidding', 'matching'):
                     await interaction.followup.send(f"❌ No active free agency period! Current status: {period_status}")
@@ -849,9 +894,9 @@ class FreeAgencyCommands(commands.Cog):
                            FROM free_agency_bids b
                            JOIN players p ON b.player_id = p.player_id
                            JOIN teams t ON p.team_id = t.team_id
-                           WHERE b.period_id = ? AND b.team_id = ? AND b.status IN ('active', 'winning')
+                           WHERE b.season_number = ? AND b.team_id = ? AND b.status IN ('active', 'winning')
                            ORDER BY b.bid_amount DESC, p.name""",
-                        (period_id, user_team_id)
+                        (current_season, user_team_id)
                     )
                 else:
                     cursor = await db.execute(
@@ -860,9 +905,9 @@ class FreeAgencyCommands(commands.Cog):
                            FROM free_agency_bids b
                            JOIN players p ON b.player_id = p.player_id
                            JOIN teams t ON p.team_id = t.team_id
-                           WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'active'
+                           WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'active'
                            ORDER BY b.bid_amount DESC, p.name""",
-                        (period_id, user_team_id)
+                        (current_season, user_team_id)
                     )
                 bids = await cursor.fetchall()
 
@@ -871,7 +916,7 @@ class FreeAgencyCommands(commands.Cog):
                 remaining_points = max_points - total_spent
 
                 # Create view
-                view = AuctionsMenuView(self.bot, period_id, user_team_id, user_team_name, bids, remaining_points, max_points, current_season, period_status)
+                view = AuctionsMenuView(self.bot, user_team_id, user_team_name, bids, remaining_points, max_points, current_season, period_status)
                 embed = view.create_embed()
                 await interaction.followup.send(embed=embed, view=view)
 
@@ -888,20 +933,15 @@ class FreeAgencyCommands(commands.Cog):
                     return [app_commands.Choice(name="Check Status", value="check_status")]
 
                 # Check if there's an existing period
-                cursor = await db.execute(
-                    "SELECT status FROM free_agency_periods WHERE season_number = ?",
-                    (current_season,)
-                )
-                period = await cursor.fetchone()
+                status, _ = await get_fa_period_for_season(db, current_season)
 
                 choices = [app_commands.Choice(name="Check Status", value="check_status")]
 
-                if not period:
+                if not status:
                     # No period - allow starting resign or bidding
                     choices.append(app_commands.Choice(name="Start Free Re-Sign Period", value="start_resign"))
                     choices.append(app_commands.Choice(name="Start Bidding Period", value="start_bidding"))
                 else:
-                    status = period[0]
                     if status == "resign":
                         choices.append(app_commands.Choice(name="Resend Free Re-Sign Notifications", value="resend_resigns"))
                         choices.append(app_commands.Choice(name="Start Bidding Period", value="start_bidding"))
@@ -955,21 +995,15 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Check if there's an existing period
-                cursor = await db.execute(
-                    "SELECT period_id, status FROM free_agency_periods WHERE season_number = ?",
-                    (current_season,)
-                )
-                period = await cursor.fetchone()
+                status, _ = await get_fa_period_for_season(db, current_season)
 
-                if not period:
+                if not status:
                     await interaction.followup.send(
                         f"📊 **Free Agency Status - Season {current_season}**\n\n"
                         f"**Status:** No active free agency period\n\n"
                         f"Use `/freeagencyperiod` to start a free re-sign or bidding period."
                     )
                     return
-
-                period_id, status = period
 
                 # Build status message based on period status
                 if status == "resign":
@@ -982,7 +1016,7 @@ class FreeAgencyCommands(commands.Cog):
                            AND t.team_id NOT IN (
                                SELECT DISTINCT team_id
                                FROM free_agency_resigns
-                               WHERE period_id = ? AND confirmed = 1
+                               WHERE season_number = ? AND confirmed = 1
                            )
                            AND (
                                SELECT COUNT(*)
@@ -990,7 +1024,7 @@ class FreeAgencyCommands(commands.Cog):
                                WHERE p2.team_id = t.team_id
                                AND p2.contract_expiry = ?
                            ) > 0""",
-                        (current_season, period_id, current_season)
+                        (current_season, current_season, current_season)
                     )
                     unconfirmed_teams_raw = await cursor.fetchall()
 
@@ -1024,8 +1058,8 @@ class FreeAgencyCommands(commands.Cog):
                 elif status == "bidding":
                     # Get total bids
                     cursor = await db.execute(
-                        "SELECT COUNT(*) FROM free_agency_bids WHERE period_id = ?",
-                        (period_id,)
+                        "SELECT COUNT(*) FROM free_agency_bids WHERE season_number = ?",
+                        (current_season,)
                     )
                     bid_count = (await cursor.fetchone())[0]
 
@@ -1043,9 +1077,9 @@ class FreeAgencyCommands(commands.Cog):
                         """SELECT DISTINCT t.team_name
                            FROM free_agency_results r
                            JOIN teams t ON r.original_team_id = t.team_id
-                           WHERE r.period_id = ? AND r.winning_team_id IS NOT NULL
+                           WHERE r.season_number = ? AND r.winning_team_id IS NOT NULL
                            AND r.confirmed_at IS NULL""",
-                        (period_id,)
+                        (current_season,)
                     )
                     unconfirmed_teams = [row[0] for row in await cursor.fetchall()]
 
@@ -1086,16 +1120,10 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Check if there's an active resign period
-                cursor = await db.execute(
-                    "SELECT period_id FROM free_agency_periods WHERE season_number = ? AND status = 'resign'",
-                    (current_season,)
-                )
-                period = await cursor.fetchone()
-                if not period:
+                status, _ = await get_fa_period_for_season(db, current_season)
+                if status != 'resign':
                     await interaction.followup.send("❌ No active free re-sign period!")
                     return
-
-                period_id = period[0]
 
                 # Get all teams with free agents and calculate their allowances
                 cursor = await db.execute(
@@ -1142,7 +1170,7 @@ class FreeAgencyCommands(commands.Cog):
                         embed.set_footer(text="Use the button below to select which players to re-sign for free.")
 
                         # Create view with button to open selection UI
-                        view = FreeResignButtonView(self.bot, period_id, team_id, allowance)
+                        view = FreeResignButtonView(self.bot, current_season, team_id, allowance)
 
                         try:
                             channel = self.bot.get_channel(int(channel_id))
@@ -1168,13 +1196,9 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Check if period already exists
-                cursor = await db.execute(
-                    "SELECT period_id, status FROM free_agency_periods WHERE season_number = ?",
-                    (current_season,)
-                )
-                existing = await cursor.fetchone()
-                if existing:
-                    await interaction.followup.send(f"❌ Free agency period already exists for Season {current_season} (status: {existing[1]})")
+                existing_status, _ = await get_fa_period_for_season(db, current_season)
+                if existing_status:
+                    await interaction.followup.send(f"❌ Free agency period already exists for Season {current_season} (status: {existing_status})")
                     return
 
                 # Get free agents (only those with a team)
@@ -1190,12 +1214,7 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Create period with 'resign' status
-                cursor = await db.execute(
-                    """INSERT INTO free_agency_periods (season_number, status, auction_points, resign_started_at)
-                       VALUES (?, 'resign', 300, CURRENT_TIMESTAMP)""",
-                    (current_season,)
-                )
-                period_id = cursor.lastrowid
+                await set_fa_period(db, 'resign', current_season, DEFAULT_AUCTION_POINTS)
                 await db.commit()
 
                 # Get all teams with free agents and calculate their allowances
@@ -1254,7 +1273,7 @@ class FreeAgencyCommands(commands.Cog):
                         embed.set_footer(text="Use the button below to select which players to re-sign for free.")
 
                         # Create view with button to open selection UI
-                        view = FreeResignButtonView(self.bot, period_id, team_id, allowance)
+                        view = FreeResignButtonView(self.bot, current_season, team_id, allowance)
 
                         try:
                             channel = self.bot.get_channel(int(channel_id))
@@ -1294,15 +1313,9 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Check if period already exists
-                cursor = await db.execute(
-                    "SELECT period_id, status FROM free_agency_periods WHERE season_number = ?",
-                    (current_season,)
-                )
-                existing = await cursor.fetchone()
+                status, _ = await get_fa_period_for_season(db, current_season)
 
-                if existing:
-                    period_id, status = existing
-
+                if status:
                     # If period is in 'resign' status, transition to 'bidding'
                     if status == 'resign':
                         # Check if all eligible teams have confirmed their free re-signs
@@ -1324,8 +1337,8 @@ class FreeAgencyCommands(commands.Cog):
                                 # Check if they've confirmed
                                 cursor = await db.execute(
                                     """SELECT COUNT(*) FROM free_agency_resigns
-                                       WHERE period_id = ? AND team_id = ? AND confirmed = 1""",
-                                    (period_id, team_id)
+                                       WHERE season_number = ? AND team_id = ? AND confirmed = 1""",
+                                    (current_season, team_id)
                                 )
                                 confirmed_count = (await cursor.fetchone())[0]
 
@@ -1342,18 +1355,13 @@ class FreeAgencyCommands(commands.Cog):
 
                         # All teams confirmed - transition to bidding
                         # First, process the free re-signs
-                        await self.process_free_resigns(db, period_id, current_season)
+                        await self.process_free_resigns(db, current_season)
 
                         # Log free re-sign results
-                        await self.log_free_resign_results(db, period_id, current_season)
+                        await self.log_free_resign_results(db, current_season)
 
                         # Update period status to bidding
-                        await db.execute(
-                            """UPDATE free_agency_periods
-                               SET status = 'bidding', bidding_started_at = CURRENT_TIMESTAMP
-                               WHERE period_id = ?""",
-                            (period_id,)
-                        )
+                        await set_fa_period_status(db, 'bidding')
                         await db.commit()
 
                         await interaction.followup.send(
@@ -1382,12 +1390,7 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Create period
-                cursor = await db.execute(
-                    """INSERT INTO free_agency_periods (season_number, status, auction_points, bidding_started_at)
-                       VALUES (?, 'bidding', 300, CURRENT_TIMESTAMP)""",
-                    (current_season,)
-                )
-                period_id = cursor.lastrowid
+                await set_fa_period(db, 'bidding', current_season, DEFAULT_AUCTION_POINTS)
                 await db.commit()
 
                 await interaction.followup.send(
@@ -1411,16 +1414,11 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Get period
-                cursor = await db.execute(
-                    "SELECT period_id, status, auction_points FROM free_agency_periods WHERE season_number = ?",
-                    (current_season,)
-                )
-                period_result = await cursor.fetchone()
-                if not period_result:
+                status, auction_points = await get_fa_period_for_season(db, current_season)
+                if not status:
                     await interaction.followup.send("❌ No free agency period found! Start bidding first.")
                     return
 
-                period_id, status, auction_points = period_result
                 if status != 'bidding':
                     await interaction.followup.send(f"❌ Period is not in bidding status (current: {status})")
                     return
@@ -1446,9 +1444,9 @@ class FreeAgencyCommands(commands.Cog):
                            FROM free_agency_bids b
                            LEFT JOIN ladder_positions lp ON b.team_id = lp.team_id
                            LEFT JOIN seasons s ON lp.season_id = s.season_id AND s.season_number = ?
-                           WHERE b.period_id = ? AND b.player_id = ? AND b.status = 'active'
+                           WHERE b.season_number = ? AND b.player_id = ? AND b.status = 'active'
                            ORDER BY b.bid_amount DESC, lp.position ASC""",
-                        (current_season, period_id, player_id)
+                        (current_season, current_season, player_id)
                     )
                     bids = await cursor.fetchall()
 
@@ -1459,9 +1457,9 @@ class FreeAgencyCommands(commands.Cog):
                         # Create result
                         await db.execute(
                             """INSERT INTO free_agency_results
-                               (period_id, player_id, original_team_id, winning_team_id, winning_bid, matched)
+                               (season_number, player_id, original_team_id, winning_team_id, winning_bid, matched)
                                VALUES (?, ?, ?, ?, ?, 0)""",
-                            (period_id, player_id, original_team_id, winning_team_id, winning_bid)
+                            (current_season, player_id, original_team_id, winning_team_id, winning_bid)
                         )
                         results_created += 1
 
@@ -1469,46 +1467,41 @@ class FreeAgencyCommands(commands.Cog):
                         await db.execute(
                             """UPDATE free_agency_bids
                                SET status = 'outbid'
-                               WHERE period_id = ? AND player_id = ? AND team_id != ?""",
-                            (period_id, player_id, winning_team_id)
+                               WHERE season_number = ? AND player_id = ? AND team_id != ?""",
+                            (current_season, player_id, winning_team_id)
                         )
 
                         # Mark winning bid
                         await db.execute(
                             """UPDATE free_agency_bids
                                SET status = 'winning'
-                               WHERE period_id = ? AND player_id = ? AND team_id = ?""",
-                            (period_id, player_id, winning_team_id)
+                               WHERE season_number = ? AND player_id = ? AND team_id = ?""",
+                            (current_season, player_id, winning_team_id)
                         )
                     else:
                         # No bids - will be auto re-signed
                         await db.execute(
                             """INSERT INTO free_agency_results
-                               (period_id, player_id, original_team_id, winning_team_id, winning_bid, matched)
+                               (season_number, player_id, original_team_id, winning_team_id, winning_bid, matched)
                                VALUES (?, ?, ?, NULL, NULL, 0)""",
-                            (period_id, player_id, original_team_id)
+                            (current_season, player_id, original_team_id)
                         )
 
                 # Update period status
-                await db.execute(
-                    """UPDATE free_agency_periods
-                       SET status = 'matching', bidding_ended_at = CURRENT_TIMESTAMP
-                       WHERE period_id = ?""",
-                    (period_id,)
-                )
+                await set_fa_period_status(db, 'matching')
                 await db.commit()
 
                 # Log winning bids
-                await self.log_winning_bids(db, period_id, current_season)
+                await self.log_winning_bids(db, current_season)
 
                 # Send matching interface to teams with winning bids on their players
                 cursor = await db.execute(
                     """SELECT DISTINCT t.team_id, t.team_name, t.channel_id
                        FROM free_agency_results r
                        JOIN teams t ON r.original_team_id = t.team_id
-                       WHERE r.period_id = ? AND r.winning_team_id IS NOT NULL
+                       WHERE r.season_number = ? AND r.winning_team_id IS NOT NULL
                        AND t.channel_id IS NOT NULL""",
-                    (period_id,)
+                    (current_season,)
                 )
                 teams_with_losses = await cursor.fetchall()
 
@@ -1522,8 +1515,8 @@ class FreeAgencyCommands(commands.Cog):
                                FROM free_agency_results r
                                JOIN players p ON r.player_id = p.player_id
                                JOIN teams t ON r.winning_team_id = t.team_id
-                               WHERE r.period_id = ? AND r.original_team_id = ?""",
-                            (period_id, team_id)
+                               WHERE r.season_number = ? AND r.original_team_id = ?""",
+                            (current_season, team_id)
                         )
                         player_bids = await cursor.fetchall()
 
@@ -1533,9 +1526,9 @@ class FreeAgencyCommands(commands.Cog):
                                 """SELECT COALESCE(SUM(b.bid_amount), 0)
                                    FROM free_agency_bids b
                                    JOIN players p ON b.player_id = p.player_id
-                                   WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
+                                   WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'winning'
                                    AND p.team_id != ?""",
-                                (period_id, team_id, team_id)
+                                (current_season, team_id, team_id)
                             )
                             winning_bid_total = (await cursor.fetchone())[0]
                             remaining_points = auction_points - winning_bid_total
@@ -1543,9 +1536,9 @@ class FreeAgencyCommands(commands.Cog):
                             channel = self.bot.get_channel(int(channel_id))
                             if channel:
                                 # Create static notification view with button
-                                view = MatchingNotificationView(self.bot, period_id, team_id)
+                                view = MatchingNotificationView(self.bot, current_season, team_id)
                                 embed = await MatchingNotificationView.create_notification_embed(
-                                    self.bot, period_id, team_id, team_name, player_bids, remaining_points
+                                    self.bot, current_season, team_id, team_name, player_bids, remaining_points
                                 )
                                 await channel.send(embed=embed, view=view)
                                 matching_messages_sent += 1
@@ -1573,22 +1566,17 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Get period
-                cursor = await db.execute(
-                    "SELECT period_id, status FROM free_agency_periods WHERE season_number = ?",
-                    (current_season,)
-                )
-                period_result = await cursor.fetchone()
-                if not period_result:
+                status, _ = await get_fa_period_for_season(db, current_season)
+                if not status:
                     await interaction.followup.send("❌ No free agency period found!")
                     return
 
-                period_id, status = period_result
                 if status != 'matching':
                     await interaction.followup.send(f"❌ Period is not in matching status (current: {status})")
                     return
 
                 # Resend winning bids summary
-                await self.log_winning_bids(db, period_id, current_season)
+                await self.log_winning_bids(db, current_season)
 
                 await interaction.followup.send("✅ Winning bids summary resent to auctions log channel!")
 
@@ -1606,16 +1594,11 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Get period
-                cursor = await db.execute(
-                    "SELECT period_id, status, auction_points FROM free_agency_periods WHERE season_number = ?",
-                    (current_season,)
-                )
-                period_result = await cursor.fetchone()
-                if not period_result:
+                status, auction_points = await get_fa_period_for_season(db, current_season)
+                if not status:
                     await interaction.followup.send("❌ No free agency period found!")
                     return
 
-                period_id, status, auction_points = period_result
                 if status != 'matching':
                     await interaction.followup.send(f"❌ Period is not in matching status (current: {status})")
                     return
@@ -1625,9 +1608,9 @@ class FreeAgencyCommands(commands.Cog):
                     """SELECT DISTINCT t.team_id, t.team_name, t.channel_id
                        FROM free_agency_results r
                        JOIN teams t ON r.original_team_id = t.team_id
-                       WHERE r.period_id = ? AND r.winning_team_id IS NOT NULL
+                       WHERE r.season_number = ? AND r.winning_team_id IS NOT NULL
                        AND t.channel_id IS NOT NULL""",
-                    (period_id,)
+                    (current_season,)
                 )
                 teams_with_losses = await cursor.fetchall()
 
@@ -1641,8 +1624,8 @@ class FreeAgencyCommands(commands.Cog):
                                FROM free_agency_results r
                                JOIN players p ON r.player_id = p.player_id
                                JOIN teams t ON r.winning_team_id = t.team_id
-                               WHERE r.period_id = ? AND r.original_team_id = ?""",
-                            (period_id, team_id)
+                               WHERE r.season_number = ? AND r.original_team_id = ?""",
+                            (current_season, team_id)
                         )
                         player_bids = await cursor.fetchall()
 
@@ -1652,9 +1635,9 @@ class FreeAgencyCommands(commands.Cog):
                                 """SELECT COALESCE(SUM(b.bid_amount), 0)
                                    FROM free_agency_bids b
                                    JOIN players p ON b.player_id = p.player_id
-                                   WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
+                                   WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'winning'
                                    AND p.team_id != ?""",
-                                (period_id, team_id, team_id)
+                                (current_season, team_id, team_id)
                             )
                             winning_bid_total = (await cursor.fetchone())[0]
                             remaining_points = auction_points - winning_bid_total
@@ -1662,9 +1645,9 @@ class FreeAgencyCommands(commands.Cog):
                             channel = self.bot.get_channel(int(channel_id))
                             if channel:
                                 # Create static notification view with button
-                                view = MatchingNotificationView(self.bot, period_id, team_id)
+                                view = MatchingNotificationView(self.bot, current_season, team_id)
                                 embed = await MatchingNotificationView.create_notification_embed(
-                                    self.bot, period_id, team_id, team_name, player_bids, remaining_points
+                                    self.bot, current_season, team_id, team_name, player_bids, remaining_points
                                 )
                                 await channel.send(embed=embed, view=view)
                                 matching_messages_sent += 1
@@ -1678,7 +1661,7 @@ class FreeAgencyCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
 
-    async def send_auction_summaries(self, db, period_id):
+    async def send_auction_summaries(self, db, season_number):
         """Send auction summary to each team's channel"""
         try:
             # Get all teams
@@ -1699,9 +1682,9 @@ class FreeAgencyCommands(commands.Cog):
                        FROM free_agency_results r
                        JOIN players p ON r.player_id = p.player_id
                        JOIN teams ot ON r.original_team_id = ot.team_id
-                       WHERE r.period_id = ? AND r.winning_team_id = ? AND r.matched = 0
+                       WHERE r.season_number = ? AND r.winning_team_id = ? AND r.matched = 0
                        ORDER BY p.overall_rating DESC, p.name""",
-                    (period_id, team_id)
+                    (season_number, team_id)
                 )
                 players_gained = await cursor.fetchall()
 
@@ -1713,9 +1696,9 @@ class FreeAgencyCommands(commands.Cog):
                        JOIN players p ON r.player_id = p.player_id
                        LEFT JOIN draft_picks dp ON r.compensation_pick_id = dp.pick_id
                        LEFT JOIN teams wt ON r.winning_team_id = wt.team_id
-                       WHERE r.period_id = ? AND r.original_team_id = ? AND (r.winning_team_id IS NOT NULL OR r.matched = 1)
+                       WHERE r.season_number = ? AND r.original_team_id = ? AND (r.winning_team_id IS NOT NULL OR r.matched = 1)
                        ORDER BY p.overall_rating DESC, p.name""",
-                    (period_id, team_id)
+                    (season_number, team_id)
                 )
                 players_lost = await cursor.fetchall()
 
@@ -1724,12 +1707,12 @@ class FreeAgencyCommands(commands.Cog):
                     """SELECT COUNT(*)
                        FROM free_agency_resigns fr
                        JOIN players p ON fr.player_id = p.player_id
-                       WHERE fr.period_id = ? AND fr.team_id = ? AND fr.confirmed = 1
+                       WHERE fr.season_number = ? AND fr.team_id = ? AND fr.confirmed = 1
                        AND NOT EXISTS (
                            SELECT 1 FROM free_agency_results r
-                           WHERE r.period_id = ? AND r.player_id = p.player_id
+                           WHERE r.season_number = ? AND r.player_id = p.player_id
                        )""",
-                    (period_id, team_id, period_id)
+                    (season_number, team_id, season_number)
                 )
                 auto_resigned_count = (await cursor.fetchone())[0]
 
@@ -1817,16 +1800,11 @@ class FreeAgencyCommands(commands.Cog):
                     return
 
                 # Get period
-                cursor = await db.execute(
-                    "SELECT period_id, status, auction_points FROM free_agency_periods WHERE season_number = ?",
-                    (current_season,)
-                )
-                period_result = await cursor.fetchone()
-                if not period_result:
+                status, auction_points = await get_fa_period_for_season(db, current_season)
+                if not status:
                     await interaction.followup.send("❌ No free agency period found!")
                     return
 
-                period_id, status, auction_points = period_result
                 if status != 'matching':
                     await interaction.followup.send(f"❌ Period is not in matching status (current: {status})")
                     return
@@ -1837,8 +1815,8 @@ class FreeAgencyCommands(commands.Cog):
                     """SELECT DISTINCT t.team_id, t.team_name
                        FROM free_agency_results r
                        JOIN teams t ON r.original_team_id = t.team_id
-                       WHERE r.period_id = ? AND r.winning_team_id IS NOT NULL""",
-                    (period_id,)
+                       WHERE r.season_number = ? AND r.winning_team_id IS NOT NULL""",
+                    (current_season,)
                 )
                 teams_with_bids = await cursor.fetchall()
 
@@ -1848,9 +1826,9 @@ class FreeAgencyCommands(commands.Cog):
                     # Check if this team has any unconfirmed results (confirmed_at IS NULL)
                     cursor = await db.execute(
                         """SELECT COUNT(*) FROM free_agency_results
-                           WHERE period_id = ? AND original_team_id = ?
+                           WHERE season_number = ? AND original_team_id = ?
                            AND winning_team_id IS NOT NULL AND confirmed_at IS NULL""",
-                        (period_id, team_id)
+                        (current_season, team_id)
                     )
                     unconfirmed_count = (await cursor.fetchone())[0]
 
@@ -1873,8 +1851,8 @@ class FreeAgencyCommands(commands.Cog):
                               r.winning_bid, r.matched, p.name, p.age, p.overall_rating
                        FROM free_agency_results r
                        JOIN players p ON r.player_id = p.player_id
-                       WHERE r.period_id = ?""",
-                    (period_id,)
+                       WHERE r.season_number = ?""",
+                    (current_season,)
                 )
                 results = await cursor.fetchall()
 
@@ -1927,27 +1905,36 @@ class FreeAgencyCommands(commands.Cog):
                             compensation_picks += 1
 
                 # Update period status
-                await db.execute(
-                    """UPDATE free_agency_periods
-                       SET status = 'completed', matching_ended_at = CURRENT_TIMESTAMP
-                       WHERE period_id = ?""",
-                    (period_id,)
-                )
+                await set_fa_period_status(db, 'completed')
 
                 # Clear all bids for this period now that it's completed
                 # This "refunds" all auction points for the next season
                 await db.execute(
-                    "DELETE FROM free_agency_bids WHERE period_id = ?",
-                    (period_id,)
+                    "DELETE FROM free_agency_bids WHERE season_number = ?",
+                    (current_season,)
                 )
 
                 # Insert compensation picks into the current draft automatically
                 picks_inserted = 0
                 draft_name = None
                 if compensation_picks > 0:
-                    # Find the current draft
+                    # Find the draft for THIS free agency period's own
+                    # season, not just "whichever draft happens to be
+                    # 'current'" - a season's National Draft is named
+                    # after (and stored with season_number = ) the season
+                    # AFTER the one its ladder is based on (see
+                    # ensure_future_seasons_exist's naming convention), so
+                    # this period's compensation picks belong in
+                    # season_number = current_season + 1. Scoping
+                    # explicitly guards against ever misfiling a
+                    # compensation pick into the wrong draft if two drafts
+                    # were somehow both left at 'current' at once (e.g. an
+                    # admin started this season without first completing/
+                    # starting last season's draft) - previously this had
+                    # no season filter and no LIMIT 1 at all.
                     cursor = await db.execute(
-                        "SELECT draft_id, draft_name, season_number FROM drafts WHERE status = 'current'"
+                        "SELECT draft_id, draft_name, season_number FROM drafts WHERE season_number = ? AND status = 'current'",
+                        (current_season + 1,)
                     )
                     draft = await cursor.fetchone()
 
@@ -1962,13 +1949,13 @@ class FreeAgencyCommands(commands.Cog):
                                FROM free_agency_results r
                                LEFT JOIN ladder_positions lp ON r.original_team_id = lp.team_id
                                LEFT JOIN seasons s ON lp.season_id = s.season_id AND s.season_number = ?
-                               WHERE r.period_id = ? AND r.compensation_band IS NOT NULL
+                               WHERE r.season_number = ? AND r.compensation_band IS NOT NULL
                                ORDER BY r.compensation_band,
                                         CASE
                                             WHEN r.compensation_band IN (2, 4) THEN lp.position
                                             ELSE r.original_team_id
                                         END DESC""",
-                            (current_season, period_id)
+                            (current_season, current_season)
                         )
                         comp_results = await cursor.fetchall()
 
@@ -2066,7 +2053,7 @@ class FreeAgencyCommands(commands.Cog):
                 await db.commit()
 
                 # Log final movements and compensation
-                await self.log_final_movements(db, period_id, current_season)
+                await self.log_final_movements(db, current_season)
 
                 # Build summary message with compensation pick details if any were awarded
                 message = (
@@ -2085,9 +2072,9 @@ class FreeAgencyCommands(commands.Cog):
                            FROM free_agency_results r
                            JOIN teams t ON r.original_team_id = t.team_id
                            JOIN players p ON r.player_id = p.player_id
-                           WHERE r.period_id = ? AND r.compensation_band IS NOT NULL
+                           WHERE r.season_number = ? AND r.compensation_band IS NOT NULL
                            ORDER BY r.compensation_band, t.team_name""",
-                        (period_id,)
+                        (current_season,)
                     )
                     comp_picks = await cursor.fetchall()
 
@@ -2100,7 +2087,14 @@ class FreeAgencyCommands(commands.Cog):
                         message += f"\n• **{team_name}**: Band {band} pick (lost {player_name})"
 
                 # Send auction summaries to all team channels
-                await self.send_auction_summaries(db, period_id)
+                await self.send_auction_summaries(db, current_season)
+
+                # Clear re-sign selections for this period now that summaries are sent
+                await db.execute(
+                    "DELETE FROM free_agency_resigns WHERE season_number = ?",
+                    (current_season,)
+                )
+                await db.commit()
 
                 await interaction.followup.send(message)
 
@@ -2201,12 +2195,17 @@ class FreeAgencyCommands(commands.Cog):
 
     @app_commands.command(name="compensationtable", description="View the compensation chart for free agency")
     async def compensation_table(self, interaction: discord.Interaction):
-        """Display the compensation chart as a visual table"""
+        """Display the compensation chart as a color-coded Age x OVR grid
+        image - band 1 (best/most valuable free agent) through band 5
+        (least), gray for any (age, ovr) combination outside the chart
+        entirely (no compensation applies). Replaced the old text output,
+        which split the same data into three separate ASCII code-block
+        tables (70-79/80-89/90-99 OVR) that were hard to read as one
+        picture."""
         await interaction.response.defer(ephemeral=True)
 
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Get compensation chart data
                 cursor = await db.execute(
                     """SELECT min_age, max_age, min_ovr, max_ovr, compensation_band
                        FROM compensation_chart
@@ -2218,51 +2217,31 @@ class FreeAgencyCommands(commands.Cog):
                     await interaction.followup.send("❌ No compensation chart data found! Use `/migratedb` to initialize.")
                     return
 
-                # Build map of (age, ovr) -> band by expanding ranges
-                comp_map = {}  # (age, ovr) -> band
-                for min_age, max_age, min_ovr, max_ovr, band in compensation_data:
-                    # Expand age range (if max_age is None, it's a single age)
-                    age_end = max_age if max_age is not None else min_age
-                    # Expand OVR range (if max_ovr is None, it's a single OVR)
-                    ovr_end = max_ovr if max_ovr is not None else min_ovr
+                # Build map of (age, ovr) -> band by expanding ranges, and
+                # track the real min/max seen so the grid always covers
+                # exactly what's in the chart, not a hardcoded guess.
+                band_by_age_ovr = {}
+                min_age = min_ovr = None
+                max_age = max_ovr = None
+                for chart_min_age, chart_max_age, chart_min_ovr, chart_max_ovr, band in compensation_data:
+                    age_end = chart_max_age if chart_max_age is not None else chart_min_age
+                    ovr_end = chart_max_ovr if chart_max_ovr is not None else chart_min_ovr
 
-                    for age in range(min_age, age_end + 1):
-                        for ovr in range(min_ovr, ovr_end + 1):
-                            comp_map[(age, ovr)] = band
+                    min_age = chart_min_age if min_age is None else min(min_age, chart_min_age)
+                    max_age = age_end if max_age is None else max(max_age, age_end)
+                    min_ovr = chart_min_ovr if min_ovr is None else min(min_ovr, chart_min_ovr)
+                    max_ovr = ovr_end if max_ovr is None else max(max_ovr, ovr_end)
 
-                # Build compact table - use 2-char columns to save space
-                response_parts = []
-                response_parts.append("**Compensation Chart** (lower = better)\n")
+                    for age in range(chart_min_age, age_end + 1):
+                        for ovr in range(chart_min_ovr, ovr_end + 1):
+                            band_by_age_ovr[(age, ovr)] = band
 
-                # Split into OVR ranges: 70-79, 80-89, 90-99
-                ovr_ranges = [
-                    (70, 79, "70-79"),
-                    (80, 89, "80-89"),
-                    (90, 99, "90-99")
-                ]
+                ages = list(range(min_age, max_age + 1))
+                ovrs = list(range(min_ovr, max_ovr + 1))
 
-                for ovr_start, ovr_end, range_label in ovr_ranges:
-                    table_lines = []
-
-                    # Compact header - 2 chars per column, add space to align with data rows
-                    header = " A│" + " ".join([f"{ovr:2}" for ovr in range(ovr_start, ovr_end + 1)])
-                    table_lines.append(header)
-                    table_lines.append("─" * len(header))
-
-                    # Data rows - ages 19-33
-                    for age in range(19, 34):
-                        row_values = [f"{age:2}"]  # Keep both digits
-                        for ovr in range(ovr_start, ovr_end + 1):
-                            band = comp_map.get((age, ovr), None)
-                            if band is not None:
-                                row_values.append(f"{band:2}")
-                            else:
-                                row_values.append(" -")
-                        table_lines.append("│".join(row_values))
-
-                    response_parts.append(f"**{range_label}**```\n{chr(10).join(table_lines)}```")
-
-                await interaction.followup.send("\n".join(response_parts))
+                buffer = render_compensation_chart_image(band_by_age_ovr, ages, ovrs)
+                file = discord.File(buffer, filename="compensation_chart.png")
+                await interaction.followup.send(file=file)
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
@@ -2370,10 +2349,10 @@ class FreeAgentsView(discord.ui.View):
 
 class MatchingNotificationView(discord.ui.View):
     """Static notification view with button to open matching interface"""
-    def __init__(self, bot, period_id, team_id):
+    def __init__(self, bot, season_number, team_id):
         super().__init__(timeout=None)  # Persistent view
         self.bot = bot
-        self.period_id = period_id
+        self.season_number = season_number
         self.team_id = team_id
 
     @discord.ui.button(label="Choose which bids to match", style=discord.ButtonStyle.primary, custom_id="matching_button")
@@ -2385,18 +2364,13 @@ class MatchingNotificationView(discord.ui.View):
                 current_season = await get_current_season(db)
 
                 # Check if period is still active
-                cursor = await db.execute(
-                    "SELECT status, auction_points FROM free_agency_periods WHERE period_id = ?",
-                    (self.period_id,)
-                )
-                period_result = await cursor.fetchone()
-                if not period_result or period_result[0] != 'matching':
+                status, auction_points = await get_fa_period_for_season(db, self.season_number)
+                if status != 'matching':
                     await interaction.response.send_message(
                         "❌ The matching period has ended! Matches are no longer editable.",
                         ephemeral=True
                     )
                     return
-                auction_points = period_result[1]
 
                 # Get team info
                 cursor = await db.execute(
@@ -2416,8 +2390,8 @@ class MatchingNotificationView(discord.ui.View):
                        FROM free_agency_results r
                        JOIN players p ON r.player_id = p.player_id
                        JOIN teams t ON r.winning_team_id = t.team_id
-                       WHERE r.period_id = ? AND r.original_team_id = ?""",
-                    (self.period_id, self.team_id)
+                       WHERE r.season_number = ? AND r.original_team_id = ?""",
+                    (self.season_number, self.team_id)
                 )
                 player_bids = await cursor.fetchall()
 
@@ -2440,9 +2414,9 @@ class MatchingNotificationView(discord.ui.View):
                         """SELECT COALESCE(SUM(b.bid_amount), 0)
                            FROM free_agency_bids b
                            JOIN players p ON b.player_id = p.player_id
-                           WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
+                           WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'winning'
                            AND p.team_id != ?""",
-                        (self.period_id, self.team_id, self.team_id)
+                        (self.season_number, self.team_id, self.team_id)
                     )
                     winning_bid_total = (await cursor.fetchone())[0]
                     remaining_points = auction_points - winning_bid_total
@@ -2451,7 +2425,7 @@ class MatchingNotificationView(discord.ui.View):
                     # Remove the extra fields from player_bids tuples (matched and confirmed_at)
                     cleaned_player_bids = [(pid, name, pos, age, ovr, wtid, tname, emoji, bid)
                                           for pid, name, pos, age, ovr, wtid, tname, emoji, bid, _, _ in player_bids]
-                    matching_view = MatchingView(self.bot, self.period_id, self.team_id, team_name, cleaned_player_bids, current_season, remaining_points)
+                    matching_view = MatchingView(self.bot, self.team_id, team_name, cleaned_player_bids, current_season, remaining_points)
                     matching_view.matches = matches
                     matching_view.confirmed = True
                     matching_view.update_buttons()
@@ -2485,9 +2459,9 @@ class MatchingNotificationView(discord.ui.View):
                         """SELECT COALESCE(SUM(b.bid_amount), 0)
                            FROM free_agency_bids b
                            JOIN players p ON b.player_id = p.player_id
-                           WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
+                           WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'winning'
                            AND p.team_id != ?""",
-                        (self.period_id, self.team_id, self.team_id)
+                        (self.season_number, self.team_id, self.team_id)
                     )
                     winning_bid_total = (await cursor.fetchone())[0]
                     remaining_points = auction_points - winning_bid_total
@@ -2497,7 +2471,7 @@ class MatchingNotificationView(discord.ui.View):
                                           for pid, name, pos, age, ovr, wtid, tname, emoji, bid, _, _ in player_bids]
 
                     # Create matching view
-                    matching_view = MatchingView(self.bot, self.period_id, self.team_id, team_name, cleaned_player_bids, current_season, remaining_points)
+                    matching_view = MatchingView(self.bot, self.team_id, team_name, cleaned_player_bids, current_season, remaining_points)
                     embed = await matching_view.create_embed()
                     await interaction.response.send_message(embed=embed, view=matching_view, ephemeral=True)
 
@@ -2505,7 +2479,7 @@ class MatchingNotificationView(discord.ui.View):
             await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
     @staticmethod
-    async def create_notification_embed(bot, period_id, team_id, team_name, player_bids, max_points):
+    async def create_notification_embed(bot, season_number, team_id, team_name, player_bids, max_points):
         """Create static notification embed"""
         embed = discord.Embed(
             title=f"🤝 Free Agency Matching - {team_name}",
@@ -2553,10 +2527,9 @@ class MatchingNotificationView(discord.ui.View):
 
 class MatchingView(discord.ui.View):
     """Interactive UI for teams to match winning bids on their players"""
-    def __init__(self, bot, period_id, team_id, team_name, player_bids, season_number, max_points=300):
+    def __init__(self, bot, team_id, team_name, player_bids, season_number, max_points=300):
         super().__init__(timeout=180)  # 3 minute timeout for ephemeral view
         self.bot = bot
-        self.period_id = period_id
         self.team_id = team_id
         self.team_name = team_name
         self.player_bids = player_bids  # List of (player_id, name, pos, age, ovr, winning_team_id, team_name, emoji_id, bid)
@@ -2725,12 +2698,8 @@ class MatchingView(discord.ui.View):
         """Handle player selection from dropdown"""
         # Check if period is still active
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT status FROM free_agency_periods WHERE period_id = ?",
-                (self.period_id,)
-            )
-            period_status = await cursor.fetchone()
-            if not period_status or period_status[0] != 'matching':
+            status, _ = await get_fa_period_for_season(db, self.season_number)
+            if status != 'matching':
                 await interaction.response.send_message(
                     "❌ The matching period has ended! Matches are no longer editable.",
                     ephemeral=True
@@ -2754,12 +2723,8 @@ class MatchingView(discord.ui.View):
         try:
             # Check if period is still active
             async with aiosqlite.connect(DB_PATH) as db:
-                cursor = await db.execute(
-                    "SELECT status FROM free_agency_periods WHERE period_id = ?",
-                    (self.period_id,)
-                )
-                period_status = await cursor.fetchone()
-                if not period_status or period_status[0] != 'matching':
+                status, _ = await get_fa_period_for_season(db, self.season_number)
+                if status != 'matching':
                     await interaction.response.send_message(
                         "❌ The matching period has ended! Matches are no longer editable.",
                         ephemeral=True
@@ -2792,8 +2757,8 @@ class MatchingView(discord.ui.View):
                     await db.execute(
                         """UPDATE free_agency_results
                            SET matched = ?, confirmed_at = CURRENT_TIMESTAMP
-                           WHERE period_id = ? AND player_id = ?""",
-                        (1 if self.matches[player_id] else 0, self.period_id, player_id)
+                           WHERE season_number = ? AND player_id = ?""",
+                        (1 if self.matches[player_id] else 0, self.season_number, player_id)
                     )
                 await db.commit()
 
@@ -2852,12 +2817,8 @@ class MatchingView(discord.ui.View):
         """Allow editing matches after confirmation"""
         # Check if period is still active
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT status FROM free_agency_periods WHERE period_id = ?",
-                (self.period_id,)
-            )
-            period_status = await cursor.fetchone()
-            if not period_status or period_status[0] != 'matching':
+            status, _ = await get_fa_period_for_season(db, self.season_number)
+            if status != 'matching':
                 await interaction.response.send_message(
                     "❌ The matching period has ended! Matches are no longer editable.",
                     ephemeral=True
@@ -2871,10 +2832,9 @@ class MatchingView(discord.ui.View):
 
 
 class AuctionsMenuView(discord.ui.View):
-    def __init__(self, bot, period_id, team_id, team_name, bids, remaining_points, max_points, season_number, period_status):
+    def __init__(self, bot, team_id, team_name, bids, remaining_points, max_points, season_number, period_status):
         super().__init__(timeout=180)
         self.bot = bot
-        self.period_id = period_id
         self.team_id = team_id
         self.team_name = team_name
         self.bids = bids
@@ -3123,8 +3083,8 @@ class AuctionsMenuView(discord.ui.View):
                 # Get existing selections (if any)
                 cursor = await db.execute(
                     """SELECT player_id, confirmed FROM free_agency_resigns
-                       WHERE period_id = ? AND team_id = ?""",
-                    (self.period_id, self.team_id)
+                       WHERE season_number = ? AND team_id = ?""",
+                    (self.season_number, self.team_id)
                 )
                 existing_selections = await cursor.fetchall()
                 selected_players = [p[0] for p in existing_selections]
@@ -3132,7 +3092,7 @@ class AuctionsMenuView(discord.ui.View):
 
                 # Create the selection view
                 view = FreeResignSelectionView(
-                    self.bot, self.period_id, self.team_id, allowance,
+                    self.bot, self.team_id, allowance,
                     free_agents, selected_players, is_confirmed, self.season_number
                 )
                 embed = view.create_embed()
@@ -3146,18 +3106,13 @@ class AuctionsMenuView(discord.ui.View):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Check if period is still in matching status
-                cursor = await db.execute(
-                    "SELECT status, auction_points FROM free_agency_periods WHERE period_id = ?",
-                    (self.period_id,)
-                )
-                period_status = await cursor.fetchone()
-                if not period_status or period_status[0] != 'matching':
+                status, auction_points = await get_fa_period_for_season(db, self.season_number)
+                if status != 'matching':
                     await interaction.response.send_message(
                         "❌ The matching period has ended! Matches are no longer editable.",
                         ephemeral=True
                     )
                     return
-                auction_points = period_status[1]
 
                 # Get winning bids on this team's players
                 cursor = await db.execute(
@@ -3166,9 +3121,9 @@ class AuctionsMenuView(discord.ui.View):
                        FROM players p
                        JOIN free_agency_bids b ON p.player_id = b.player_id
                        JOIN teams t ON b.team_id = t.team_id
-                       WHERE p.team_id = ? AND b.period_id = ? AND b.status = 'winning'
+                       WHERE p.team_id = ? AND b.season_number = ? AND b.status = 'winning'
                        ORDER BY b.bid_amount DESC""",
-                    (self.team_id, self.period_id)
+                    (self.team_id, self.season_number)
                 )
                 player_bids = await cursor.fetchall()
 
@@ -3184,15 +3139,15 @@ class AuctionsMenuView(discord.ui.View):
                     """SELECT COALESCE(SUM(b.bid_amount), 0)
                        FROM free_agency_bids b
                        JOIN players p ON b.player_id = p.player_id
-                       WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'winning'
+                       WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'winning'
                        AND p.team_id != ?""",
-                    (self.period_id, self.team_id, self.team_id)
+                    (self.season_number, self.team_id, self.team_id)
                 )
                 winning_bid_total = (await cursor.fetchone())[0]
                 remaining_points = auction_points - winning_bid_total
 
                 # Create matching view
-                matching_view = MatchingView(self.bot, self.period_id, self.team_id, self.team_name, player_bids, self.season_number, remaining_points)
+                matching_view = MatchingView(self.bot, self.team_id, self.team_name, player_bids, self.season_number, remaining_points)
                 embed = await matching_view.create_embed()
                 await interaction.response.send_message(embed=embed, view=matching_view, ephemeral=True)
 
@@ -3209,9 +3164,9 @@ class AuctionsMenuView(discord.ui.View):
                        FROM free_agency_bids b
                        JOIN players p ON b.player_id = p.player_id
                        JOIN teams t ON p.team_id = t.team_id
-                       WHERE b.period_id = ? AND b.team_id = ? AND b.status = 'active'
+                       WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'active'
                        ORDER BY b.bid_amount DESC, p.name""",
-                    (self.period_id, self.team_id)
+                    (self.season_number, self.team_id)
                 )
                 self.bids = await cursor.fetchall()
 
@@ -3220,17 +3175,13 @@ class AuctionsMenuView(discord.ui.View):
                 self.remaining_points = self.max_points - total_spent
 
                 # Re-fetch period status
-                cursor = await db.execute(
-                    "SELECT status FROM free_agency_periods WHERE period_id = ?",
-                    (self.period_id,)
-                )
-                status_result = await cursor.fetchone()
-                if status_result:
-                    self.period_status = status_result[0]
+                status, _ = await get_fa_period_for_season(db, self.season_number)
+                if status:
+                    self.period_status = status
 
             # Recreate view with new buttons
             new_view = AuctionsMenuView(
-                self.bot, self.period_id, self.team_id, self.team_name,
+                self.bot, self.team_id, self.team_name,
                 self.bids, self.remaining_points, self.max_points, self.season_number, self.period_status
             )
             embed = new_view.create_embed()
@@ -3242,10 +3193,10 @@ class AuctionsMenuView(discord.ui.View):
 
 class FreeResignButtonView(discord.ui.View):
     """Simple view with a button to open the free re-sign selection interface"""
-    def __init__(self, bot, period_id, team_id, allowance):
+    def __init__(self, bot, season_number, team_id, allowance):
         super().__init__(timeout=None)  # Persistent view
         self.bot = bot
-        self.period_id = period_id
+        self.season_number = season_number
         self.team_id = team_id
         self.allowance = allowance
 
@@ -3257,17 +3208,11 @@ class FreeResignButtonView(discord.ui.View):
                 # Get current season
                 current_season = await get_current_season(db)
 
-                # Get current period_id dynamically (don't rely on stored value)
-                cursor = await db.execute(
-                    "SELECT period_id FROM free_agency_periods WHERE season_number = ? AND status = 'resign'",
-                    (current_season,)
-                )
-                period_result = await cursor.fetchone()
-                if not period_result:
+                # Check the current period status dynamically (don't rely on stored value)
+                status, _ = await get_fa_period_for_season(db, current_season)
+                if status != 'resign':
                     await interaction.response.send_message("❌ No active free re-sign period!", ephemeral=True)
                     return
-
-                current_period_id = period_result[0]
 
                 # Calculate allowance dynamically
                 free_agency_cog = self.bot.get_cog('FreeAgencyCommands')
@@ -3283,19 +3228,19 @@ class FreeResignButtonView(discord.ui.View):
                 )
                 free_agents = await cursor.fetchall()
 
-                # Get existing selections (if any) - use current period_id
+                # Get existing selections (if any) - use the current season
                 cursor = await db.execute(
                     """SELECT player_id, confirmed FROM free_agency_resigns
-                       WHERE period_id = ? AND team_id = ?""",
-                    (current_period_id, self.team_id)
+                       WHERE season_number = ? AND team_id = ?""",
+                    (current_season, self.team_id)
                 )
                 existing_selections = await cursor.fetchall()
                 selected_players = [p[0] for p in existing_selections]
                 is_confirmed = any(p[1] for p in existing_selections) if existing_selections else False
 
-                # Create the selection view with current period_id
+                # Create the selection view for the current season
                 view = FreeResignSelectionView(
-                    self.bot, current_period_id, self.team_id, current_allowance,
+                    self.bot, self.team_id, current_allowance,
                     free_agents, selected_players, is_confirmed, current_season
                 )
                 embed = view.create_embed()
@@ -3307,10 +3252,9 @@ class FreeResignButtonView(discord.ui.View):
 
 class FreeResignSelectionView(discord.ui.View):
     """Interactive UI for teams to select which players to re-sign for free"""
-    def __init__(self, bot, period_id, team_id, allowance, free_agents, selected_players, is_confirmed, season_number):
+    def __init__(self, bot, team_id, allowance, free_agents, selected_players, is_confirmed, season_number):
         super().__init__(timeout=180)
         self.bot = bot
-        self.period_id = period_id
         self.team_id = team_id
         self.allowance = allowance
         self.free_agents = free_agents
@@ -3373,23 +3317,23 @@ class FreeResignSelectionView(discord.ui.View):
             async with aiosqlite.connect(DB_PATH) as db:
                 # Delete old selections
                 await db.execute(
-                    "DELETE FROM free_agency_resigns WHERE period_id = ? AND team_id = ?",
-                    (self.period_id, self.team_id)
+                    "DELETE FROM free_agency_resigns WHERE season_number = ? AND team_id = ?",
+                    (self.season_number, self.team_id)
                 )
 
                 # Insert new selections
                 for player_id in selected_ids:
                     await db.execute(
-                        """INSERT INTO free_agency_resigns (period_id, team_id, player_id, confirmed)
+                        """INSERT INTO free_agency_resigns (season_number, team_id, player_id, confirmed)
                            VALUES (?, ?, ?, 0)""",
-                        (self.period_id, self.team_id, player_id)
+                        (self.season_number, self.team_id, player_id)
                     )
 
                 await db.commit()
 
             # Recreate view with updated selections
             new_view = FreeResignSelectionView(
-                self.bot, self.period_id, self.team_id, self.allowance,
+                self.bot, self.team_id, self.allowance,
                 self.free_agents, self.selected_players, False, self.season_number
             )
             embed = new_view.create_embed()
@@ -3406,8 +3350,8 @@ class FreeResignSelectionView(discord.ui.View):
                 await db.execute(
                     """UPDATE free_agency_resigns
                        SET confirmed = 1, confirmed_at = CURRENT_TIMESTAMP
-                       WHERE period_id = ? AND team_id = ?""",
-                    (self.period_id, self.team_id)
+                       WHERE season_number = ? AND team_id = ?""",
+                    (self.season_number, self.team_id)
                 )
                 await db.commit()
 
@@ -3439,7 +3383,7 @@ class FreeResignSelectionView(discord.ui.View):
 
             # Recreate view with confirmed state
             new_view = FreeResignSelectionView(
-                self.bot, self.period_id, self.team_id, self.allowance,
+                self.bot, self.team_id, self.allowance,
                 self.free_agents, self.selected_players, True, self.season_number
             )
             embed = new_view.create_embed()
@@ -3457,8 +3401,8 @@ class FreeResignSelectionView(discord.ui.View):
                 await db.execute(
                     """UPDATE free_agency_resigns
                        SET confirmed = 0, confirmed_at = NULL
-                       WHERE period_id = ? AND team_id = ?""",
-                    (self.period_id, self.team_id)
+                       WHERE season_number = ? AND team_id = ?""",
+                    (self.season_number, self.team_id)
                 )
                 await db.commit()
 
@@ -3466,7 +3410,7 @@ class FreeResignSelectionView(discord.ui.View):
 
             # Recreate view in unconfirmed state
             new_view = FreeResignSelectionView(
-                self.bot, self.period_id, self.team_id, self.allowance,
+                self.bot, self.team_id, self.allowance,
                 self.free_agents, self.selected_players, False, self.season_number
             )
             embed = new_view.create_embed()

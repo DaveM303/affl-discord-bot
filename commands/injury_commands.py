@@ -1,3 +1,4 @@
+import re
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -5,6 +6,179 @@ import aiosqlite
 from config import DB_PATH, ADMIN_ROLE_ID
 from commands.season_commands import get_round_name
 from utils import is_admin_user, get_team_emoji_str
+
+
+async def build_injury_suspension_list(bot, db, current_round, total_rounds, filter_team_id=None,
+                                        season_id=None, regular_rounds=None, new_this_round=None):
+    """Shared combined injuries+suspensions list builder, returned as a list
+    of display-ready lines (headers, entries, blank separator) - the same
+    format post_injury_list_to_channel renders, factored out so
+    round-summary embeds (season_commands.py's post_round_summaries,
+    triggered from /matchsimulation's sim buttons) can show a team's own
+    current list without duplicating this query/formatting. Sorted by team
+    first, then weeks/games remaining, so a full-league list reads grouped
+    by team rather than interleaved by return date. Returns [] if there's
+    nothing active for the filter.
+
+    Once the finals are underway (current_round > regular_rounds), teams
+    already eliminated from premiership contention are excluded entirely -
+    their injuries/suspensions no longer matter to anyone still watching the
+    finals race. Requires BOTH season_id and regular_rounds to apply this
+    (both None by default, e.g. for a caller with no season loaded at all);
+    a caller that already knows it's mid-finals should always pass them.
+
+    new_this_round, if given, is the round_number an injury's injury_round
+    (or a suspension's suspension_round) must equal to be bolded as "new" -
+    everything else renders in plain text. Deliberately a separate
+    parameter rather than derived from current_round: callers disagree on
+    what current_round even MEANS at the moment they call this (e.g.
+    post_injury_list_to_channel reads it fresh from the DB AFTER
+    advance_to_next_round has already incremented it, so "the round that
+    just finished" is current_round - 1 there, while post_round_summaries
+    calls in BEFORE the increment, where current_round already IS that
+    round) - safer for each caller to just say explicitly which round
+    counts as "new" than to bake in one of those two off-by-one
+    assumptions here. None (the default) bolds nothing."""
+    eliminated_team_ids = set()
+    if season_id is not None and regular_rounds is not None and current_round > regular_rounds:
+        from commands.season_commands import get_eliminated_finals_team_ids
+        eliminated_team_ids = await get_eliminated_finals_team_ids(db, season_id)
+
+    if filter_team_id:
+        cursor = await db.execute(
+            """SELECT p.name, p.overall_rating, i.injury_type, i.return_round, t.team_name, t.emoji_id, p.team_id, i.injury_round
+               FROM injuries i
+               JOIN players p ON i.player_id = p.player_id
+               LEFT JOIN teams t ON p.team_id = t.team_id
+               WHERE i.status = 'injured' AND p.team_id = ?
+               ORDER BY t.team_name ASC, i.return_round ASC, p.name ASC""",
+            (filter_team_id,)
+        )
+    else:
+        cursor = await db.execute(
+            """SELECT p.name, p.overall_rating, i.injury_type, i.return_round, t.team_name, t.emoji_id, p.team_id, i.injury_round
+               FROM injuries i
+               JOIN players p ON i.player_id = p.player_id
+               LEFT JOIN teams t ON p.team_id = t.team_id
+               WHERE i.status = 'injured'
+               ORDER BY t.team_name ASC, i.return_round ASC, p.name ASC"""
+        )
+    injuries = [row for row in await cursor.fetchall() if row[6] not in eliminated_team_ids]
+
+    if filter_team_id:
+        cursor = await db.execute(
+            """SELECT p.name, p.overall_rating, s.suspension_reason, s.games_remaining, t.team_name, t.emoji_id, p.team_id, s.suspension_round
+               FROM suspensions s
+               JOIN players p ON s.player_id = p.player_id
+               LEFT JOIN teams t ON p.team_id = t.team_id
+               WHERE s.status = 'suspended' AND p.team_id = ?
+               ORDER BY t.team_name ASC, s.games_remaining ASC, p.name ASC""",
+            (filter_team_id,)
+        )
+    else:
+        cursor = await db.execute(
+            """SELECT p.name, p.overall_rating, s.suspension_reason, s.games_remaining, t.team_name, t.emoji_id, p.team_id, s.suspension_round
+               FROM suspensions s
+               JOIN players p ON s.player_id = p.player_id
+               LEFT JOIN teams t ON p.team_id = t.team_id
+               WHERE s.status = 'suspended'
+               ORDER BY t.team_name ASC, s.games_remaining ASC, p.name ASC"""
+        )
+    suspensions = [row for row in await cursor.fetchall() if row[6] not in eliminated_team_ids]
+
+    combined_list = []
+
+    if injuries:
+        combined_list.append("**🚑 Injuries:**")
+        for name, overall_rating, injury_type, return_round, team_name, emoji_id, team_id, injury_round in injuries:
+            # Emoji dropped for a team-scoped list (round summaries) - every
+            # line is already that one team, so it's redundant there. Kept
+            # for the league-wide list (/injurylist) where it's the only
+            # thing distinguishing which team each entry belongs to.
+            team_display = get_team_emoji_str(bot, emoji_id) if team_name and not filter_team_id else ""
+            if return_round is None:
+                # Recovery length not yet determined - the round it
+                # happened in hasn't finished being advanced past yet (see
+                # season_commands.py's _roll_pending_injury_recoveries).
+                status = "- TBC"
+            else:
+                weeks_left = return_round - current_round
+                if weeks_left <= 0:
+                    status = "✅ Recovered"
+                else:
+                    week_text = "week" if weeks_left == 1 else "weeks"
+                    season_indicator = " (SEASON)" if return_round > total_rounds else ""
+                    status = f"- {weeks_left} {week_text}{season_indicator}"
+            line = f"{team_display}{name} ({overall_rating}) - {injury_type} {status}"
+            if injury_round == new_this_round:
+                line = f"**{line}**"
+            combined_list.append(line)
+
+    if suspensions:
+        if injuries:
+            combined_list.append("")
+        combined_list.append("**🚫 Suspensions:**")
+        for name, overall_rating, suspension_reason, games_remaining, team_name, emoji_id, team_id, suspension_round in suspensions:
+            team_display = get_team_emoji_str(bot, emoji_id) if team_name and not filter_team_id else ""
+            if games_remaining is None:
+                # Suspension length not yet determined - the round the
+                # report happened in hasn't finished being advanced past
+                # yet (see season_commands.py's _roll_pending_report_suspensions).
+                status = "- TBC"
+            elif games_remaining <= 0:
+                status = "✅ Available"
+            else:
+                # No "(SEASON)" indicator here unlike injuries - games_remaining
+                # only ticks down on rounds the team actually plays, so whether
+                # it spills into next season depends on how many fixtures are
+                # left, not a round-number comparison against total_rounds.
+                game_text = "game" if games_remaining == 1 else "games"
+                status = f"- {games_remaining} {game_text}"
+            # Impact grading (" - low/medium/high impact") drives the
+            # games-range roll (see match_sim.py's REPORT_REASONS /
+            # season_commands.py's _REPORT_GAMES_RANGE_BY_CHARGE) but isn't
+            # shown here - the list reads "striking", not "striking - low
+            # impact".
+            display_reason = re.sub(r' - (low|medium|high) impact$', '', suspension_reason)
+            line = f"{team_display}{name} ({overall_rating}) - {display_reason} {status}"
+            if suspension_round == new_this_round:
+                line = f"**{line}**"
+            combined_list.append(line)
+
+    return combined_list
+
+
+def _chunk_lines_into_descriptions(lines, max_length=4000):
+    """Splits `lines` into groups that each join (with "\\n") under
+    max_length chars - never splitting a single line in half, only ever
+    breaking between whole lines. max_length leaves headroom below
+    Discord's actual 4096-char embed description cap. Used to post a long
+    combined injury+suspension list as several separate embeds (each with
+    its own plain description) instead of splitting into multiple FIELDS
+    within one embed - a field boundary renders as visible extra spacing
+    in Discord wherever it happens to land (driven purely by character
+    count, so it could fall in the middle of a team's block), which read
+    as random gaps between lines. A whole extra embed's own natural
+    spacing, by contrast, is expected/normal Discord rendering, and only
+    ever appears where a real length limit forced a split."""
+    chunks = []
+    current_chunk = []
+    current_length = 0
+
+    for line in lines:
+        line_length = len(line) + 1  # +1 for the joining newline
+        if current_chunk and current_length + line_length > max_length:
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_length = 0
+        current_chunk.append(line)
+        current_length += line_length
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return ["\n".join(chunk) for chunk in chunks]
+
 
 class InjuryCommands(commands.Cog):
     def __init__(self, bot):
@@ -73,11 +247,7 @@ class InjuryCommands(commands.Cog):
         return choices[:25]
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        """Check if user has admin permissions for admin commands"""
-        # Public commands
-        if interaction.command.name in ['injurylist']:
-            return True
-
+        """Check if user has admin permissions - every command in this cog is admin-only."""
         if await is_admin_user(interaction):
             return True
 
@@ -100,20 +270,6 @@ class InjuryCommands(commands.Cog):
         )
         result = await cursor.fetchone()
         return result[0] if result else 0
-
-    async def notify_team_channel(self, team_id, message):
-        """Send notification to team channel"""
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT channel_id FROM teams WHERE team_id = ?",
-                (team_id,)
-            )
-            result = await cursor.fetchone()
-
-            if result and result[0]:
-                channel = self.bot.get_channel(int(result[0]))
-                if channel:
-                    await channel.send(message)
 
     @app_commands.command(name="addinjury", description="[ADMIN] Add an injury to a player")
     @app_commands.describe(
@@ -141,10 +297,7 @@ class InjuryCommands(commands.Cog):
                 return
 
             cursor = await db.execute(
-                """SELECT p.player_id, p.name, p.team_id, t.team_name
-                   FROM players p
-                   LEFT JOIN teams t ON p.team_id = t.team_id
-                   WHERE p.player_id = ?""",
+                "SELECT player_id, name FROM players WHERE player_id = ?",
                 (player_id,)
             )
             player = await cursor.fetchone()
@@ -156,7 +309,7 @@ class InjuryCommands(commands.Cog):
                 )
                 return
 
-            player_id, p_name, team_id, team_name = player
+            player_id, p_name = player
 
             # Check if player is already injured
             cursor = await db.execute(
@@ -183,8 +336,16 @@ class InjuryCommands(commands.Cog):
                 )
                 return
 
-            # Calculate return round
-            return_round = current_round + recovery_rounds
+            # Calculate return round - +1 beyond the round the injury happened
+            # in plus the recovery weeks, since the injury round itself is
+            # already missed (the player got hurt mid-match) on top of the
+            # stated recovery time, not counted as part of it. E.g. a 2-week
+            # injury in Round 6 should miss Rounds 7 and 8 (Round 6 itself
+            # already happened - the player was hurt DURING it, so it isn't
+            # something they can additionally "miss") and return in Round 9 -
+            # not return_round = 6 + 2 = 8 (which would only give 1 full
+            # round of actual recovery, 7, since Round 6 is already over).
+            return_round = current_round + recovery_rounds + 1
 
             # Add injury
             await db.execute(
@@ -217,279 +378,57 @@ class InjuryCommands(commands.Cog):
                 ephemeral=True
             )
 
-            # Notify team channel
-            if team_id:
-                team_display = team_name if team_name else "Delisted"
-                week_text = "week" if recovery_rounds == 1 else "weeks"
-
-                # Use "an" for vowels, "a" for consonants
-                article = "an" if injury_type[0].lower() in 'aeiou' else "a"
-
-                # Format expected return for channel notification
-                if return_round > total_rounds:
-                    return_text = "SEASON"
-                else:
-                    return_text = get_round_name(return_round, regular_rounds)
-
-                await self.notify_team_channel(
-                    team_id,
-                    f"🚑 **Injury Update**\n"
-                    f"**{p_name}** has suffered {article} **{injury_type} injury** and will miss **{recovery_rounds} {week_text}**.\n"
-                    f"Expected return: {return_text}"
-                )
-
-    @app_commands.command(name="injurylist", description="View current injuries and suspensions")
-    @app_commands.describe(team_name="Team name (leave empty for all teams)")
-    async def injury_list(self, interaction: discord.Interaction, team_name: str = None):
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Get current round, total rounds, and regular_rounds
-            cursor = await db.execute(
-                "SELECT current_round, total_rounds, regular_rounds FROM seasons WHERE status = 'active' LIMIT 1"
-            )
-            season_info = await cursor.fetchone()
-            current_round = season_info[0] if season_info else 0
-            total_rounds = season_info[1] if season_info else 0
-            regular_rounds = season_info[2] if season_info else 24
-
-            # Determine which team to show
-            filter_team_id = None
-            title_suffix = ""
-
-            if team_name:
-                # Show specific team (exact match due to autocomplete)
-                cursor = await db.execute(
-                    "SELECT team_id, team_name FROM teams WHERE team_name = ?",
-                    (team_name,)
-                )
-                team = await cursor.fetchone()
-                if not team:
-                    await interaction.response.send_message(
-                        f"❌ Team '{team_name}' not found. Please select from the autocomplete suggestions.",
-                        ephemeral=True
-                    )
-                    return
-                filter_team_id = team[0]
-                title_suffix = f" - {team[1]}"
-            else:
-                # Default to all teams
-                filter_team_id = None
-                title_suffix = ""
-
-            # Get active injuries (filtered by team if specified)
-            if filter_team_id:
-                cursor = await db.execute(
-                    """SELECT p.name, i.injury_type, i.return_round, t.team_name, t.emoji_id
-                       FROM injuries i
-                       JOIN players p ON i.player_id = p.player_id
-                       LEFT JOIN teams t ON p.team_id = t.team_id
-                       WHERE i.status = 'injured' AND p.team_id = ?
-                       ORDER BY i.return_round ASC, p.name ASC""",
-                    (filter_team_id,)
-                )
-            else:
-                cursor = await db.execute(
-                    """SELECT p.name, i.injury_type, i.return_round, t.team_name, t.emoji_id
-                       FROM injuries i
-                       JOIN players p ON i.player_id = p.player_id
-                       LEFT JOIN teams t ON p.team_id = t.team_id
-                       WHERE i.status = 'injured'
-                       ORDER BY i.return_round ASC, p.name ASC"""
-                )
-            injuries = await cursor.fetchall()
-
-            # Get active suspensions (filtered by team if specified)
-            if filter_team_id:
-                cursor = await db.execute(
-                    """SELECT p.name, s.suspension_reason, s.return_round, t.team_name, t.emoji_id
-                       FROM suspensions s
-                       JOIN players p ON s.player_id = p.player_id
-                       LEFT JOIN teams t ON p.team_id = t.team_id
-                       WHERE s.status = 'suspended' AND p.team_id = ?
-                       ORDER BY s.return_round ASC, p.name ASC""",
-                    (filter_team_id,)
-                )
-            else:
-                cursor = await db.execute(
-                    """SELECT p.name, s.suspension_reason, s.return_round, t.team_name, t.emoji_id
-                       FROM suspensions s
-                       JOIN players p ON s.player_id = p.player_id
-                       LEFT JOIN teams t ON p.team_id = t.team_id
-                       WHERE s.status = 'suspended'
-                       ORDER BY s.return_round ASC, p.name ASC"""
-                )
-            suspensions = await cursor.fetchall()
-
-            if not injuries and not suspensions:
-                await interaction.response.send_message("No active injuries or suspensions!")
-                return
-
-            # Build combined list
-            combined_list = []
-
-            # Add injuries
-            if injuries:
-                combined_list.append("**🚑 Injuries:**")
-                for name, injury_type, return_round, team_name, emoji_id in injuries:
-                    # Calculate weeks remaining
-                    weeks_left = return_round - current_round
-
-                    # Get team emoji
-                    team_display = ""
-                    if team_name:
-                        team_display = get_team_emoji_str(self.bot, emoji_id)
-
-                    if weeks_left <= 0:
-                        status = "✅ Ready to return"
-                    else:
-                        week_text = "week" if weeks_left == 1 else "weeks"
-                        # Check if injury extends beyond season
-                        season_indicator = " (SEASON)" if return_round > total_rounds else ""
-                        status = f"- {weeks_left} {week_text}{season_indicator}"
-
-                    combined_list.append(
-                        f"{team_display}**{name}** - {injury_type} {status}"
-                    )
-
-            # Add suspensions
-            if suspensions:
-                if injuries:
-                    combined_list.append("")  # Empty line separator
-                combined_list.append("**🚫 Suspensions:**")
-                for name, suspension_reason, return_round, team_name, emoji_id in suspensions:
-                    # Calculate games remaining
-                    games_left = return_round - current_round
-
-                    # Get team emoji
-                    team_display = ""
-                    if team_name:
-                        team_display = get_team_emoji_str(self.bot, emoji_id)
-
-                    if games_left <= 0:
-                        status = "✅ Ready to return"
-                    else:
-                        game_text = "game" if games_left == 1 else "games"
-                        # Check if suspension extends beyond season
-                        season_indicator = " (SEASON)" if return_round > total_rounds else ""
-                        status = f"- {games_left} {game_text}{season_indicator}"
-
-                    combined_list.append(
-                        f"{team_display}**{name}** - {suspension_reason} {status}"
-                    )
-
-            # Get the round name
-            round_display = get_round_name(current_round, regular_rounds) if current_round > 0 else "Offseason"
-
-            embed = discord.Embed(
-                title=f"Injury & Suspension List - {round_display}{title_suffix}",
-                description="\n".join(combined_list),
-                color=discord.Color.red()
-            )
-
-            await interaction.response.send_message(embed=embed)
-
     async def post_injury_list_to_channel(self, db, channel_id: int):
         """Helper function to post the injury list to a specified channel"""
         # Get current round, total rounds, and regular_rounds
         cursor = await db.execute(
-            "SELECT current_round, total_rounds, regular_rounds FROM seasons WHERE status = 'active' LIMIT 1"
+            "SELECT season_id, current_round, total_rounds, regular_rounds FROM seasons WHERE status = 'active' LIMIT 1"
         )
         season_info = await cursor.fetchone()
-        current_round = season_info[0] if season_info else 0
-        total_rounds = season_info[1] if season_info else 0
-        regular_rounds = season_info[2] if season_info else 24
+        season_id = season_info[0] if season_info else None
+        current_round = season_info[1] if season_info else 0
+        total_rounds = season_info[2] if season_info else 0
+        regular_rounds = season_info[3] if season_info else 24
 
-        # Get all active injuries
-        cursor = await db.execute(
-            """SELECT p.name, i.injury_type, i.return_round, t.team_name, t.emoji_id
-               FROM injuries i
-               JOIN players p ON i.player_id = p.player_id
-               LEFT JOIN teams t ON p.team_id = t.team_id
-               WHERE i.status = 'injured'
-               ORDER BY i.return_round ASC, p.name ASC"""
+        # This posts right after advance_to_next_round has already
+        # incremented current_round - so the round whose injuries/
+        # suspensions should be bolded as "new" is the one that just
+        # finished, current_round - 1, not current_round itself.
+        combined_list = await build_injury_suspension_list(
+            self.bot, db, current_round, total_rounds,
+            season_id=season_id, regular_rounds=regular_rounds, new_this_round=current_round - 1,
         )
-        injuries = await cursor.fetchall()
 
-        # Get all active suspensions
-        cursor = await db.execute(
-            """SELECT p.name, s.suspension_reason, s.return_round, t.team_name, t.emoji_id
-               FROM suspensions s
-               JOIN players p ON s.player_id = p.player_id
-               LEFT JOIN teams t ON p.team_id = t.team_id
-               WHERE s.status = 'suspended'
-               ORDER BY s.return_round ASC, p.name ASC"""
-        )
-        suspensions = await cursor.fetchall()
-
-        if not injuries and not suspensions:
+        if not combined_list:
             # No injuries or suspensions to post
             return
-
-        # Build combined list
-        combined_list = []
-
-        # Add injuries
-        if injuries:
-            combined_list.append("**🚑 Injuries:**")
-            for name, injury_type, return_round, team_name, emoji_id in injuries:
-                # Calculate weeks remaining
-                weeks_left = return_round - current_round
-
-                # Get team emoji
-                team_display = ""
-                if team_name:
-                    team_display = get_team_emoji_str(self.bot, emoji_id)
-
-                if weeks_left <= 0:
-                    status = "✅ Ready to return"
-                else:
-                    week_text = "week" if weeks_left == 1 else "weeks"
-                    # Check if injury extends beyond season
-                    season_indicator = " (SEASON)" if return_round > total_rounds else ""
-                    status = f"- {weeks_left} {week_text}{season_indicator}"
-
-                combined_list.append(
-                    f"{team_display}**{name}** - {injury_type} {status}"
-                )
-
-        # Add suspensions
-        if suspensions:
-            if injuries:
-                combined_list.append("")  # Empty line separator
-            combined_list.append("**🚫 Suspensions:**")
-            for name, suspension_reason, return_round, team_name, emoji_id in suspensions:
-                # Calculate games remaining
-                games_left = return_round - current_round
-
-                # Get team emoji
-                team_display = ""
-                if team_name:
-                    team_display = get_team_emoji_str(self.bot, emoji_id)
-
-                if games_left <= 0:
-                    status = "✅ Ready to return"
-                else:
-                    game_text = "game" if games_left == 1 else "games"
-                    # Check if suspension extends beyond season
-                    season_indicator = " (SEASON)" if return_round > total_rounds else ""
-                    status = f"- {games_left} {game_text}{season_indicator}"
-
-                combined_list.append(
-                    f"{team_display}**{name}** - {suspension_reason} {status}"
-                )
 
         # Get the round name
         round_display = get_round_name(current_round, regular_rounds) if current_round > 0 else "Offseason"
 
-        embed = discord.Embed(
-            title=f"Injury & Suspension List - {round_display}",
-            description="\n".join(combined_list),
-            color=discord.Color.red()
-        )
+        # A single description is capped at 4096 chars by Discord - with
+        # enough concurrent injuries/suspensions across the league that's
+        # exceedable (each line runs ~30-60 chars). Split into several
+        # embeds (each its own plain description), never multiple FIELDS
+        # within one embed - a field boundary renders as visible extra
+        # spacing wherever it happens to land (character-count-driven, so
+        # it could land mid-team), which read as random gaps between
+        # lines. Only the first embed gets the title; Discord sends up to
+        # 10 embeds in one message, comfortably covering any realistic
+        # league size.
+        descriptions = _chunk_lines_into_descriptions(combined_list, max_length=4000)
+        embeds = []
+        for i, description in enumerate(descriptions):
+            embeds.append(discord.Embed(
+                title=f"Injury & Suspension List - {round_display}" if i == 0 else None,
+                description=description,
+                color=discord.Color.red(),
+            ))
 
         # Post to channel
         channel = self.bot.get_channel(channel_id)
         if channel:
-            await channel.send(embed=embed)
+            await channel.send(embeds=embeds)
 
     @app_commands.command(name="editinjury", description="[ADMIN] Edit a player's injury")
     @app_commands.describe(
@@ -558,8 +497,10 @@ class InjuryCommands(commands.Cog):
             season_info = await cursor.fetchone()
             current_round = season_info[0] if season_info else 0
 
-            # Calculate current recovery time remaining
-            old_recovery_remaining = old_return_round - current_round
+            # Calculate current recovery time remaining - old_return_round
+            # is NULL while recovery length is still TBC (see
+            # season_commands.py's _roll_pending_injury_recoveries)
+            old_recovery_remaining = None if old_return_round is None else old_return_round - current_round
 
             # Update fields
             updates = []
@@ -572,13 +513,19 @@ class InjuryCommands(commands.Cog):
                 changes.append(f"Injury: {old_injury_type} → {new_injury_type}")
 
             if new_recovery_rounds:
-                # Calculate return round from current round, not injury round
+                # Calculate return round from current round, not injury round.
+                # Deliberately NO +1 here unlike a fresh injury's return_round
+                # calc (see add_injury) - editing "to 2 weeks" during the
+                # CURRENT round means miss this round plus 1 more, back the
+                # round after (current_round + 2), since the admin is
+                # resetting the clock starting now, not simulating a fresh
+                # injury that also separately eats its own occurrence round.
                 new_return_round = current_round + new_recovery_rounds
                 updates.append("recovery_rounds = ?, return_round = ?")
                 values.extend([new_recovery_rounds, new_return_round])
-                old_week_text = "week" if old_recovery_remaining == 1 else "weeks"
+                old_display = "TBC" if old_recovery_remaining is None else f"{old_recovery_remaining} {'week' if old_recovery_remaining == 1 else 'weeks'}"
                 new_week_text = "week" if new_recovery_rounds == 1 else "weeks"
-                changes.append(f"Recovery: {old_recovery_remaining} {old_week_text} → {new_recovery_rounds} {new_week_text}")
+                changes.append(f"Recovery: {old_display} → {new_recovery_rounds} {new_week_text}")
 
             if not updates:
                 await interaction.response.send_message(
@@ -615,10 +562,7 @@ class InjuryCommands(commands.Cog):
                 return
 
             cursor = await db.execute(
-                """SELECT p.player_id, p.name, p.team_id, t.team_name
-                   FROM players p
-                   LEFT JOIN teams t ON p.team_id = t.team_id
-                   WHERE p.player_id = ?""",
+                "SELECT player_id, name FROM players WHERE player_id = ?",
                 (player_id,)
             )
             player = await cursor.fetchone()
@@ -630,7 +574,7 @@ class InjuryCommands(commands.Cog):
                 )
                 return
 
-            player_id, p_name, team_id, team_name = player
+            player_id, p_name = player
 
             # Find and remove active injury
             cursor = await db.execute(
@@ -647,9 +591,9 @@ class InjuryCommands(commands.Cog):
                 )
                 return
 
-            # Mark as recovered
+            # Recovered - remove the injury record
             await db.execute(
-                "UPDATE injuries SET status = 'recovered' WHERE injury_id = ?",
+                "DELETE FROM injuries WHERE injury_id = ?",
                 (injury[0],)
             )
             await db.commit()
@@ -658,15 +602,6 @@ class InjuryCommands(commands.Cog):
                 f"✅ **{p_name}** has recovered from injury!",
                 ephemeral=True
             )
-
-            # Notify team channel
-            if team_id:
-                team_display = team_name if team_name else "Delisted"
-                await self.notify_team_channel(
-                    team_id,
-                    f"✅ **Recovery Update**\n"
-                    f"**{p_name}** has recovered from injury and is available for selection!"
-                )
 
 
 async def setup(bot):

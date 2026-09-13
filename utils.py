@@ -200,3 +200,38 @@ def get_team_emoji_str(bot, emoji_id, trailing_space=True):
         return ""
     return f"{emoji} " if trailing_space else str(emoji)
 
+
+async def get_games_played(db, player_id, season_number=None):
+    """
+    Games played by a player, derived from player_match_stats - one row per
+    player per simulated match (see commands/match_commands.py's
+    _persist_match_result) is the durable record of "did this player take
+    the field," so games played is just a count, not a separately
+    maintained/incrementable column.
+
+    Args:
+        db: an open aiosqlite connection
+        player_id: the player's ID
+        season_number: if given, only count games from that season;
+            otherwise counts career games played across every season
+
+    Returns:
+        int: games played (0 if the player has never appeared in a
+            simulated match)
+    """
+    if season_number is not None:
+        cursor = await db.execute(
+            """SELECT COUNT(*) FROM player_match_stats pms
+               JOIN matches m ON pms.match_id = m.match_id
+               JOIN seasons s ON m.season_id = s.season_id
+               WHERE pms.player_id = ? AND s.season_number = ?""",
+            (player_id, season_number)
+        )
+    else:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM player_match_stats WHERE player_id = ?",
+            (player_id,)
+        )
+    result = await cursor.fetchone()
+    return result[0] if result else 0
+

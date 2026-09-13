@@ -157,29 +157,47 @@ async def init_db():
             )
         ''')
 
-        # Create Injuries table
+        # Create Injuries table. recovery_rounds/return_round are nullable -
+        # NULL means "recovery time not yet determined" (a natural in-match
+        # injury's actual length isn't rolled until the round it happened in
+        # is fully over - see advance_to_next_round - so it reads as TBC in
+        # the interim, matching the real "assessment takes time" framing).
+        # /addinjury still fills both in immediately since there's no round
+        # in progress to wait on for an admin-entered injury.
         await db.execute('''
             CREATE TABLE IF NOT EXISTS injuries (
                 injury_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 player_id INTEGER NOT NULL,
                 injury_type TEXT NOT NULL,
                 injury_round INTEGER NOT NULL,
-                recovery_rounds INTEGER NOT NULL,
-                return_round INTEGER NOT NULL,
+                recovery_rounds INTEGER,
+                return_round INTEGER,
                 status TEXT DEFAULT 'injured',
                 FOREIGN KEY (player_id) REFERENCES players(player_id)
             )
         ''')
 
-        # Create Suspensions table
+        # Create Suspensions table. games_remaining is the source of truth
+        # for whether a player is still out - unlike injuries (flat weeks),
+        # suspensions only tick down on rounds the player's team actually
+        # plays (see advance_to_next_round), so a bye round doesn't count
+        # and a suspension can carry unchanged across the offseason into
+        # next season. games_missed/games_remaining are nullable - NULL
+        # means "suspension length not yet determined" (a natural in-match
+        # report's actual sanction isn't rolled until the round it happened
+        # in is fully over - see advance_to_next_round's
+        # _roll_pending_report_suspensions - so it reads as TBC in the
+        # interim, same reasoning as injuries.recovery_rounds/return_round).
+        # /addsuspension still fills both in immediately since there's no
+        # round in progress to wait on for an admin-entered suspension.
         await db.execute('''
             CREATE TABLE IF NOT EXISTS suspensions (
                 suspension_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 player_id INTEGER NOT NULL,
                 suspension_reason TEXT NOT NULL,
                 suspension_round INTEGER NOT NULL,
-                games_missed INTEGER NOT NULL,
-                return_round INTEGER NOT NULL,
+                games_missed INTEGER,
+                games_remaining INTEGER,
                 status TEXT DEFAULT 'suspended',
                 FOREIGN KEY (player_id) REFERENCES players(player_id)
             )
@@ -209,6 +227,25 @@ async def init_db():
             )
         ''')
 
+        # Create Finals Bracket table (tracks each finals week's slots - who's
+        # playing, and once simulated, which match row holds the result -
+        # see finals_bracket.py for the bracket-generation logic that reads
+        # this back round to round)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS finals_bracket (
+                bracket_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                season_id INTEGER NOT NULL,
+                round_number INTEGER NOT NULL,
+                slot_code TEXT NOT NULL,
+                home_team_id INTEGER,
+                away_team_id INTEGER,
+                match_id INTEGER,
+                FOREIGN KEY (season_id) REFERENCES seasons(season_id),
+                FOREIGN KEY (match_id) REFERENCES matches(match_id),
+                UNIQUE(season_id, slot_code)
+            )
+        ''')
+
         # Create Draft Value Index table (points value for each draft pick)
         await db.execute('''
             CREATE TABLE IF NOT EXISTS draft_value_index (
@@ -217,18 +254,29 @@ async def init_db():
             )
         ''')
 
-        # Create Submitted Lineups table (for tracking lineup submissions per round)
+        # Create Player Match Stats table (one row per player per simulated
+        # match - the durable per-match record; also doubles as the
+        # historical "who played round N" lookup, replacing the old
+        # submitted_lineups snapshot table)
         await db.execute('''
-            CREATE TABLE IF NOT EXISTS submitted_lineups (
-                submission_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            CREATE TABLE IF NOT EXISTS player_match_stats (
+                stat_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id INTEGER NOT NULL,
+                player_id INTEGER NOT NULL,
                 team_id INTEGER NOT NULL,
-                season_id INTEGER NOT NULL,
-                round_number INTEGER NOT NULL,
-                player_ids TEXT NOT NULL,
-                submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                disposals INTEGER DEFAULT 0,
+                goals INTEGER DEFAULT 0,
+                behinds INTEGER DEFAULT 0,
+                marks INTEGER DEFAULT 0,
+                tackles INTEGER DEFAULT 0,
+                spoils INTEGER DEFAULT 0,
+                hitouts INTEGER DEFAULT 0,
+                brownlow_votes INTEGER DEFAULT 0,
+                best_fairest_votes INTEGER DEFAULT 0,
+                FOREIGN KEY (match_id) REFERENCES matches(match_id),
+                FOREIGN KEY (player_id) REFERENCES players(player_id),
                 FOREIGN KEY (team_id) REFERENCES teams(team_id),
-                FOREIGN KEY (season_id) REFERENCES seasons(season_id),
-                UNIQUE(team_id, season_id, round_number)
+                UNIQUE(match_id, player_id)
             )
         ''')
 
@@ -250,7 +298,7 @@ async def init_db():
             (21, 23, 5),
             (24, 26, 4),
             (27, 30, 3),
-            (31, NULL, 2)
+            (31, 99, 2)
         ''')
 
         # Insert default draft value index (AFL-style points system)
@@ -290,36 +338,23 @@ async def init_db():
             )
         ''')
 
-        # Create Free Agency Periods table
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS free_agency_periods (
-                period_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                season_number INTEGER NOT NULL,
-                status TEXT DEFAULT 'bidding',
-                auction_points INTEGER DEFAULT 300,
-                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                bidding_ended_at TIMESTAMP,
-                matching_ended_at TIMESTAMP,
-                FOREIGN KEY (season_number) REFERENCES seasons(season_number),
-                UNIQUE(season_number)
-            )
-        ''')
-
         # Create Free Agency Bids table
+        # (The free agency period itself lives in the settings table:
+        #  fa_period_status / fa_period_season / fa_period_auction_points)
         await db.execute('''
             CREATE TABLE IF NOT EXISTS free_agency_bids (
                 bid_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                period_id INTEGER NOT NULL,
+                season_number INTEGER NOT NULL,
                 team_id INTEGER NOT NULL,
                 player_id INTEGER NOT NULL,
                 bid_amount INTEGER NOT NULL,
                 status TEXT DEFAULT 'active',
                 placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (period_id) REFERENCES free_agency_periods(period_id),
+                FOREIGN KEY (season_number) REFERENCES seasons(season_number),
                 FOREIGN KEY (team_id) REFERENCES teams(team_id),
                 FOREIGN KEY (player_id) REFERENCES players(player_id),
-                UNIQUE(period_id, team_id, player_id)
+                UNIQUE(season_number, team_id, player_id)
             )
         ''')
 
@@ -327,7 +362,7 @@ async def init_db():
         await db.execute('''
             CREATE TABLE IF NOT EXISTS free_agency_results (
                 result_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                period_id INTEGER NOT NULL,
+                season_number INTEGER NOT NULL,
                 player_id INTEGER NOT NULL,
                 original_team_id INTEGER NOT NULL,
                 winning_team_id INTEGER,
@@ -335,12 +370,12 @@ async def init_db():
                 matched BOOLEAN DEFAULT 0,
                 compensation_band INTEGER,
                 compensation_pick_id INTEGER,
-                FOREIGN KEY (period_id) REFERENCES free_agency_periods(period_id),
+                FOREIGN KEY (season_number) REFERENCES seasons(season_number),
                 FOREIGN KEY (player_id) REFERENCES players(player_id),
                 FOREIGN KEY (original_team_id) REFERENCES teams(team_id),
                 FOREIGN KEY (winning_team_id) REFERENCES teams(team_id),
                 FOREIGN KEY (compensation_pick_id) REFERENCES draft_picks(pick_id),
-                UNIQUE(period_id, player_id)
+                UNIQUE(season_number, player_id)
             )
         ''')
 
@@ -362,6 +397,44 @@ async def init_db():
             await db.execute("ALTER TABLE players ADD COLUMN plays_like TEXT")
             print("Added 'plays_like' column to players table")
 
+        # Add lineups_locked column to seasons table if it doesn't exist -
+        # single league-wide flag (not per-team) since /matchsimulation's
+        # Announce Lineups button locks every team at once and its Advance
+        # to Next Round button unlocks them all together.
+        cursor = await db.execute("PRAGMA table_info(seasons)")
+        columns = await cursor.fetchall()
+        column_names = [column[1] for column in columns]
+
+        if 'lineups_locked' not in column_names:
+            await db.execute("ALTER TABLE seasons ADD COLUMN lineups_locked INTEGER DEFAULT 0")
+            print("Added 'lineups_locked' column to seasons table")
+
+        # Add lineup_confirmed column to teams table if it doesn't exist -
+        # set by the Submit Lineup button in /teamlineup, cleared each round
+        # when lineups_locked resets, checked by /matchsimulation's Announce
+        # Lineups button before locking the round in.
+        cursor = await db.execute("PRAGMA table_info(teams)")
+        columns = await cursor.fetchall()
+        column_names = [column[1] for column in columns]
+
+        if 'lineup_confirmed' not in column_names:
+            await db.execute("ALTER TABLE teams ADD COLUMN lineup_confirmed INTEGER DEFAULT 0")
+            print("Added 'lineup_confirmed' column to teams table")
+
+        # Add color/color_secondary columns to teams table if they don't
+        # exist - 6-digit hex strings (no leading '#', e.g. "1E5C3A"), set
+        # via /updateteam's primary_color/secondary_color params. Used in
+        # the auto-posted ladder image (post_ladder): color fills the
+        # team's cell background, color_secondary is the team name text
+        # color drawn on top of it.
+        if 'color' not in column_names:
+            await db.execute("ALTER TABLE teams ADD COLUMN color TEXT")
+            print("Added 'color' column to teams table")
+
+        if 'color_secondary' not in column_names:
+            await db.execute("ALTER TABLE teams ADD COLUMN color_secondary TEXT")
+            print("Added 'color_secondary' column to teams table")
+
         await db.commit()
         print("Database initialized successfully!")
 
@@ -380,6 +453,8 @@ async def on_ready():
     await bot.load_extension('commands.trade_commands')
     await bot.load_extension('commands.draft_commands')
     await bot.load_extension('commands.free_agency_commands')
+    await bot.load_extension('commands.match_commands')
+    await bot.load_extension('commands.stats_commands')
     
     try:
         if GUILD_ID:

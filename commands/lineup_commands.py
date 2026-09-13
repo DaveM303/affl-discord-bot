@@ -1,3 +1,4 @@
+import random
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -6,6 +7,10 @@ import json
 from config import DB_PATH
 from commands.season_commands import get_round_name
 from utils import is_admin_user, get_team_emoji, get_team_emoji_str
+from match_sim import (
+    slot_group, POSITION_ALLOWED_GROUPS, RUCK_SLOT, RUCK_ELIGIBLE_POSITIONS, Player,
+    _team_strengths, _resolve_bench_groups, INTERCHANGE_SLOTS,
+)
 
 # AFL lineup structure with 18 positions + 5 interchange
 AFL_POSITIONS = [
@@ -22,6 +27,411 @@ AFL_POSITIONS = [
     # Interchange (5)
     "INT1", "INT2", "INT3", "INT4", "INT5"
 ]
+
+# Row groupings used by format_lineup_description below - display only,
+# distinct from AFL_POSITIONS which is the actual slot order used for
+# lineup storage/validation.
+_LINEUP_DISPLAY_ROWS = [
+    ("FB", ["LBP", "FB", "RBP"]),
+    ("HB", ["LHB", "CHB", "RHB"]),
+    ("C", ["LW", "C", "RW"]),
+    ("HF", ["LHF", "CHF", "RHF"]),
+    ("FF", ["LFP", "FF", "RFP"]),
+    ("Fol", ["R", "RR", "RO"]),
+]
+
+
+def format_lineup_description(lineup):
+    """Renders a team's lineup rows (`SELECT position_name, player_id, name,
+    position, overall_rating FROM lineups JOIN players ...` shaped tuples)
+    into the same grouped-by-line text used in the lineup channel post.
+    Shared by SeasonCommands._try_announce_lineups (season_commands.py,
+    called from /matchsimulation's Announce Lineups button in
+    match_commands.py) and, previously, the old submit-and-post flow here."""
+    lineup_dict = {pos_name: (name, pos, rating) for pos_name, player_id, name, pos, rating in lineup}
+    field_text = ""
+
+    for line_name, positions in _LINEUP_DISPLAY_ROWS:
+        row_text = []
+        for pos_name in positions:
+            if pos_name in lineup_dict:
+                p = lineup_dict[pos_name]
+                row_text.append(f"{p[0]} ({p[2]})")
+            else:
+                row_text.append("*Empty*")
+        field_text += f"**{line_name}:**  {', '.join(row_text)}\n"
+
+    field_text += "\n"
+
+    int_players = []
+    for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]:
+        if pos_name in lineup_dict:
+            p = lineup_dict[pos_name]
+            int_players.append(f"{p[0]} ({p[2]})")
+        else:
+            int_players.append("*Empty*")
+    field_text += f"**Int:**  {', '.join(int_players)}"
+
+    return field_text
+
+
+async def team_playing_this_round(db, team_id, round_number):
+    """True if team_id has a fixture (as home or away) in round_number.
+    Used to block lineup submission for teams on a bye or already
+    eliminated from the finals - there's nothing to submit a lineup for."""
+    cursor = await db.execute(
+        """SELECT 1 FROM matches
+           WHERE round_number = ? AND (home_team_id = ? OR away_team_id = ?)
+           LIMIT 1""",
+        (round_number, team_id, team_id)
+    )
+    return await cursor.fetchone() is not None
+
+
+async def validate_lineup(db, team_id, current_round):
+    """Shared lineup-readiness check - completeness, duplicates, injured/
+    suspended players still out. Used by the Submit Lineup button
+    (TeamLineupMenu.submit_lineup_callback) and by the force-submit path
+    (season_commands.py's _try_announce_lineups/_AnnounceLineupsMissingView,
+    triggered from /matchsimulation's Announce Lineups button), so the
+    definition of "a valid lineup" stays in exactly one place. Returns
+    (errors, player_ids) - errors is empty when the lineup is valid;
+    player_ids is the lineup's player_id list regardless (callers that only
+    care about validity can just check `if errors`)."""
+    cursor = await db.execute(
+        """SELECT l.position_name, p.player_id, p.name, p.position, p.overall_rating
+           FROM lineups l
+           JOIN players p ON l.player_id = p.player_id AND p.team_id = l.team_id
+           WHERE l.team_id = ?
+           ORDER BY l.slot_number""",
+        (team_id,)
+    )
+    lineup = await cursor.fetchall()
+
+    errors = []
+    if len(lineup) < 23:
+        empty_count = 23 - len(lineup)
+        errors.append(f"❌ Lineup incomplete: {empty_count} position(s) empty")
+
+    player_ids = [p[1] for p in lineup]
+    if len(player_ids) != len(set(player_ids)):
+        errors.append("❌ Duplicate players in lineup")
+
+    if player_ids:
+        placeholders = ','.join('?' * len(player_ids))
+
+        slot_by_player_id = {p[1]: p[0] for p in lineup}
+
+        cursor = await db.execute(
+            f"""SELECT p.player_id, p.name, i.return_round
+               FROM injuries i
+               JOIN players p ON i.player_id = p.player_id
+               WHERE i.player_id IN ({placeholders}) AND i.status = 'injured'""",
+            player_ids
+        )
+        injuries = await cursor.fetchall()
+        injured_players = []
+        for player_id, name, return_round in injuries:
+            # return_round is NULL while recovery length is still TBC (see
+            # season_commands.py's _roll_pending_injury_recoveries) - the
+            # player is still definitely out either way.
+            if return_round is not None and return_round - current_round <= 0:
+                continue
+            slot = slot_by_player_id.get(player_id, "?")
+            injured_players.append(f"{name} ({slot})")
+        if injured_players:
+            errors.append(f"❌ Injured players: {', '.join(injured_players)}")
+
+        cursor = await db.execute(
+            f"""SELECT p.player_id, p.name, s.games_remaining
+               FROM suspensions s
+               JOIN players p ON s.player_id = p.player_id
+               WHERE s.player_id IN ({placeholders}) AND s.status = 'suspended'""",
+            player_ids
+        )
+        suspensions = await cursor.fetchall()
+        suspended_players = []
+        for player_id, name, games_remaining in suspensions:
+            # games_remaining is NULL while suspension length is still TBC
+            # (see season_commands.py's _roll_pending_report_suspensions) -
+            # the player is still definitely out either way.
+            if games_remaining is None or games_remaining > 0:
+                slot = slot_by_player_id.get(player_id, "?")
+                suspended_players.append(f"{name} ({slot})")
+        if suspended_players:
+            errors.append(f"❌ Suspended players: {', '.join(suspended_players)}")
+
+    return errors, player_ids
+
+
+async def auto_fill_lineup(db, team_id, current_round):
+    """Automatically repairs a team's full 23-slot lineup by maximizing
+    overall team strength, reusing match_sim.py's own scoring
+    (_team_strengths/Player.effective_ovr) - the same math the simulator
+    itself uses, so this is automatically aware of out-of-position
+    penalties, key-position spine/pocket penalties, AND key-position
+    line-overload penalties, without needing any bespoke "does this player
+    fit" heuristic of its own.
+
+    Only currently-invalid slots are touched - valid slots (starting or
+    interchange) are never disturbed, matching the original scope of this
+    tool (a repair pass, not a full lineup optimizer).
+
+    Invalid slots (empty, injured, suspended, or a duplicate of an earlier
+    slot in the whole lineup - see below) are processed one at a time, in
+    AFL_POSITIONS order (starting slots first, then interchange). For each,
+    every legal candidate is considered:
+      - any currently-unclaimed, available reserve - scored by the single
+        resulting team strength of putting them in this slot
+      - for a STARTING slot only, any player currently in a still-VALID
+        interchange slot - scored as a COMBO: their move into this slot
+        AND the best available reserve backfilling the interchange slot
+        they vacate, evaluated together as one resulting team strength.
+        Scoring the move alone (ignoring the backfill) would unfairly
+        penalize a strong interchange candidate purely because the
+        strength their vacated slot loses isn't priced back in - the combo
+        score avoids that. If picked, the vacated interchange slot is
+        appended to the back of the processing queue and filled for real
+        the same way (from reserves only - interchange slots never borrow
+        from each other, which would just chase the same vacancy in
+        circles).
+    Whichever candidate yields the highest score is picked. There is no
+    positional-fit gate anywhere (not even the R/ruck slot) - a large
+    enough OVR gap can win a slot even fully out of position, since
+    match_sim.py's out-of-position penalty is a multiplier, not a hard
+    block, and this is deliberately just "whichever candidate improves team
+    strength the most," not a fit-first heuristic with strength as a
+    tiebreak.
+
+    Duplicate detection runs across the WHOLE 23-slot lineup in
+    AFL_POSITIONS order - a player_id appearing more than once (in any
+    combination of starting/interchange slots) is only kept in the FIRST
+    slot they appear in; every later occurrence is treated as invalid.
+
+    A player already used earlier in this same run (moved or pulled from
+    reserves) is never reused for a later slot, and a player who is
+    themselves injured/suspended is never moved or pulled from reserves.
+    Mutates the `lineups` table directly and returns (changes, unfilled) -
+    changes is a list of "{slot}: {player name} ({ovr})" strings describing
+    what moved where (for admin visibility), unfilled is a list of slot
+    names that still couldn't be filled (roster fully exhausted)."""
+    cursor = await db.execute(
+        "SELECT player_id, name, position, overall_rating FROM players WHERE team_id = ?",
+        (team_id,)
+    )
+    roster = {row[0]: {"name": row[1], "position": row[2], "ovr": row[3]} for row in await cursor.fetchall()}
+
+    cursor = await db.execute(
+        "SELECT slot_number, position_name, player_id FROM lineups WHERE team_id = ? ORDER BY slot_number",
+        (team_id,)
+    )
+    lineup_rows = await cursor.fetchall()
+    slot_to_player = {position_name: player_id for _, position_name, player_id in lineup_rows}
+
+    cursor = await db.execute(
+        "SELECT player_id, return_round FROM injuries WHERE status = 'injured'"
+    )
+    injured_return = {row[0]: row[1] for row in await cursor.fetchall()}
+    cursor = await db.execute(
+        "SELECT player_id, games_remaining FROM suspensions WHERE status = 'suspended'"
+    )
+    suspended_games_remaining = {row[0]: row[1] for row in await cursor.fetchall()}
+
+    def is_unavailable(player_id):
+        # "Still actually out" - same test as validate_lineup, not just a
+        # raw status flag (a recovered/served player's row can still say
+        # status='injured'/'suspended' until Advance to Next Round clears
+        # it). Suspensions use games_remaining (ticks down only on rounds
+        # the team actually plays), not a round-number comparison like
+        # injuries - a bye round doesn't serve any of the suspension.
+        # A NULL return_round means recovery length is still TBC (see
+        # _roll_pending_injury_recoveries) - definitely still unavailable
+        # either way, so that's treated as True with no round-number math.
+        # Same for a NULL games_remaining (see
+        # _roll_pending_report_suspensions) - a still-TBC report.
+        if player_id in injured_return:
+            player_return_round = injured_return[player_id]
+            if player_return_round is None or player_return_round - current_round > 0:
+                return True
+        if player_id in suspended_games_remaining:
+            player_games_remaining = suspended_games_remaining[player_id]
+            if player_games_remaining is None or player_games_remaining > 0:
+                return True
+        return False
+
+    starting_slots = AFL_POSITIONS[:18]
+    interchange_slots = AFL_POSITIONS[18:]
+
+    # Which player_id occupies which slot right now, and which player_ids
+    # are already "claimed" this run (assigned to a slot, or otherwise
+    # unavailable) so the same reserve/interchange player can't be double-used.
+    claimed_player_ids = {pid for pid in slot_to_player.values() if pid is not None}
+
+    # Duplicate detection runs across the WHOLE 23-slot lineup (not just the
+    # starting 18) in AFL_POSITIONS order, so a player appearing twice -
+    # whether both times in the starting 18, both times on the interchange,
+    # or once in each - is only ever kept in the FIRST slot they appear in;
+    # every later occurrence is treated as vacant, regardless of which of
+    # the two invalid-slot categories (starting vs. interchange) it falls in.
+    seen_player_ids = set()
+    invalid_starting_slots = []
+    invalid_interchange_slots = []
+    for slot in AFL_POSITIONS:
+        player_id = slot_to_player.get(slot)
+        target_list = invalid_starting_slots if slot in starting_slots else invalid_interchange_slots
+        if player_id is None:
+            target_list.append(slot)
+        elif player_id in seen_player_ids:
+            target_list.append(slot)
+        elif is_unavailable(player_id):
+            target_list.append(slot)
+        else:
+            seen_player_ids.add(player_id)
+
+    def reserve_pool():
+        """Roster players not currently claimed by any slot and not
+        themselves injured/suspended."""
+        return [
+            (pid, info) for pid, info in roster.items()
+            if pid not in claimed_player_ids and not is_unavailable(pid)
+        ]
+
+    # Unseeded - each team_strength_of() call independently resolves
+    # bench roles for whatever hypothetical lineup it's scoring, same as
+    # a real match_sim.py simulation would (a fresh per-match roll, not
+    # meant to be reproducible run to run).
+    rng = random.Random()
+
+    def team_strength_of(overrides):
+        """Total team strength (sum of the three match_sim.py group
+        strengths) of the current lineup with `overrides` (slot -> player_id
+        or None) applied on top of slot_to_player. Empty slots are simply
+        omitted from the Player list passed to match_sim.py - it only ever
+        scores players actually on the strength sheet."""
+        players = []
+        for s in AFL_POSITIONS:
+            effective_pid = overrides[s] if s in overrides else slot_to_player.get(s)
+            if effective_pid is None or effective_pid not in roster:
+                continue
+            info = roster[effective_pid]
+            players.append(Player(effective_pid, info["name"], info["position"], info["ovr"], s))
+        # _team_strengths reads player_group(p) for each player, which for
+        # a bench (interchange) Player requires .resolved_group to already
+        # be set - see _resolve_bench_groups. Without this, every bench
+        # hybrid/ruck would silently contribute 0 to every group's
+        # strength instead of counting toward whichever line they'd
+        # actually fill this match.
+        _resolve_bench_groups([p for p in players if p.slot in INTERCHANGE_SLOTS], rng)
+        return sum(_team_strengths(players).values())
+
+    def best_reserve_for(slot, exclude_id=None):
+        """Highest-team-strength reserve for `slot` (evaluated on its own,
+        no further vacancy chain), excluding `exclude_id` if given. Returns
+        (player_id, info, resulting_strength) or None if no reserves left."""
+        pool = [item for item in reserve_pool() if item[0] != exclude_id]
+        if not pool:
+            return None
+        pid, info = max(pool, key=lambda item: team_strength_of({slot: item[0]}))
+        return pid, info, team_strength_of({slot: pid})
+
+    changes = []
+    unfilled = []
+
+    # Slots still needing a fill, processed in order - starting slots first
+    # (matches AFL_POSITIONS order), then interchange. Borrowing a valid
+    # interchange player for a starting slot appends that player's now-
+    # vacant interchange slot to the back of this queue, so it gets filled
+    # afterward like any other empty slot (from reserves only - interchange
+    # slots never borrow from each other, which would just chase the same
+    # vacancy in circles).
+    queue = list(invalid_starting_slots) + list(invalid_interchange_slots)
+    queued = set(queue)
+
+    while queue:
+        slot = queue.pop(0)
+        is_starting = slot in starting_slots
+
+        # Each candidate is scored as (player_id, info, source_int_slot,
+        # resulting_strength). A reserve candidate's strength is just that
+        # one move; an interchange-borrow candidate's strength is the FULL
+        # combo - their move AND the best reserve backfill for the slot
+        # they vacate - scored together, since scoring the move alone
+        # unfairly ignores the backfill's own contribution and can make a
+        # much better borrow option look worse than a mediocre reserve.
+        candidates = []
+        for pid, info in reserve_pool():
+            candidates.append((pid, info, None, team_strength_of({slot: pid})))
+
+        if is_starting:
+            for int_slot in interchange_slots:
+                if int_slot in queued:
+                    continue  # already empty/invalid itself, not a valid lender
+                int_player_id = slot_to_player.get(int_slot)
+                if int_player_id is None or int_player_id not in roster:
+                    continue
+                backfill = best_reserve_for(int_slot, exclude_id=int_player_id)
+                overrides = {slot: int_player_id, int_slot: backfill[0] if backfill else None}
+                combo_strength = team_strength_of(overrides)
+                candidates.append((int_player_id, roster[int_player_id], int_slot, combo_strength))
+
+        if not candidates:
+            # Genuinely nobody left - this slot must end up empty, not keep
+            # whatever invalid occupant it started with (e.g. a duplicate's
+            # second occurrence, or an injured player), since that occupant
+            # is exactly what made the slot invalid in the first place.
+            slot_to_player[slot] = None
+            unfilled.append(slot)
+            continue
+
+        best_id, best_info, source_int_slot, _ = max(candidates, key=lambda item: item[3])
+
+        slot_to_player[slot] = best_id
+        claimed_player_ids.add(best_id)
+        if source_int_slot is not None:
+            changes.append(f"{slot}: {best_info['name']} ({best_info['ovr']}) - from {source_int_slot}")
+            slot_to_player[source_int_slot] = None
+            if source_int_slot not in queued:
+                queue.append(source_int_slot)
+                queued.add(source_int_slot)
+        else:
+            changes.append(f"{slot}: {best_info['name']} ({best_info['ovr']}) - reserve")
+
+    # Write the final slot assignments back to the database.
+    for slot, player_id in slot_to_player.items():
+        await db.execute("DELETE FROM lineups WHERE team_id = ? AND position_name = ?", (team_id, slot))
+        if player_id is not None:
+            slot_number = AFL_POSITIONS.index(slot) + 1
+            await db.execute(
+                "INSERT INTO lineups (team_id, player_id, slot_number, position_name) VALUES (?, ?, ?, ?)",
+                (team_id, player_id, slot_number, slot)
+            )
+    await db.commit()
+
+    return changes, unfilled
+
+
+async def lineups_locked(db):
+    """True while the active season's lineups are locked (set by the
+    Announce Lineups button on /matchsimulation, cleared by that panel's
+    Advance to Next Round button - see season_commands.py). Every path that
+    mutates the `lineups` table must check this first and refuse if locked,
+    since a locked round's lineups are what actually gets simmed."""
+    cursor = await db.execute(
+        "SELECT lineups_locked FROM seasons WHERE status = 'active' LIMIT 1"
+    )
+    row = await cursor.fetchone()
+    return bool(row and row[0])
+
+
+async def unconfirm_lineup(db, team_id):
+    """Clears a team's lineup_confirmed flag - called whenever their live
+    lineup changes after they'd confirmed but before the round locks, so a
+    stale confirmation can't slip through when the round gets announced."""
+    await db.execute(
+        "UPDATE teams SET lineup_confirmed = 0 WHERE team_id = ?",
+        (team_id,)
+    )
+
 
 class LineupCommands(commands.Cog):
     def __init__(self, bot):
@@ -133,52 +543,8 @@ class LineupCommands(commands.Cog):
                 )
                 return
 
-        # Get team data
         async with aiosqlite.connect(DB_PATH) as db:
-            # Get current lineup
-            cursor = await db.execute(
-                """SELECT l.position_name, p.name, p.position, p.overall_rating, p.player_id
-                   FROM lineups l
-                   JOIN players p ON l.player_id = p.player_id
-                   WHERE l.team_id = ?
-                   ORDER BY l.slot_number""",
-                (team_id,)
-            )
-            lineup_data = await cursor.fetchall()
-
-            # Get roster
-            cursor = await db.execute(
-                """SELECT player_id, name, position, overall_rating, age
-                   FROM players
-                   WHERE team_id = ?
-                   ORDER BY overall_rating DESC""",
-                (team_id,)
-            )
-            roster = await cursor.fetchall()
-
-            # Get team emoji
-            cursor = await db.execute(
-                "SELECT emoji_id FROM teams WHERE team_id = ?",
-                (team_id,)
-            )
-            result = await cursor.fetchone()
-            emoji_id = result[0] if result else None
-
-            # Check if starting lineup exists
-            cursor = await db.execute(
-                "SELECT 1 FROM starting_lineups WHERE team_id = ?",
-                (team_id,)
-            )
-            has_starting_lineup = await cursor.fetchone() is not None
-
-        # Build lineup dict
-        lineup = {}
-        for pos_name, name, pos, rating, player_id in lineup_data:
-            lineup[pos_name] = {'name': name, 'pos': pos, 'rating': rating, 'player_id': player_id}
-
-        # Create menu view
-        view = TeamLineupMenu(team_id, team_name, lineup, roster, self.bot, emoji_id, has_starting_lineup)
-        embed = await view.create_menu_embed()
+            view, embed = await build_team_lineup_menu(db, self.bot, team_id, team_name)
 
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
@@ -218,7 +584,7 @@ class LineupCommands(commands.Cog):
             cursor = await db.execute(
                 """SELECT l.position_name, p.name, p.position, p.overall_rating
                    FROM lineups l
-                   JOIN players p ON l.player_id = p.player_id
+                   JOIN players p ON l.player_id = p.player_id AND p.team_id = l.team_id
                    WHERE l.team_id = ?
                    ORDER BY l.slot_number""",
                 (team_id,)
@@ -471,9 +837,83 @@ class LineupCommands(commands.Cog):
                 print(f"Failed to log delist: {e}")
 
 
+async def build_team_lineup_menu(db, bot, team_id, team_name=None):
+    """Builds a ready-to-send (TeamLineupMenu, embed) pair for one team -
+    factored out of /teamlineup's own command body so other code (e.g.
+    season_commands.py's round-summary "Set Lineup for Next Round" button)
+    can open the exact same menu directly, without going through the
+    command itself. team_name is looked up if not already known by the
+    caller. Caller owns the actual interaction.response/followup send -
+    this only builds the view/embed."""
+    if team_name is None:
+        cursor = await db.execute("SELECT team_name FROM teams WHERE team_id = ?", (team_id,))
+        row = await cursor.fetchone()
+        team_name = row[0] if row else "Unknown Team"
+
+    # Get current lineup
+    cursor = await db.execute(
+        """SELECT l.position_name, p.name, p.position, p.overall_rating, p.player_id
+           FROM lineups l
+           JOIN players p ON l.player_id = p.player_id AND p.team_id = l.team_id
+           WHERE l.team_id = ?
+           ORDER BY l.slot_number""",
+        (team_id,)
+    )
+    lineup_data = await cursor.fetchall()
+
+    # Get roster
+    cursor = await db.execute(
+        """SELECT player_id, name, position, overall_rating, age
+           FROM players
+           WHERE team_id = ?
+           ORDER BY overall_rating DESC""",
+        (team_id,)
+    )
+    roster = await cursor.fetchall()
+
+    # Get team emoji and confirmation state
+    cursor = await db.execute(
+        "SELECT emoji_id, lineup_confirmed FROM teams WHERE team_id = ?",
+        (team_id,)
+    )
+    result = await cursor.fetchone()
+    emoji_id = result[0] if result else None
+    is_confirmed = bool(result[1]) if result else False
+
+    # Check if starting lineup exists
+    cursor = await db.execute(
+        "SELECT 1 FROM starting_lineups WHERE team_id = ?",
+        (team_id,)
+    )
+    has_starting_lineup = await cursor.fetchone() is not None
+
+    cursor = await db.execute(
+        "SELECT current_round, lineups_locked FROM seasons WHERE status = 'active' LIMIT 1"
+    )
+    season_row = await cursor.fetchone()
+    current_round = season_row[0] if season_row else 0
+    season_lineups_locked = bool(season_row[1]) if season_row else False
+
+    not_playing_this_round = (
+        current_round > 0 and not await team_playing_this_round(db, team_id, current_round)
+    )
+
+    # Build lineup dict
+    lineup = {}
+    for pos_name, name, pos, rating, player_id in lineup_data:
+        lineup[pos_name] = {'name': name, 'pos': pos, 'rating': rating, 'player_id': player_id}
+
+    view = TeamLineupMenu(team_id, team_name, lineup, roster, bot, emoji_id, has_starting_lineup,
+                           is_confirmed=is_confirmed, lineups_locked=season_lineups_locked,
+                           not_playing_this_round=not_playing_this_round)
+    embed = await view.create_menu_embed()
+    return view, embed
+
+
 class TeamLineupMenu(discord.ui.View):
     """Main menu for team lineup management"""
-    def __init__(self, team_id, team_name, lineup, roster, bot, emoji_id=None, has_starting_lineup=False):
+    def __init__(self, team_id, team_name, lineup, roster, bot, emoji_id=None, has_starting_lineup=False,
+                 is_confirmed=False, lineups_locked=False, not_playing_this_round=False):
         super().__init__(timeout=300)
         self.team_id = team_id
         self.team_name = team_name
@@ -482,31 +922,34 @@ class TeamLineupMenu(discord.ui.View):
         self.bot = bot
         self.emoji_id = emoji_id
         self.has_starting_lineup = has_starting_lineup
+        self.is_confirmed = is_confirmed
+        self.lineups_locked = lineups_locked
+        self.not_playing_this_round = not_playing_this_round
         self.warnings = []
 
         # Add buttons
         self.add_buttons()
 
     async def get_injured_players(self):
-        """Check for injured players in lineup - returns list of (player_name, weeks_left) tuples"""
+        """Check for injured players in lineup - returns list of
+        (player_name, slot_position) tuples, so the lineup screen shows
+        where the injured player currently sits rather than how long
+        they're out."""
         injured = []
         player_ids = [p.get('player_id') for p in self.lineup.values() if p.get('player_id')]
 
         if not player_ids:
             return injured
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Get current round
-            cursor = await db.execute(
-                "SELECT current_round FROM seasons WHERE status = 'active' LIMIT 1"
-            )
-            season_info = await cursor.fetchone()
-            current_round = season_info[0] if season_info else 0
+        slot_by_player_id = {
+            p['player_id']: pos_name
+            for pos_name, p in self.lineup.items() if p.get('player_id')
+        }
 
-            # Check for injuries
+        async with aiosqlite.connect(DB_PATH) as db:
             placeholders = ','.join('?' * len(player_ids))
             cursor = await db.execute(
-                f"""SELECT p.name, i.return_round
+                f"""SELECT p.player_id, p.name
                    FROM injuries i
                    JOIN players p ON i.player_id = p.player_id
                    WHERE i.player_id IN ({placeholders}) AND i.status = 'injured'""",
@@ -514,33 +957,30 @@ class TeamLineupMenu(discord.ui.View):
             )
             injuries = await cursor.fetchall()
 
-            for name, return_round in injuries:
-                weeks_left = return_round - current_round
-                if weeks_left > 0:
-                    injured.append((name, weeks_left))
+            for player_id, name in injuries:
+                injured.append((name, slot_by_player_id.get(player_id, "?")))
 
         return injured
 
     async def get_suspended_players(self):
-        """Check for suspended players in lineup - returns list of (player_name, games_left) tuples"""
+        """Check for suspended players in lineup - returns list of
+        (player_name, slot_position) tuples, so the lineup screen shows
+        where the suspended player currently sits rather than games remaining."""
         suspended = []
         player_ids = [p.get('player_id') for p in self.lineup.values() if p.get('player_id')]
 
         if not player_ids:
             return suspended
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Get current round
-            cursor = await db.execute(
-                "SELECT current_round FROM seasons WHERE status = 'active' LIMIT 1"
-            )
-            season_info = await cursor.fetchone()
-            current_round = season_info[0] if season_info else 0
+        slot_by_player_id = {
+            p['player_id']: pos_name
+            for pos_name, p in self.lineup.items() if p.get('player_id')
+        }
 
-            # Check for suspensions
+        async with aiosqlite.connect(DB_PATH) as db:
             placeholders = ','.join('?' * len(player_ids))
             cursor = await db.execute(
-                f"""SELECT p.name, s.return_round
+                f"""SELECT p.player_id, p.name, s.games_remaining
                    FROM suspensions s
                    JOIN players p ON s.player_id = p.player_id
                    WHERE s.player_id IN ({placeholders}) AND s.status = 'suspended'""",
@@ -548,10 +988,11 @@ class TeamLineupMenu(discord.ui.View):
             )
             suspensions = await cursor.fetchall()
 
-            for name, return_round in suspensions:
-                games_left = return_round - current_round
-                if games_left > 0:
-                    suspended.append((name, games_left))
+            for player_id, name, games_remaining in suspensions:
+                # games_remaining is NULL while suspension length is still
+                # TBC (see season_commands.py's _roll_pending_report_suspensions).
+                if games_remaining is None or games_remaining > 0:
+                    suspended.append((name, slot_by_player_id.get(player_id, "?")))
 
         return suspended
 
@@ -579,43 +1020,65 @@ class TeamLineupMenu(discord.ui.View):
         # Check for injured players
         injured = await self.get_injured_players()
         if injured:
-            injured_str = ', '.join([f"{name} ({weeks}w)" for name, weeks in injured])
+            injured_str = ', '.join([f"{name} ({slot})" for name, slot in injured])
             self.warnings.append(f"🚑 **Injured players:** {injured_str}")
 
         # Check for suspended players
         suspended = await self.get_suspended_players()
         if suspended:
-            suspended_str = ', '.join([f"{name} ({games}g)" for name, games in suspended])
+            suspended_str = ', '.join([f"{name} ({slot})" for name, slot in suspended])
             self.warnings.append(f"🚫 **Suspended players:** {suspended_str}")
 
     def add_buttons(self):
         """Add all menu buttons"""
+        # Once submitted (or once the whole round is locked via
+        # /matchsimulation's Announce Lineups button), every editing action
+        # is disabled - only Unsubmit Lineup (or, once locked, nothing) can
+        # get you back to an editable state.
+        locked_for_editing = self.is_confirmed or self.lineups_locked
+
         # Row 1: Primary actions
-        edit_btn = discord.ui.Button(label="📝 Edit Lineup", style=discord.ButtonStyle.primary, custom_id="edit_lineup")
+        edit_btn = discord.ui.Button(
+            label="📝 Edit Lineup", style=discord.ButtonStyle.primary, custom_id="edit_lineup",
+            disabled=locked_for_editing
+        )
         edit_btn.callback = self.edit_lineup_callback
         self.add_item(edit_btn)
 
-        submit_btn = discord.ui.Button(label="📤 Submit Lineup", style=discord.ButtonStyle.success, custom_id="submit_lineup")
-        submit_btn.callback = self.submit_lineup_callback
+        if self.is_confirmed:
+            submit_btn = discord.ui.Button(
+                label="↩️ Unsubmit Lineup", style=discord.ButtonStyle.secondary, custom_id="unconfirm_lineup",
+                disabled=self.lineups_locked
+            )
+            submit_btn.callback = self.unconfirm_lineup_callback
+        else:
+            submit_btn = discord.ui.Button(
+                label="✅ Submit Lineup", style=discord.ButtonStyle.success, custom_id="submit_lineup",
+                disabled=self.lineups_locked or self.not_playing_this_round
+            )
+            submit_btn.callback = self.submit_lineup_callback
         self.add_item(submit_btn)
 
-        # Row 2: Starting lineup management
-        save_btn = discord.ui.Button(label="💾 Save as Starting Lineup", style=discord.ButtonStyle.secondary, custom_id="save_starting")
+        # Row 2: Main lineup management
+        save_btn = discord.ui.Button(
+            label="💾 Save as Main Lineup", style=discord.ButtonStyle.secondary, custom_id="save_starting",
+            disabled=locked_for_editing
+        )
         save_btn.callback = self.save_starting_lineup_callback
         self.add_item(save_btn)
 
         revert_btn = discord.ui.Button(
-            label="🔄 Revert to Starting Lineup",
+            label="🔄 Revert to Main Lineup",
             style=discord.ButtonStyle.secondary,
             custom_id="revert_starting",
-            disabled=not self.has_starting_lineup
+            disabled=locked_for_editing or not self.has_starting_lineup
         )
         revert_btn.callback = self.revert_starting_lineup_callback
         self.add_item(revert_btn)
 
         # Row 3: View and Clear actions
         view_starting_btn = discord.ui.Button(
-            label="👁️ View Starting Lineup",
+            label="👁️ View Main Lineup",
             style=discord.ButtonStyle.secondary,
             custom_id="view_starting",
             disabled=not self.has_starting_lineup
@@ -623,12 +1086,28 @@ class TeamLineupMenu(discord.ui.View):
         view_starting_btn.callback = self.view_starting_lineup_callback
         self.add_item(view_starting_btn)
 
-        clear_btn = discord.ui.Button(label="🗑️ Clear Lineup", style=discord.ButtonStyle.danger, custom_id="clear_lineup")
+        clear_btn = discord.ui.Button(
+            label="🗑️ Clear Lineup", style=discord.ButtonStyle.danger, custom_id="clear_lineup",
+            disabled=locked_for_editing
+        )
         clear_btn.callback = self.clear_lineup_callback
         self.add_item(clear_btn)
 
     async def edit_lineup_callback(self, interaction: discord.Interaction):
         """Open the lineup editor"""
+        if self.is_confirmed:
+            await interaction.response.send_message(
+                "❌ Your lineup is submitted - select **Unsubmit Lineup** first to make changes.",
+                ephemeral=True
+            )
+            return
+        if self.lineups_locked:
+            await interaction.response.send_message(
+                "❌ Lineups are locked for this round - the round has already been announced.",
+                ephemeral=True
+            )
+            return
+
         # Create LineupView with current data
         view = LineupView(self.team_id, self.team_name, [], self.roster, self.bot, self.emoji_id)
 
@@ -642,249 +1121,117 @@ class TeamLineupMenu(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=view)
 
     async def submit_lineup_callback(self, interaction: discord.Interaction):
-        """Submit the lineup for the current round"""
+        """Submit the lineup as ready for the current round - no longer
+        posts anywhere itself; an admin locks in and posts every team's
+        lineup at once via /matchsimulation's Announce Lineups button
+        (season_commands.py's _try_announce_lineups). Logs a one-line entry
+        to the bot logs channel, then flips the menu's Submit button to
+        Unsubmit and locks further edits until that's
+        pressed."""
         await interaction.response.defer(ephemeral=True)
 
-        # Call the submit logic (similar to /submitlineup)
         async with aiosqlite.connect(DB_PATH) as db:
-            # Get current round
             cursor = await db.execute(
-                "SELECT current_round, regular_rounds FROM seasons WHERE status = 'active' LIMIT 1"
+                "SELECT current_round, regular_rounds, lineups_locked FROM seasons WHERE status = 'active' LIMIT 1"
             )
             season_info = await cursor.fetchone()
             if not season_info:
                 await interaction.followup.send("❌ No active season!", ephemeral=True)
                 return
+            current_round, regular_rounds, lineups_locked = season_info
 
-            current_round = season_info[0]
-            regular_rounds = season_info[1]
-
-            # Get lineup from database
-            cursor = await db.execute(
-                """SELECT l.position_name, p.player_id, p.name, p.position, p.overall_rating
-                   FROM lineups l
-                   JOIN players p ON l.player_id = p.player_id
-                   WHERE l.team_id = ?
-                   ORDER BY l.slot_number""",
-                (self.team_id,)
-            )
-            lineup = await cursor.fetchall()
-
-            # Validation (copied from submitlineup command)
-            errors = []
-            if len(lineup) < 23:
-                empty_count = 23 - len(lineup)
-                errors.append(f"❌ Lineup incomplete: {empty_count} position(s) empty")
-
-            # Check for duplicates
-            player_ids = [p[1] for p in lineup]
-            if len(player_ids) != len(set(player_ids)):
-                errors.append("❌ Duplicate players in lineup")
-
-            # Check for injured/suspended players
-            if player_ids:
-                placeholders = ','.join('?' * len(player_ids))
-
-                # Check injuries
-                cursor = await db.execute(
-                    f"""SELECT p.name, i.return_round
-                       FROM injuries i
-                       JOIN players p ON i.player_id = p.player_id
-                       WHERE i.player_id IN ({placeholders}) AND i.status = 'injured'""",
-                    player_ids
+            if lineups_locked:
+                await interaction.followup.send(
+                    "❌ Lineups are locked for this round - the round has already been announced.",
+                    ephemeral=True
                 )
-                injuries = await cursor.fetchall()
-                injured_players = []
-                for name, return_round in injuries:
-                    weeks_left = return_round - current_round
-                    if weeks_left > 0:
-                        injured_players.append(f"{name} ({weeks_left}w)")
-                if injured_players:
-                    errors.append(f"❌ Injured players: {', '.join(injured_players)}")
+                return
 
-                # Check suspensions
-                cursor = await db.execute(
-                    f"""SELECT p.name, s.return_round
-                       FROM suspensions s
-                       JOIN players p ON s.player_id = p.player_id
-                       WHERE s.player_id IN ({placeholders}) AND s.status = 'suspended'""",
-                    player_ids
+            if current_round > 0 and not await team_playing_this_round(db, self.team_id, current_round):
+                await interaction.followup.send(
+                    "❌ Your team isn't playing this round - there's no fixture to submit a lineup for.",
+                    ephemeral=True
                 )
-                suspensions = await cursor.fetchall()
-                suspended_players = []
-                for name, return_round in suspensions:
-                    games_left = return_round - current_round
-                    if games_left > 0:
-                        suspended_players.append(f"{name} ({games_left}g)")
-                if suspended_players:
-                    errors.append(f"❌ Suspended players: {', '.join(suspended_players)}")
+                return
 
+            errors, player_ids = await validate_lineup(db, self.team_id, current_round)
             if errors:
                 await interaction.followup.send("\n".join(errors), ephemeral=True)
                 return
 
-            # Get lineup channel
-            cursor = await db.execute(
-                "SELECT setting_value FROM settings WHERE setting_key = ?",
-                ("lineups_channel_id",)
+            await db.execute(
+                "UPDATE teams SET lineup_confirmed = 1 WHERE team_id = ?",
+                (self.team_id,)
             )
-            result = await cursor.fetchone()
-            if not result or not result[0]:
-                await interaction.followup.send("❌ Lineups channel not set! Ask an admin to use `/setlineupschannel`", ephemeral=True)
-                return
+            await db.commit()
 
-            lineup_channel = self.bot.get_channel(int(result[0]))
-            if not lineup_channel:
-                await interaction.followup.send("❌ Lineup channel not found!", ephemeral=True)
-                return
-
-            # Get season_id for tracking submissions
             cursor = await db.execute(
-                "SELECT season_id FROM seasons WHERE status = 'active' LIMIT 1"
+                "SELECT setting_value FROM settings WHERE setting_key = 'bot_logs_channel_id'"
             )
-            season_result = await cursor.fetchone()
-            season_id = season_result[0] if season_result else None
+            log_setting = await cursor.fetchone()
+            round_display = get_round_name(current_round, regular_rounds) if current_round > 0 else "Offseason"
 
-            # Get previous submitted lineup for this team in this season (from previous rounds only)
-            previous_player_ids = None
-            has_previous_submission = False
-            if season_id:
-                cursor = await db.execute(
-                    """SELECT player_ids FROM submitted_lineups
-                       WHERE team_id = ? AND season_id = ? AND round_number < ?
-                       ORDER BY round_number DESC LIMIT 1""",
-                    (self.team_id, season_id, current_round)
-                )
-                prev_result = await cursor.fetchone()
-                if prev_result:
-                    previous_player_ids = set(json.loads(prev_result[0]))
-                    has_previous_submission = True
+        if log_setting and log_setting[0]:
+            log_channel = self.bot.get_channel(int(log_setting[0]))
+            if log_channel:
+                emoji_str = get_team_emoji_str(self.bot, self.emoji_id)
+                await log_channel.send(f"✅ {emoji_str}has submitted their lineup for {round_display} ({interaction.user.mention})")
 
-        # Calculate Ins and Outs (only if there was a previous submission)
-        ins_names = []
-        outs_names = []
+        self.is_confirmed = True
+        self.clear_items()
+        self.add_buttons()
+        embed = await self.create_menu_embed()
+        await self.message.edit(embed=embed, view=self)
 
-        if has_previous_submission:
-            current_player_ids = set(player_ids)
-            ins = current_player_ids - previous_player_ids
-            outs = previous_player_ids - current_player_ids
-
-            # Get player names and OVRs for ins and outs
-            async with aiosqlite.connect(DB_PATH) as db:
-                if ins:
-                    placeholders = ','.join('?' * len(ins))
-                    cursor = await db.execute(
-                        f"SELECT name, overall_rating FROM players WHERE player_id IN ({placeholders})",
-                        list(ins)
-                    )
-                    ins_names = [f"{name} ({ovr})" for name, ovr in await cursor.fetchall()]
-
-                if outs:
-                    placeholders = ','.join('?' * len(outs))
-                    # Get player info for outs
-                    cursor = await db.execute(
-                        f"SELECT player_id, name, overall_rating FROM players WHERE player_id IN ({placeholders})",
-                        list(outs)
-                    )
-                    out_players = await cursor.fetchall()
-
-                    # Batch-check injury status for all outs at once
-                    cursor = await db.execute(
-                        f"""SELECT player_id FROM injuries
-                            WHERE player_id IN ({placeholders}) AND status = 'injured' AND return_round > ?""",
-                        list(outs) + [current_round]
-                    )
-                    injured_ids = {row[0] for row in await cursor.fetchall()}
-
-                    # Batch-check suspension status for all outs at once
-                    cursor = await db.execute(
-                        f"""SELECT player_id FROM suspensions
-                            WHERE player_id IN ({placeholders}) AND status = 'suspended' AND return_round > ?""",
-                        list(outs) + [current_round]
-                    )
-                    suspended_ids = {row[0] for row in await cursor.fetchall()}
-
-                    # Build name with status
-                    for player_id, name, ovr in out_players:
-                        if player_id in injured_ids:
-                            outs_names.append(f"{name} ({ovr}) (injured)")
-                        elif player_id in suspended_ids:
-                            outs_names.append(f"{name} ({ovr}) (suspended)")
-                        else:
-                            outs_names.append(f"{name} ({ovr}) (omitted)")
-
-        # Build lineup embed
-        round_display = get_round_name(current_round, regular_rounds) if current_round > 0 else "Offseason"
-
-        emoji = get_team_emoji_str(self.bot, self.emoji_id)
-
-        embed = discord.Embed(
-            title=f"{emoji}{self.team_name} - {round_display} Lineup",
-            color=discord.Color.green()
+        await interaction.followup.send(
+            f"✅ Lineup submitted and ready for Round {current_round}.",
+            ephemeral=True
         )
 
-        # Format lineup
-        rows = [
-            ("FB", ["LBP", "FB", "RBP"]),
-            ("HB", ["LHB", "CHB", "RHB"]),
-            ("C", ["LW", "C", "RW"]),
-            ("HF", ["LHF", "CHF", "RHF"]),
-            ("FF", ["LFP", "FF", "RFP"]),
-            ("Fol", ["R", "RR", "RO"])
-        ]
+    async def unconfirm_lineup_callback(self, interaction: discord.Interaction):
+        """Reverses submit_lineup_callback - clears lineup_confirmed so the
+        team's lineup is editable again. Logged the same way as submission,
+        so bot logs show both halves of the round-planning back-and-forth."""
+        await interaction.response.defer(ephemeral=True)
 
-        lineup_dict = {pos_name: (name, pos, rating) for pos_name, player_id, name, pos, rating in lineup}
-        field_text = ""
-
-        for line_name, positions in rows:
-            row_text = []
-            for pos_name in positions:
-                if pos_name in lineup_dict:
-                    p = lineup_dict[pos_name]
-                    row_text.append(f"{p[0]} ({p[2]})")
-                else:
-                    row_text.append("*Empty*")
-            field_text += f"**{line_name}:**  {', '.join(row_text)}\n"
-
-        field_text += "\n"
-
-        # Interchange - all 5 on one line
-        int_players = []
-        for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]:
-            if pos_name in lineup_dict:
-                p = lineup_dict[pos_name]
-                int_players.append(f"{p[0]} ({p[2]})")
-            else:
-                int_players.append("*Empty*")
-        field_text += f"**Int:**  {', '.join(int_players)}"
-
-        embed.description = field_text
-
-        # Add Ins & Outs to description if there are changes
-        if ins_names or outs_names:
-            changes_text = "\n\n"
-            if ins_names:
-                changes_text += f"**IN:** {', '.join(ins_names)}\n"
-            if outs_names:
-                changes_text += f"**OUT:** {', '.join(outs_names)}"
-            embed.description += changes_text
-
-        # Save this submission to the database
-        if season_id:
-            async with aiosqlite.connect(DB_PATH) as db:
-                player_ids_json = json.dumps(player_ids)
-                await db.execute(
-                    """INSERT OR REPLACE INTO submitted_lineups (team_id, season_id, round_number, player_ids)
-                       VALUES (?, ?, ?, ?)""",
-                    (self.team_id, season_id, current_round, player_ids_json)
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT current_round, regular_rounds, lineups_locked FROM seasons WHERE status = 'active' LIMIT 1"
+            )
+            season_info = await cursor.fetchone()
+            if season_info and season_info[2]:
+                await interaction.followup.send(
+                    "❌ Lineups are locked for this round - the round has already been announced.",
+                    ephemeral=True
                 )
-                await db.commit()
+                return
+            current_round, regular_rounds = (season_info[0], season_info[1]) if season_info else (0, None)
 
-        # Post to lineup channel
-        await lineup_channel.send(embed=embed)
+            await db.execute(
+                "UPDATE teams SET lineup_confirmed = 0 WHERE team_id = ?",
+                (self.team_id,)
+            )
+            await db.commit()
 
-        # Confirm
-        await interaction.followup.send(f"✅ Lineup submitted to {lineup_channel.mention}!", ephemeral=True)
+            cursor = await db.execute(
+                "SELECT setting_value FROM settings WHERE setting_key = 'bot_logs_channel_id'"
+            )
+            log_setting = await cursor.fetchone()
+            round_display = get_round_name(current_round, regular_rounds) if current_round > 0 else "Offseason"
+
+        if log_setting and log_setting[0]:
+            log_channel = self.bot.get_channel(int(log_setting[0]))
+            if log_channel:
+                emoji_str = get_team_emoji_str(self.bot, self.emoji_id)
+                await log_channel.send(f"↩️ {emoji_str}has unsubmitted their lineup for {round_display} ({interaction.user.mention})")
+
+        self.is_confirmed = False
+        self.clear_items()
+        self.add_buttons()
+        embed = await self.create_menu_embed()
+        await self.message.edit(embed=embed, view=self)
+
+        await interaction.followup.send("↩️ Lineup unsubmitted - you can make changes again.", ephemeral=True)
 
     async def save_starting_lineup_callback(self, interaction: discord.Interaction):
         """Save current lineup as starting lineup - show confirmation first"""
@@ -892,9 +1239,9 @@ class TeamLineupMenu(discord.ui.View):
         confirmation_view = ConfirmActionView(self, 'do_save_starting_lineup', discord.ButtonStyle.success)
 
         if self.has_starting_lineup:
-            message = "⚠️ **Are you sure?**\n\nThis will overwrite your previously saved starting lineup with your current lineup."
+            message = "⚠️ **Are you sure?**\n\nThis will overwrite your previously saved main lineup with your current lineup."
         else:
-            message = "💾 **Save as Starting Lineup?**\n\nYour current lineup will be saved and can be restored later."
+            message = "💾 **Save as Main Lineup?**\n\nYour current lineup will be saved and can be restored later."
 
         await interaction.response.send_message(message, view=confirmation_view, ephemeral=True)
 
@@ -913,7 +1260,7 @@ class TeamLineupMenu(discord.ui.View):
             lineup_data = await cursor.fetchall()
 
             if not lineup_data:
-                await interaction.followup.send("❌ Cannot save empty lineup!", ephemeral=True)
+                await interaction.edit_original_response(content="❌ Cannot save empty lineup!", view=None)
                 return
 
             # Convert to JSON
@@ -936,13 +1283,25 @@ class TeamLineupMenu(discord.ui.View):
         embed = await self.create_menu_embed()
         await self.message.edit(embed=embed, view=self)
 
-        await interaction.followup.send("✅ Starting lineup saved!", ephemeral=True)
+        # Edit the confirmation message itself (already edited once above,
+        # in ConfirmActionView.confirm_button, to disable its buttons) to
+        # its final result text, instead of sending a separate followup -
+        # merges "Save as Main Lineup?" and "Main lineup saved!" into one
+        # message that just updates in place.
+        await interaction.edit_original_response(content="✅ Main lineup saved!", view=None)
 
     async def revert_starting_lineup_callback(self, interaction: discord.Interaction):
         """Revert to saved starting lineup"""
         await interaction.response.defer(ephemeral=True)
 
         async with aiosqlite.connect(DB_PATH) as db:
+            if await lineups_locked(db):
+                await interaction.followup.send(
+                    "❌ Lineups are locked for this round - the round has already been announced.",
+                    ephemeral=True
+                )
+                return
+
             # Get saved starting lineup
             cursor = await db.execute(
                 "SELECT lineup_data FROM starting_lineups WHERE team_id = ?",
@@ -951,7 +1310,7 @@ class TeamLineupMenu(discord.ui.View):
             result = await cursor.fetchone()
 
             if not result:
-                await interaction.followup.send("❌ No starting lineup saved!", ephemeral=True)
+                await interaction.followup.send("❌ No main lineup saved!", ephemeral=True)
                 return
 
             lineup_data = json.loads(result[0])
@@ -967,16 +1326,17 @@ class TeamLineupMenu(discord.ui.View):
                     (self.team_id, int(player_id), slot_number, position_name)
                 )
 
+            await unconfirm_lineup(db, self.team_id)
             await db.commit()
 
-        await interaction.followup.send("✅ Reverted to starting lineup!", ephemeral=True)
+        await interaction.followup.send("✅ Reverted to main lineup!", ephemeral=True)
 
         # Refresh the menu with updated lineup
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
                 """SELECT l.position_name, p.name, p.position, p.overall_rating, p.player_id
                    FROM lineups l
-                   JOIN players p ON l.player_id = p.player_id
+                   JOIN players p ON l.player_id = p.player_id AND p.team_id = l.team_id
                    WHERE l.team_id = ?
                    ORDER BY l.slot_number""",
                 (self.team_id,)
@@ -1004,7 +1364,15 @@ class TeamLineupMenu(discord.ui.View):
         # Interaction has already been responded to by the confirmation view
 
         async with aiosqlite.connect(DB_PATH) as db:
+            if await lineups_locked(db):
+                await interaction.followup.send(
+                    "❌ Lineups are locked for this round - the round has already been announced.",
+                    ephemeral=True
+                )
+                return
+
             await db.execute("DELETE FROM lineups WHERE team_id = ?", (self.team_id,))
+            await unconfirm_lineup(db, self.team_id)
             await db.commit()
 
         self.lineup = {}
@@ -1028,7 +1396,7 @@ class TeamLineupMenu(discord.ui.View):
             result = await cursor.fetchone()
 
             if not result:
-                await interaction.response.send_message("❌ No starting lineup saved!", ephemeral=True)
+                await interaction.response.send_message("❌ No main lineup saved!", ephemeral=True)
                 return
 
             lineup_data = json.loads(result[0])
@@ -1036,7 +1404,7 @@ class TeamLineupMenu(discord.ui.View):
             # Get player details for the saved lineup
             player_ids = list(lineup_data.values())
             if not player_ids:
-                await interaction.response.send_message("❌ Starting lineup is empty!", ephemeral=True)
+                await interaction.response.send_message("❌ Main lineup is empty!", ephemeral=True)
                 return
 
             placeholders = ','.join('?' * len(player_ids))
@@ -1051,10 +1419,10 @@ class TeamLineupMenu(discord.ui.View):
         # Build player lookup
         player_lookup = {pid: (name, pos, rating) for pid, name, pos, rating in players}
 
-        # Create embed for starting lineup
+        # Create embed for main lineup
         emoji = get_team_emoji_str(self.bot, self.emoji_id)
         embed = discord.Embed(
-            title=f"{emoji}{self.team_name} - Starting Lineup",
+            title=f"{emoji}{self.team_name} - Main Lineup",
             color=discord.Color.gold()
         )
 
@@ -1156,7 +1524,14 @@ class TeamLineupMenu(discord.ui.View):
         if self.warnings:
             embed.add_field(name="\u200b", value="\n".join(self.warnings), inline=False)
 
-        embed.set_footer(text=f"{len(self.lineup)}/23 positions filled")
+        status = f"{len(self.lineup)}/23 positions filled"
+        if self.lineups_locked:
+            status += " • Lineups locked for this round"
+        elif self.not_playing_this_round:
+            status += " • Not playing this round - lineup can't be submitted"
+        elif self.is_confirmed:
+            status += " • Submitted - select Unsubmit Lineup to make changes"
+        embed.set_footer(text=status)
 
         return embed
 
@@ -1171,7 +1546,13 @@ class ConfirmActionView(discord.ui.View):
 
     @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.success)
     async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Disable all buttons and respond to interaction
+        # Disable all buttons and respond to interaction - the action
+        # method (e.g. do_save_starting_lineup) is expected to edit THIS
+        # SAME confirmation message with its own result text via
+        # interaction.edit_original_response, rather than sending a
+        # separate followup - so the user sees one message update in
+        # place ("Save as Main Lineup?" -> "Main lineup saved!") instead
+        # of the prompt staying on screen next to a brand new message.
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(view=self)
@@ -1219,7 +1600,7 @@ class LineupView(discord.ui.View):
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
                 """SELECT l.position_name, p.player_id FROM lineups l
-                   JOIN players p ON l.player_id = p.player_id
+                   JOIN players p ON l.player_id = p.player_id AND p.team_id = l.team_id
                    WHERE l.team_id = ?""",
                 (self.team_id,)
             )
@@ -1326,25 +1707,25 @@ class LineupView(discord.ui.View):
         return duplicates
 
     async def get_injured_players(self):
-        """Check for injured players in lineup - returns list of (player_name, weeks_left) tuples"""
+        """Check for injured players in lineup - returns list of
+        (player_name, slot_position) tuples, so the lineup screen shows
+        where the injured player currently sits rather than how long
+        they're out."""
         injured = []
         player_ids = [p.get('player_id') for p in self.lineup.values() if p.get('player_id')]
 
         if not player_ids:
             return injured
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Get current round
-            cursor = await db.execute(
-                "SELECT current_round FROM seasons WHERE status = 'active' LIMIT 1"
-            )
-            season_info = await cursor.fetchone()
-            current_round = season_info[0] if season_info else 0
+        slot_by_player_id = {
+            p['player_id']: pos_name
+            for pos_name, p in self.lineup.items() if p.get('player_id')
+        }
 
-            # Check for injuries
+        async with aiosqlite.connect(DB_PATH) as db:
             placeholders = ','.join('?' * len(player_ids))
             cursor = await db.execute(
-                f"""SELECT p.name, i.return_round
+                f"""SELECT p.player_id, p.name
                    FROM injuries i
                    JOIN players p ON i.player_id = p.player_id
                    WHERE i.player_id IN ({placeholders}) AND i.status = 'injured'""",
@@ -1352,33 +1733,30 @@ class LineupView(discord.ui.View):
             )
             injuries = await cursor.fetchall()
 
-            for name, return_round in injuries:
-                weeks_left = return_round - current_round
-                if weeks_left > 0:
-                    injured.append((name, weeks_left))
+            for player_id, name in injuries:
+                injured.append((name, slot_by_player_id.get(player_id, "?")))
 
         return injured
 
     async def get_suspended_players(self):
-        """Check for suspended players in lineup - returns list of (player_name, games_left) tuples"""
+        """Check for suspended players in lineup - returns list of
+        (player_name, slot_position) tuples, so the lineup screen shows
+        where the suspended player currently sits rather than games remaining."""
         suspended = []
         player_ids = [p.get('player_id') for p in self.lineup.values() if p.get('player_id')]
 
         if not player_ids:
             return suspended
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Get current round
-            cursor = await db.execute(
-                "SELECT current_round FROM seasons WHERE status = 'active' LIMIT 1"
-            )
-            season_info = await cursor.fetchone()
-            current_round = season_info[0] if season_info else 0
+        slot_by_player_id = {
+            p['player_id']: pos_name
+            for pos_name, p in self.lineup.items() if p.get('player_id')
+        }
 
-            # Check for suspensions
+        async with aiosqlite.connect(DB_PATH) as db:
             placeholders = ','.join('?' * len(player_ids))
             cursor = await db.execute(
-                f"""SELECT p.name, s.return_round
+                f"""SELECT p.player_id, p.name, s.games_remaining
                    FROM suspensions s
                    JOIN players p ON s.player_id = p.player_id
                    WHERE s.player_id IN ({placeholders}) AND s.status = 'suspended'""",
@@ -1386,10 +1764,11 @@ class LineupView(discord.ui.View):
             )
             suspensions = await cursor.fetchall()
 
-            for name, return_round in suspensions:
-                games_left = return_round - current_round
-                if games_left > 0:
-                    suspended.append((name, games_left))
+            for player_id, name, games_remaining in suspensions:
+                # games_remaining is NULL while suspension length is still
+                # TBC (see season_commands.py's _roll_pending_report_suspensions).
+                if games_remaining is None or games_remaining > 0:
+                    suspended.append((name, slot_by_player_id.get(player_id, "?")))
 
         return suspended
 
@@ -1405,13 +1784,13 @@ class LineupView(discord.ui.View):
         # Check for injured players
         injured = await self.get_injured_players()
         if injured:
-            injured_str = ', '.join([f"{name} ({weeks}w)" for name, weeks in injured])
+            injured_str = ', '.join([f"{name} ({slot})" for name, slot in injured])
             self.warnings.append(f"🚑 **Injured players:** {injured_str}")
 
         # Check for suspended players
         suspended = await self.get_suspended_players()
         if suspended:
-            suspended_str = ', '.join([f"{name} ({games}g)" for name, games in suspended])
+            suspended_str = ', '.join([f"{name} ({slot})" for name, slot in suspended])
             self.warnings.append(f"🚫 **Suspended players:** {suspended_str}")
 
     def create_embed(self):
@@ -1531,15 +1910,23 @@ class ClearPositionButton(discord.ui.Button):
     
     async def callback(self, interaction: discord.Interaction):
         pos_name = self.parent_view.selected_position
-        
+
         # Remove from database
         async with aiosqlite.connect(DB_PATH) as db:
+            if await lineups_locked(db):
+                await interaction.response.send_message(
+                    "❌ Lineups are locked for this round - the round has already been announced.",
+                    ephemeral=True
+                )
+                return
+
             await db.execute(
                 "DELETE FROM lineups WHERE team_id = ? AND position_name = ?",
                 (self.parent_view.team_id, pos_name)
             )
+            await unconfirm_lineup(db, self.parent_view.team_id)
             await db.commit()
-        
+
         # Remove from lineup
         if pos_name in self.parent_view.lineup:
             del self.parent_view.lineup[pos_name]
@@ -1651,25 +2038,33 @@ class PlayerSelect(discord.ui.Select):
         if self.values[0] == "none":
             await interaction.response.defer()
             return
-        
+
         player_id = int(self.values[0])
-        
+
         # Get slot number for this position
         slot_number = AFL_POSITIONS.index(self.position_name) + 1
-        
+
         # Update lineup in database
         async with aiosqlite.connect(DB_PATH) as db:
+            if await lineups_locked(db):
+                await interaction.response.send_message(
+                    "❌ Lineups are locked for this round - the round has already been announced.",
+                    ephemeral=True
+                )
+                return
+
             # Remove player from any existing position
             await db.execute(
                 "DELETE FROM lineups WHERE team_id = ? AND player_id = ?",
                 (self.parent_view.team_id, player_id)
             )
-            
+
             # Add to new position
             await db.execute(
                 "INSERT OR REPLACE INTO lineups (team_id, player_id, slot_number, position_name) VALUES (?, ?, ?, ?)",
                 (self.parent_view.team_id, player_id, slot_number, self.position_name)
             )
+            await unconfirm_lineup(db, self.parent_view.team_id)
             await db.commit()
             
             # Get player info
@@ -1714,7 +2109,7 @@ class MainMenuButton(discord.ui.Button):
             cursor = await db.execute(
                 """SELECT l.position_name, p.name, p.position, p.overall_rating, p.player_id
                    FROM lineups l
-                   JOIN players p ON l.player_id = p.player_id
+                   JOIN players p ON l.player_id = p.player_id AND p.team_id = l.team_id
                    WHERE l.team_id = ?
                    ORDER BY l.slot_number""",
                 (self.parent_view.team_id,)

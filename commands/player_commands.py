@@ -72,7 +72,7 @@ class PlayerCommands(commands.Cog):
                     """SELECT p.player_id, p.name, p.position, p.overall_rating, p.age, t.team_name, t.emoji_id
                        FROM players p
                        LEFT JOIN teams t ON p.team_id = t.team_id
-                       WHERE p.name LIKE ?
+                       WHERE p.name LIKE ? AND p.team_id IS NOT NULL
                        ORDER BY p.overall_rating DESC""",
                     (f"%{search_term}%",)
                 )
@@ -356,13 +356,18 @@ class PlayerCommands(commands.Cog):
         limit: int = 100
     ):
         async with aiosqlite.connect(DB_PATH) as db:
-            # Build the query dynamically based on filters (exclude Draft Pool players)
+            # Build the query dynamically based on filters (exclude Draft Pool players;
+            # exclude delisted players too unless team_name="delisted" was requested)
             query = """SELECT p.name, p.position, p.overall_rating, p.age, t.team_name, t.emoji_id
                        FROM players p
                        LEFT JOIN teams t ON p.team_id = t.team_id
                        WHERE 1=1
                        AND (t.team_name IS NULL OR t.team_name != 'Draft Pool')"""
             params = []
+
+            searching_delisted = team_name is not None and team_name.lower() in ['delisted', 'delist', 'del']
+            if not searching_delisted:
+                query += " AND p.team_id IS NOT NULL"
             
             if min_rating is not None:
                 query += " AND p.overall_rating >= ?"
@@ -402,7 +407,7 @@ class PlayerCommands(commands.Cog):
                 params.extend(normalized_positions)
             
             if team_name is not None:
-                if team_name.lower() in ['delisted', 'delist', 'del']:
+                if searching_delisted:
                     query += " AND p.team_id IS NULL"
                 else:
                     query += " AND t.team_name = ?"
