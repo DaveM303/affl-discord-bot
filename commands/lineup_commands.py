@@ -1580,21 +1580,54 @@ class LineupView(discord.ui.View):
         self.selected_position = None  # Track which position is being edited
         self.player_page = 0  # Current page of players in dropdown
         self.warnings = []  # Store lineup warnings
+        self.injured_player_ids = set()  # Whole-roster injury/suspension status,
+        self.suspended_player_ids = set()  # populated by refresh_status_ids() - used
+                                            # to badge PositionSelect/PlayerSelect options
 
         # Build lineup dict (position_name -> player info)
         self.lineup = {}
         for pos_name, name, pos, rating in current_lineup:
             self.lineup[pos_name] = {'name': name, 'pos': pos, 'rating': rating, 'player_id': None}
 
-        # Add position buttons
-        self.current_group = 0  # 0=backs, 1=mids, 2=forwards, 3=interchange
+        # Add position dropdown
         self.add_position_buttons()
 
     async def initialize(self):
         """Initialize player IDs and warnings (call this after creating the view)"""
         await self.refresh_lineup_ids()
+        await self.refresh_status_ids()
         await self.update_warnings()
-    
+
+    async def refresh_status_ids(self):
+        """Get injured/suspended player IDs for the whole roster (not just
+        players currently in the lineup) - used to badge PositionSelect and
+        PlayerSelect options so a coach can see injury/suspension status
+        while picking, not just after the fact in the warnings list."""
+        roster_ids = [p[0] for p in self.roster]
+        if not roster_ids:
+            return
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            placeholders = ','.join('?' * len(roster_ids))
+            cursor = await db.execute(
+                f"""SELECT player_id FROM injuries
+                   WHERE player_id IN ({placeholders}) AND status = 'injured'""",
+                roster_ids
+            )
+            self.injured_player_ids = {row[0] for row in await cursor.fetchall()}
+
+            cursor = await db.execute(
+                f"""SELECT player_id, games_remaining FROM suspensions
+                   WHERE player_id IN ({placeholders}) AND status = 'suspended'""",
+                roster_ids
+            )
+            # games_remaining is NULL while suspension length is still TBC
+            # (see season_commands.py's _roll_pending_report_suspensions) -
+            # treated as still suspended, same as get_suspended_players above.
+            self.suspended_player_ids = {
+                row[0] for row in await cursor.fetchall() if row[1] is None or row[1] > 0
+            }
+
     async def refresh_lineup_ids(self):
         """Get player IDs for current lineup players"""
         async with aiosqlite.connect(DB_PATH) as db:
@@ -1612,39 +1645,27 @@ class LineupView(discord.ui.View):
                     self.lineup[pos_name]['player_id'] = player_id_by_position[pos_name]
     
     def add_position_buttons(self):
-        """Add buttons for current position group"""
+        """Add the position dropdown, player dropdown (if a position is
+        selected), and supporting buttons."""
         self.clear_items()
-        
-        groups = [
-            (["LBP", "FB", "RBP", "LHB", "CHB", "RHB"]),
-            (["LW", "C", "RW", "R", "RR", "RO"]),
-            (["LHF", "CHF", "RHF", "LFP", "FF", "RFP"]),
-            (["INT1", "INT2", "INT3", "INT4", "INT5"])
-        ]
-        
-        positions = groups[self.current_group]
-        
-        # Add position buttons for current group
-        for pos_name in positions:
-            self.add_item(PositionButton(pos_name, self))
-        
+
+        # Position dropdown - all 23 slots fit in one Select (Discord's
+        # cap is 25), replacing the old 4-page backs/mids/forwards/
+        # interchange button groups with a single always-visible list.
+        self.add_item(PositionSelect(self))
+
         # Add player select dropdown if a position is selected
         if self.selected_position:
             self.add_item(PlayerSelect(self.selected_position, self))
             # Add pagination buttons if needed
             total_players = self.get_sorted_roster_count()
             if total_players > 25:
+                total_pages = (total_players + 24) // 25
                 if self.player_page > 0:
                     self.add_item(PrevPageButton(self))
                 if (self.player_page + 1) * 25 < total_players:
-                    self.add_item(NextPageButton(self))
-        
-        # Add navigation buttons
-        if self.current_group < 3:
-            self.add_item(NextGroupButton(self))
-        if self.current_group > 0:
-            self.add_item(PrevGroupButton(self))
-        
+                    self.add_item(NextPageButton(self, total_pages))
+
         # Add clear and main menu buttons
         if self.selected_position and self.selected_position in self.lineup:
             self.add_item(ClearPositionButton(self))
@@ -1811,7 +1832,7 @@ class LineupView(discord.ui.View):
         
         embed = discord.Embed(
             title=title,
-            description="Click a position button, then select a player from the dropdown below.",
+            description="Select a position from the dropdown, then choose a player to fill it.",
             color=discord.Color.green()
         )
         
@@ -1854,34 +1875,63 @@ class LineupView(discord.ui.View):
         return embed
 
 
-class PositionButton(discord.ui.Button):
-    def __init__(self, position_name, parent_view):
-        # Show if position is filled and if it's selected
-        label = position_name
-        if position_name == parent_view.selected_position:
-            style = discord.ButtonStyle.primary
-        elif position_name in parent_view.lineup:
-            style = discord.ButtonStyle.success
-        else:
-            style = discord.ButtonStyle.secondary
-        
-        super().__init__(label=label, style=style, custom_id=f"pos_{position_name}")
-        self.position_name = position_name
+class PositionSelect(discord.ui.Select):
+    """Single dropdown listing all 23 lineup slots (fits Discord's 25-option
+    cap), replacing the old 4-page backs/mids/forwards/interchange button
+    groups. Each option shows the slot's current occupant (or "Empty") so
+    the whole lineup's fill state is visible without extra clicks."""
+    def __init__(self, parent_view):
         self.parent_view = parent_view
-    
+
+        # age isn't stored on parent_view.lineup entries - looked up from
+        # the roster tuples (player_id, name, pos, rating, age) by player_id
+        # instead, matching PlayerSelect's own "(pos, age, rating)" format.
+        age_by_player_id = {p[0]: p[4] for p in parent_view.roster}
+
+        options = []
+        for pos_name in AFL_POSITIONS:
+            if pos_name in parent_view.lineup:
+                p = parent_view.lineup[pos_name]
+                age = age_by_player_id.get(p.get('player_id'))
+                age_part = f", {age}" if age is not None else ""
+                description = f"{p['name']} ({p['pos']}{age_part}, {p['rating']})"
+                badge = ""
+                player_id = p.get('player_id')
+                if player_id in parent_view.injured_player_ids:
+                    badge = " 🚑"
+                elif player_id in parent_view.suspended_player_ids:
+                    badge = " 🚫"
+                description += badge
+            else:
+                description = "Empty"
+            options.append(
+                discord.SelectOption(
+                    label=pos_name,
+                    description=description,
+                    value=pos_name,
+                    default=(pos_name == parent_view.selected_position)
+                )
+            )
+
+        super().__init__(
+            placeholder="Select a position to edit...",
+            options=options,
+            custom_id="position_select"
+        )
+
     async def callback(self, interaction: discord.Interaction):
         # Select this position for editing and reset to first page
-        self.parent_view.selected_position = self.position_name
+        self.parent_view.selected_position = self.values[0]
         self.parent_view.player_page = 0
         self.parent_view.add_position_buttons()
-        
+
         embed = self.parent_view.create_embed()
         await interaction.response.edit_message(embed=embed, view=self.parent_view)
 
 
 class PrevPageButton(discord.ui.Button):
     def __init__(self, parent_view):
-        super().__init__(label="◀ Prev", style=discord.ButtonStyle.secondary, row=4)
+        super().__init__(label="◀ Prev", style=discord.ButtonStyle.secondary, row=2)
         self.parent_view = parent_view
     
     async def callback(self, interaction: discord.Interaction):
@@ -1892,8 +1942,9 @@ class PrevPageButton(discord.ui.Button):
 
 
 class NextPageButton(discord.ui.Button):
-    def __init__(self, parent_view):
-        super().__init__(label="Next ▶", style=discord.ButtonStyle.secondary, row=4)
+    def __init__(self, parent_view, total_pages):
+        next_page = parent_view.player_page + 2  # 1-indexed page being navigated to
+        super().__init__(label=f"Page {next_page}/{total_pages} ▶", style=discord.ButtonStyle.secondary, row=2)
         self.parent_view = parent_view
     
     async def callback(self, interaction: discord.Interaction):
@@ -1905,7 +1956,7 @@ class NextPageButton(discord.ui.Button):
 
 class ClearPositionButton(discord.ui.Button):
     def __init__(self, parent_view):
-        super().__init__(label="✗ Clear", style=discord.ButtonStyle.danger)
+        super().__init__(label="✗ Clear", style=discord.ButtonStyle.danger, row=3)
         self.parent_view = parent_view
     
     async def callback(self, interaction: discord.Interaction):
@@ -1939,38 +1990,6 @@ class ClearPositionButton(discord.ui.Button):
         await interaction.response.edit_message(embed=embed, view=self.parent_view)
 
 
-class NextGroupButton(discord.ui.Button):
-    def __init__(self, parent_view):
-        group_names = ["Backline", "Midfield", "Forwards", "Interchange"]
-        next_group = parent_view.current_group + 1
-        label = f"{group_names[next_group]} →"
-        super().__init__(label=label, style=discord.ButtonStyle.primary)
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction):
-        self.parent_view.current_group += 1
-        self.parent_view.add_position_buttons()
-
-        embed = self.parent_view.create_embed()
-        await interaction.response.edit_message(embed=embed, view=self.parent_view)
-
-
-class PrevGroupButton(discord.ui.Button):
-    def __init__(self, parent_view):
-        group_names = ["Backline", "Midfield", "Forwards", "Interchange"]
-        prev_group = parent_view.current_group - 1
-        label = f"← {group_names[prev_group]}"
-        super().__init__(label=label, style=discord.ButtonStyle.primary)
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction):
-        self.parent_view.current_group -= 1
-        self.parent_view.add_position_buttons()
-
-        embed = self.parent_view.create_embed()
-        await interaction.response.edit_message(embed=embed, view=self.parent_view)
-
-
 class PlayerSelect(discord.ui.Select):
     def __init__(self, position_name, parent_view):
         self.position_name = position_name
@@ -1993,10 +2012,12 @@ class PlayerSelect(discord.ui.Select):
             # Show all players - they can be moved between positions
             # Check if this player is in the current page
             if count >= start_idx and added < 25:
-                # Build label with age
-                label = f"{name} ({pos}, {age}, {rating})"
+                # Label (1st line) - name + "Currently in X" if applicable.
+                label = name
 
-                # Mark if player is currently in lineup
+                # Mark if player is currently in lineup - including the
+                # slot being edited itself, so it's clear who currently
+                # holds that position (not just where everyone else is).
                 if player_id in used_ids:
                     # Find which position they're in
                     current_pos = None
@@ -2004,12 +2025,21 @@ class PlayerSelect(discord.ui.Select):
                         if player_info.get('player_id') == player_id:
                             current_pos = pos_name
                             break
-                    if current_pos and current_pos != position_name:
-                        label += f" (Currently in {current_pos})"
+                    if current_pos:
+                        label += f" - Currently in {current_pos}"
+
+                # Description (2nd line) - stats, then an injury/suspension
+                # badge if applicable.
+                description = f"{pos}, {age}, {rating}"
+                if player_id in parent_view.injured_player_ids:
+                    description += " - 🚑 Injured"
+                elif player_id in parent_view.suspended_player_ids:
+                    description += " - 🚫 Suspended"
 
                 options.append(
                     discord.SelectOption(
                         label=label,
+                        description=description,
                         value=str(player_id)
                     )
                 )
@@ -2099,7 +2129,7 @@ class PlayerSelect(discord.ui.Select):
 
 class MainMenuButton(discord.ui.Button):
     def __init__(self, parent_view):
-        super().__init__(label="🏠 Main Menu", style=discord.ButtonStyle.primary)
+        super().__init__(label="🏠 Main Menu", style=discord.ButtonStyle.primary, row=3)
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction):

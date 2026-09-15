@@ -2335,10 +2335,17 @@ class DraftPointsCalculatorView(discord.ui.View):
                 )
             )
 
-        # Update the select menu
+        # Update the select menu - max_values must never exceed the number
+        # of options Discord actually has to offer (it defaults to a fixed
+        # 25, matching a full page, but the last page can hold fewer than
+        # that - e.g. 54 picks across pages of 25 leaves only 4 on page 3,
+        # and Discord rejects a Select whose max_values exceeds its option
+        # count with a "components.0.components.0.options: Must be 25 or
+        # more in length" error).
         for item in self.children:
             if isinstance(item, discord.ui.Select):
                 item.options = options
+                item.max_values = max(1, len(options))
                 break
 
         # Update button states

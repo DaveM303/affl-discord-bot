@@ -1,3 +1,4 @@
+import re
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -312,6 +313,202 @@ class PlayerCommands(commands.Cog):
                 embed.set_footer(text="0/44 players")
 
             await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="injurylist", description="View current injuries and suspensions")
+    @app_commands.describe(team_name="Name of the team (leave empty for all teams)")
+    @app_commands.autocomplete(team_name=team_name_autocomplete)
+    async def injurylist(self, interaction: discord.Interaction, team_name: str = None):
+        from commands.season_commands import get_round_name, get_eliminated_finals_team_ids
+
+        await interaction.response.defer(ephemeral=True)
+        async with aiosqlite.connect(DB_PATH) as db:
+            team_id = None
+            team_title = "All Teams"
+            if team_name:
+                cursor = await db.execute(
+                    "SELECT team_id, team_name, emoji_id FROM teams WHERE team_name = ?",
+                    (team_name,)
+                )
+                team = await cursor.fetchone()
+                if not team:
+                    await interaction.followup.send(
+                        f"❌ Team '{team_name}' not found. Please select from the autocomplete suggestions."
+                    )
+                    return
+                team_id, t_name, emoji_id = team
+                emoji = get_team_emoji_str(self.bot, emoji_id)
+                team_title = f"{emoji}{t_name}"
+
+            cursor = await db.execute(
+                """SELECT season_id, season_number, current_round, regular_rounds, total_rounds, status
+                   FROM seasons WHERE status IN ('active', 'offseason')
+                   ORDER BY CASE status WHEN 'active' THEN 1 ELSE 2 END LIMIT 1"""
+            )
+            season = await cursor.fetchone()
+
+            if not season:
+                await interaction.followup.send("❌ No active season!")
+                return
+
+            season_id, season_number, current_round, regular_rounds, total_rounds, status = season
+
+            if status == 'offseason':
+                # No live "current round" to compare against during the
+                # offseason - return_round is still expressed in the OLD
+                # season's round numbers (carryover into the new season's
+                # numbering only happens once /startseason actually runs,
+                # since it needs an admin-supplied offseason_weeks value -
+                # see season_commands.py's start_season). Estimate using
+                # that command's own default (23) so the round shown here
+                # lines up with what /startseason will produce if run with
+                # its default, but it's still just an estimate - offseason_weeks
+                # can be overridden at that point in time.
+                default_offseason_weeks = 23
+                if team_id:
+                    cursor = await db.execute(
+                        """SELECT p.name, p.overall_rating, i.injury_type, i.return_round, t.team_name, t.emoji_id
+                           FROM injuries i
+                           JOIN players p ON i.player_id = p.player_id
+                           LEFT JOIN teams t ON p.team_id = t.team_id
+                           WHERE i.status = 'injured' AND p.team_id = ?
+                           ORDER BY i.return_round ASC, p.name ASC""",
+                        (team_id,)
+                    )
+                else:
+                    cursor = await db.execute(
+                        """SELECT p.name, p.overall_rating, i.injury_type, i.return_round, t.team_name, t.emoji_id
+                           FROM injuries i
+                           JOIN players p ON i.player_id = p.player_id
+                           LEFT JOIN teams t ON p.team_id = t.team_id
+                           WHERE i.status = 'injured'
+                           ORDER BY t.team_name ASC, i.return_round ASC, p.name ASC"""
+                    )
+                injuries = await cursor.fetchall()
+
+                if team_id:
+                    cursor = await db.execute(
+                        """SELECT p.name, p.overall_rating, s.suspension_reason, s.games_remaining, t.team_name, t.emoji_id
+                           FROM suspensions s
+                           JOIN players p ON s.player_id = p.player_id
+                           LEFT JOIN teams t ON p.team_id = t.team_id
+                           WHERE s.status = 'suspended' AND p.team_id = ?
+                           ORDER BY s.games_remaining ASC, p.name ASC""",
+                        (team_id,)
+                    )
+                else:
+                    cursor = await db.execute(
+                        """SELECT p.name, p.overall_rating, s.suspension_reason, s.games_remaining, t.team_name, t.emoji_id
+                           FROM suspensions s
+                           JOIN players p ON s.player_id = p.player_id
+                           LEFT JOIN teams t ON p.team_id = t.team_id
+                           WHERE s.status = 'suspended'
+                           ORDER BY t.team_name ASC, s.games_remaining ASC, p.name ASC"""
+                    )
+                suspensions = await cursor.fetchall()
+
+                lines = []
+                if injuries:
+                    lines.append("**🚑 Injuries:**")
+                    for name, ovr, injury_type, return_round, t_name, emoji_id in injuries:
+                        team_display = get_team_emoji_str(self.bot, emoji_id) if t_name and not team_id else ""
+                        weeks_remaining = return_round - total_rounds
+                        new_season_round = max(weeks_remaining - default_offseason_weeks, 1)
+                        lines.append(f"{team_display}{name} ({ovr}) - {injury_type} - Round {new_season_round}")
+
+                if suspensions:
+                    if injuries:
+                        lines.append("")
+                    lines.append("**🚫 Suspensions:**")
+                    for name, ovr, suspension_reason, games_remaining, t_name, emoji_id in suspensions:
+                        team_display = get_team_emoji_str(self.bot, emoji_id) if t_name and not team_id else ""
+                        display_reason = re.sub(r' - (low|medium|high) impact$', '', suspension_reason)
+                        game_text = "match" if games_remaining == 1 else "matches"
+                        lines.append(f"{team_display}{name} ({ovr}) - {display_reason} - {games_remaining} {game_text}")
+
+                embed = discord.Embed(
+                    title=f"{team_title} - Injuries & Suspensions",
+                    description="\n".join(lines) if lines else "No current injuries or suspensions.",
+                    color=discord.Color.blue()
+                )
+                await interaction.followup.send(embed=embed)
+                return
+
+            eliminated_team_ids = set()
+            if current_round > regular_rounds:
+                eliminated_team_ids = await get_eliminated_finals_team_ids(db, season_id)
+
+            if team_id:
+                cursor = await db.execute(
+                    """SELECT p.name, p.overall_rating, i.injury_type, i.return_round, t.team_name, t.emoji_id, p.team_id
+                       FROM injuries i
+                       JOIN players p ON i.player_id = p.player_id
+                       LEFT JOIN teams t ON p.team_id = t.team_id
+                       WHERE i.status = 'injured' AND p.team_id = ?
+                       ORDER BY i.return_round ASC, p.name ASC""",
+                    (team_id,)
+                )
+            else:
+                cursor = await db.execute(
+                    """SELECT p.name, p.overall_rating, i.injury_type, i.return_round, t.team_name, t.emoji_id, p.team_id
+                       FROM injuries i
+                       JOIN players p ON i.player_id = p.player_id
+                       LEFT JOIN teams t ON p.team_id = t.team_id
+                       WHERE i.status = 'injured'
+                       ORDER BY t.team_name ASC, i.return_round ASC, p.name ASC"""
+                )
+            injuries = [row for row in await cursor.fetchall() if row[6] not in eliminated_team_ids]
+
+            if team_id:
+                cursor = await db.execute(
+                    """SELECT p.name, p.overall_rating, s.suspension_reason, s.games_remaining, t.team_name, t.emoji_id, p.team_id
+                       FROM suspensions s
+                       JOIN players p ON s.player_id = p.player_id
+                       LEFT JOIN teams t ON p.team_id = t.team_id
+                       WHERE s.status = 'suspended' AND p.team_id = ?
+                       ORDER BY s.games_remaining ASC, p.name ASC""",
+                    (team_id,)
+                )
+            else:
+                cursor = await db.execute(
+                    """SELECT p.name, p.overall_rating, s.suspension_reason, s.games_remaining, t.team_name, t.emoji_id, p.team_id
+                       FROM suspensions s
+                       JOIN players p ON s.player_id = p.player_id
+                       LEFT JOIN teams t ON p.team_id = t.team_id
+                       WHERE s.status = 'suspended'
+                       ORDER BY t.team_name ASC, s.games_remaining ASC, p.name ASC"""
+                )
+            suspensions = [row for row in await cursor.fetchall() if row[6] not in eliminated_team_ids]
+
+            lines = []
+            if injuries:
+                lines.append("**🚑 Injuries:**")
+                for name, ovr, injury_type, return_round, t_name, emoji_id, _ in injuries:
+                    team_display = get_team_emoji_str(self.bot, emoji_id) if t_name and not team_id else ""
+                    weeks_left = return_round - current_round
+                    if weeks_left <= 0:
+                        status_text = "✅ Recovered"
+                    else:
+                        week_text = "week" if weeks_left == 1 else "weeks"
+                        season_indicator = " (SEASON)" if return_round > total_rounds else ""
+                        status_text = f"{weeks_left} {week_text}{season_indicator}"
+                    lines.append(f"{team_display}{name} ({ovr}) - {injury_type} - {status_text}")
+
+            if suspensions:
+                if injuries:
+                    lines.append("")
+                lines.append("**🚫 Suspensions:**")
+                for name, ovr, suspension_reason, games_remaining, t_name, emoji_id, _ in suspensions:
+                    team_display = get_team_emoji_str(self.bot, emoji_id) if t_name and not team_id else ""
+                    display_reason = re.sub(r' - (low|medium|high) impact$', '', suspension_reason)
+                    game_text = "match" if games_remaining == 1 else "matches"
+                    lines.append(f"{team_display}{name} ({ovr}) - {display_reason} - {games_remaining} {game_text}")
+
+            embed = discord.Embed(
+                title=f"{team_title} - Injuries & Suspensions",
+                description="\n".join(lines) if lines else "No current injuries or suspensions.",
+                color=discord.Color.blue()
+            )
+            await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="filterplayers", description="Search for players with filters")
     @app_commands.describe(

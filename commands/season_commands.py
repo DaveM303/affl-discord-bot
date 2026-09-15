@@ -2804,7 +2804,7 @@ class SeasonCommands(commands.Cog):
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get active season
                 cursor = await db.execute(
-                    """SELECT season_id, season_number, regular_rounds FROM seasons
+                    """SELECT season_id, season_number, regular_rounds, current_round, total_rounds FROM seasons
                        WHERE status = 'active' LIMIT 1"""
                 )
                 season = await cursor.fetchone()
@@ -2816,7 +2816,7 @@ class SeasonCommands(commands.Cog):
                     )
                     return
 
-                season_id, season_number, current_regular_rounds = season
+                season_id, season_number, current_regular_rounds, ending_current_round, ending_total_rounds = season
 
                 # Placeholder only - the actual round count for the next
                 # season is chosen at /startseason time (that's the ONE
@@ -2860,6 +2860,38 @@ class SeasonCommands(commands.Cog):
                 # Committed just above first so this read-only pass sees
                 # the final, already-resolved injury/report data.
                 await post_season_summaries(self.bot, db, season_id, season_number)
+
+                # Post the league-wide injury/suspension list to the
+                # configured channel, same as every advance_to_next_round
+                # does - /endseason doesn't go through that function, so
+                # without this the list would just go silent for the whole
+                # offseason. current_round is left at its final in-season
+                # value by the UPDATE above (not reset to 0), so the same
+                # weeks/games-remaining math the last round summary already
+                # showed still applies here unchanged.
+                cursor = await db.execute(
+                    "SELECT setting_value FROM settings WHERE setting_key = 'injury_list_channel_id'"
+                )
+                result = await cursor.fetchone()
+                if result and result[0]:
+                    from commands.injury_commands import build_injury_suspension_list, _chunk_lines_into_descriptions
+                    combined_list = await build_injury_suspension_list(
+                        self.bot, db, ending_current_round, ending_total_rounds,
+                        season_id=season_id, regular_rounds=current_regular_rounds,
+                    )
+                    if combined_list:
+                        descriptions = _chunk_lines_into_descriptions(combined_list, max_length=4000)
+                        embeds = [
+                            discord.Embed(
+                                title=f"Injury & Suspension List - Off-season" if i == 0 else None,
+                                description=description,
+                                color=discord.Color.red(),
+                            )
+                            for i, description in enumerate(descriptions)
+                        ]
+                        channel = self.bot.get_channel(int(result[0]))
+                        if channel:
+                            await channel.send(embeds=embeds)
 
                 # Check if next season already exists
                 next_season_num = season_number + 1

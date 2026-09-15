@@ -132,7 +132,7 @@ async def build_injury_suspension_list(bot, db, current_round, total_rounds, fil
                 # only ticks down on rounds the team actually plays, so whether
                 # it spills into next season depends on how many fixtures are
                 # left, not a round-number comparison against total_rounds.
-                game_text = "game" if games_remaining == 1 else "games"
+                game_text = "match" if games_remaining == 1 else "matches"
                 status = f"- {games_remaining} {game_text}"
             # Impact grading (" - low/medium/high impact") drives the
             # games-range roll (see match_sim.py's REPORT_REASONS /
@@ -336,16 +336,16 @@ class InjuryCommands(commands.Cog):
                 )
                 return
 
-            # Calculate return round - +1 beyond the round the injury happened
-            # in plus the recovery weeks, since the injury round itself is
-            # already missed (the player got hurt mid-match) on top of the
-            # stated recovery time, not counted as part of it. E.g. a 2-week
-            # injury in Round 6 should miss Rounds 7 and 8 (Round 6 itself
-            # already happened - the player was hurt DURING it, so it isn't
-            # something they can additionally "miss") and return in Round 9 -
-            # not return_round = 6 + 2 = 8 (which would only give 1 full
-            # round of actual recovery, 7, since Round 6 is already over).
-            return_round = current_round + recovery_rounds + 1
+            # Calculate return round from the current round, not +1 - unlike
+            # a NATURAL in-match injury (whose injury_round has already been
+            # played through by the time it's revealed, so that round can't
+            # also count as missed - see MatchCommands._persist_match_result),
+            # an admin using /addinjury is applying the injury starting now,
+            # inclusive of the current round. E.g. a 2-week injury applied in
+            # Round 1 should miss Rounds 1 and 2 and return in Round 3, same
+            # as /editinjury's and /addsuspension's own "current round counts"
+            # behavior (see edit_injury's matching comment below).
+            return_round = current_round + recovery_rounds
 
             # Add injury
             await db.execute(
@@ -513,13 +513,14 @@ class InjuryCommands(commands.Cog):
                 changes.append(f"Injury: {old_injury_type} → {new_injury_type}")
 
             if new_recovery_rounds:
-                # Calculate return round from current round, not injury round.
-                # Deliberately NO +1 here unlike a fresh injury's return_round
-                # calc (see add_injury) - editing "to 2 weeks" during the
-                # CURRENT round means miss this round plus 1 more, back the
-                # round after (current_round + 2), since the admin is
-                # resetting the clock starting now, not simulating a fresh
-                # injury that also separately eats its own occurrence round.
+                # Calculate return round from current round, not injury round -
+                # same "current round counts" formula as add_injury (no +1;
+                # that only applies to a NATURAL in-match injury, whose
+                # injury_round has already been played through by the time
+                # it's revealed). Editing "to 2 weeks" during the CURRENT
+                # round means miss this round plus 1 more, back the round
+                # after (current_round + 2), since the admin is resetting
+                # the clock starting now.
                 new_return_round = current_round + new_recovery_rounds
                 updates.append("recovery_rounds = ?, return_round = ?")
                 values.extend([new_recovery_rounds, new_return_round])
