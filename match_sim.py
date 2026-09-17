@@ -17,42 +17,73 @@ DEFENSE_SLOTS = {"LBP", "FB", "RBP", "LHB", "CHB", "RHB"}
 MIDFIELD_SLOTS = {"LW", "C", "RW", "R", "RR", "RO"}
 FORWARD_SLOTS = {"LHF", "CHF", "RHF", "LFP", "FF", "RFP"}
 
-# Key position players (KEY DEF/KEY FWD) belong in the "spine" (full-back/
-# full-forward, centre half-back/forward) or the pockets - the flanks are a
-# general/mid-leaning role in real AFL, not a key position player's normal
-# home. Used for KEY_POSITION_SLOT_PENALTY (see effective_ovr).
-KEY_DEF_HOME_SLOTS = {"FB", "CHB", "LBP", "RBP"}   # spine + pockets, not LHB/RHB
-KEY_FWD_HOME_SLOTS = {"FF", "CHF", "LFP", "RFP"}   # spine + pockets, not LHF/RHF
-
-# The 4 TRUE spine slots - full-back/centre half-back, full-forward/centre
-# half-forward - a stricter subset of KEY_DEF/FWD_HOME_SLOTS above (which
-# also includes the pockets). Pockets are genuinely shared ground in real
-# AFL - both key and general players occupy them regularly - but the spine
-# is a real key-position specialist's post; a generalist parked there is a
-# mismatch the same way a key player is on a flank. Used for
-# GENERALIST_SPINE_PENALTY below (a new, separate penalty from
-# KEY_POSITION_SLOT_PENALTY, which only ever fires the other direction).
-TRUE_DEF_SPINE_SLOTS = {"FB", "CHB"}
-TRUE_FWD_SPINE_SLOTS = {"FF", "CHF"}
-
-# Which positions count as a KEY DEF/KEY FWD-equivalent while playing a given
-# group - drives both the tall-overload count (_group_strength) and the
-# spine/pocket slot penalty (effective_ovr). SWINGMAN is a key position
-# player in both of its groups (forward AND defense). RUCK-FWD/RUCK-DEF are
-# key-position-equivalent only in their non-midfield group - while genuinely
-# rucking (in midfield) they're judged as a ruck instead, not a tall. UTILITY
-# is never key-position-like - always a generalist matching whichever group
-# it's currently in (GEN DEF/MID/GEN FWD-equivalent), regardless of group.
-KEY_DEF_EQUIVALENT_POSITIONS = {"KEY DEF", "SWINGMAN", "RUCK-DEF"}
-KEY_FWD_EQUIVALENT_POSITIONS = {"KEY FWD", "SWINGMAN", "RUCK-FWD"}
-
-# Ruck is a genuine specialist role, not just "one of six interchangeable
-# midfield slots" - a ruckman parked on the wing isn't contesting ruck taps,
-# and a rover/wingman thrown into the ruck isn't built for hitouts. Unlike
-# the key-position spine/pocket mismatch (a smaller penalty), this is treated
-# as a full out-of-position mismatch - see effective_ovr.
 RUCK_SLOT = "R"
 RUCK_ELIGIBLE_POSITIONS = {"RUCK", "RUCK-FWD", "RUCK-DEF"}
+
+# Which of the 4 real LINES (defense/midfield/forward/ruck) each on-field
+# slot belongs to, for effective_ovr's flat line-fit penalty (see below).
+# Ruck is its OWN line here, distinct from midfield - a midfielder in the
+# ruck and a ruckman on the wing are both full line mismatches, not a
+# same-line reshuffle. (slot_group()/MIDFIELD_SLOTS above still treat R as
+# midfield for everything else in this file - team strength, disposals,
+# voting - since ruck contests are genuinely won at centre bounces and
+# contribute to that line's output; only the POSITIONING penalty below
+# treats ruck as its own line.)
+SLOT_LINE = {}
+for _s in DEFENSE_SLOTS:
+    SLOT_LINE[_s] = "defense"
+for _s in MIDFIELD_SLOTS:
+    SLOT_LINE[_s] = "midfield"
+for _s in FORWARD_SLOTS:
+    SLOT_LINE[_s] = "forward"
+SLOT_LINE[RUCK_SLOT] = "ruck"
+del _s
+
+# Which LINE(S) each natural position is genuinely at home in - a pure
+# position has exactly one, a hybrid has two. RUCK's only home is the ruck
+# line itself (not midfield generally). RUCK-DEF/RUCK-FWD are only ever at
+# home in the ruck line or their own non-midfield line - never plain
+# midfield - matching how a ruck-eligible hybrid not genuinely rucking was
+# already a mismatch anywhere in midfield under the old model.
+POSITION_ALLOWED_LINES = {
+    "KEY DEF": {"defense"}, "GEN DEF": {"defense"},
+    "MID": {"midfield"},
+    "KEY FWD": {"forward"}, "GEN FWD": {"forward"},
+    "RUCK": {"ruck"},
+    "DEF-MID": {"defense", "midfield"},
+    "MID-FWD": {"midfield", "forward"},
+    "SWINGMAN": {"defense", "forward"},
+    "UTILITY": {"defense", "midfield", "forward"},
+    "RUCK-DEF": {"ruck", "defense"},
+    "RUCK-FWD": {"ruck", "forward"},
+}
+
+# Slot typing for effective_ovr's flat key/general-fit penalty: the true
+# spine (FB/CHB/FF/CHF) plus the ruck contest are KEY slots; the flanks and
+# pure midfield slots are GENERAL slots; the 4 pockets are neutral ground -
+# a key-position player and a generalist are equally at home there, so
+# pockets never trigger this penalty either way.
+KEY_SLOTS = {"FB", "CHB", "FF", "CHF", RUCK_SLOT}
+GENERAL_SLOTS = {"LHB", "RHB", "LW", "C", "RW", "RR", "RO", "LHF", "RHF"}
+
+# Which natural positions are KEY-position-type vs GENERAL-position-type,
+# for that same penalty. A ruckman is explicitly key-position-type (real
+# AFL rucks are genuine specialists, not generalists); MID is explicitly
+# general-position-type. SWINGMAN/RUCK-DEF/RUCK-FWD stay key-position-type
+# (a swingman or a rucking hybrid parked forward/back is still a tall, not
+# a generalist); DEF-MID/MID-FWD/UTILITY stay general-position-type.
+KEY_POSITION_TYPES = {"KEY DEF", "KEY FWD", "RUCK", "SWINGMAN", "RUCK-DEF", "RUCK-FWD"}
+GENERAL_POSITION_TYPES = {"GEN DEF", "GEN FWD", "MID", "DEF-MID", "MID-FWD", "UTILITY"}
+
+# Kept for backward compatibility with callers still keying off "which
+# positions count as a tall in THIS group" (currently only the key-position
+# line-overload count in _group_strength, a separate mechanic from the flat
+# positioning penalties above - unaffected by this model). Derived from
+# KEY_POSITION_TYPES filtered to positions actually eligible for that line;
+# RUCK is deliberately excluded from both (the overload count is specific
+# to defense/forward tall-stacking, not the ruck line).
+KEY_DEF_EQUIVALENT_POSITIONS = {p for p in KEY_POSITION_TYPES if "defense" in POSITION_ALLOWED_LINES[p]}
+KEY_FWD_EQUIVALENT_POSITIONS = {p for p in KEY_POSITION_TYPES if "forward" in POSITION_ALLOWED_LINES[p]}
 
 # Slots that count as midfield for disposal purposes regardless of the
 # player's natural position - the half-back flank functions as an auxiliary
@@ -238,27 +269,21 @@ def player_group(p):
         return best_fairest_group(p.slot)
     return p.resolved_group
 
-OUT_OF_POSITION_PENALTY = 0.80  # effective_OVR multiplier when slot group isn't one of the player's allowed groups
-
-# Smaller, separate penalty for a KEY DEF/KEY FWD playing the right GROUP but
-# the wrong SLOT within it - stuck on a flank instead of the spine (FB/CHB,
-# FF/CHF) or a pocket. Real key position players live in the spine/pockets;
-# flanks are a general/mid-leaning role. This stacks on top of (not instead
-# of) OUT_OF_POSITION_PENALTY, which only fires when they leave the group
-# entirely - a key forward on a half-forward flank is a smaller mismatch
-# than a key forward playing defense.
-KEY_POSITION_SLOT_PENALTY = 0.92
-
-# Mirror-image penalty: a GENERALIST (any position eligible for this group
-# that ISN'T key-position-equivalent - see KEY_DEF/FWD_EQUIVALENT_POSITIONS)
-# playing one of the 4 TRUE spine slots (FB/CHB/FF/CHF, not the pockets -
-# see TRUE_DEF/FWD_SPINE_SLOTS). A key position player gets no bonus for
-# being in their home slot (their effective_OVR there is just their raw
-# OVR), so this is the only place spine-slot preference actually shows up:
-# a generalist is worth strictly less there than an equally-rated key
-# player would be. Same magnitude as KEY_POSITION_SLOT_PENALTY by design -
-# both represent "a player one tier away from their ideal role."
-GENERALIST_SPINE_PENALTY = 0.92
+# Two independent flat OVR penalties (not multipliers) that can stack -
+# see Player._compute_effective_ovr. Replaced the old 3-multiplier system
+# (OUT_OF_POSITION_PENALTY/KEY_POSITION_SLOT_PENALTY/GENERALIST_SPINE_PENALTY)
+# with a simpler, additive model:
+#   - LINE_MISMATCH_PENALTY fires when the slot's LINE (defense/midfield/
+#     forward/ruck - see SLOT_LINE) isn't one of the player's
+#     POSITION_ALLOWED_LINES.
+#   - KEY_GENERAL_MISMATCH_PENALTY fires when the slot is typed KEY_SLOTS
+#     or GENERAL_SLOTS and that doesn't match the player's own
+#     KEY_POSITION_TYPES/GENERAL_POSITION_TYPES (pockets are neutral -
+#     neither typed, so never trigger this one).
+# A player can take neither, either, or both at once (e.g. a GEN FWD at
+# CHB: wrong line AND a generalist in a key slot = both penalties).
+LINE_MISMATCH_PENALTY = 8
+KEY_GENERAL_MISMATCH_PENALTY = 8
 
 # Shot ownership weighting within the forward group - key forwards generate
 # far more looks than general forwards at the same OVR (per real Coleman
@@ -870,54 +895,35 @@ class Player:
             # (that needs every one of a team's 5 interchange Players
             # already constructed, to compare bench composition) - so
             # .resolved_group isn't set yet at this point, and never can
-            # be for this calculation. Not a real gap though: every group
-            # _resolve_bench_groups can possibly assign a hybrid to is
-            # already one of their genuinely allowed groups (see
-            # HYBRID_BENCH_GROUPS/PURE_POSITION_GROUP) - a bench player is
-            # never actually out of position under the new system, so no
-            # penalty is ever the correct answer here regardless.
+            # be for this calculation. Not a real gap though: a bench
+            # player is never actually out of position under this system
+            # (see POSITION_ALLOWED_LINES/HYBRID_BENCH_GROUPS - every group
+            # _resolve_bench_groups can assign a hybrid to is already one
+            # of their genuinely allowed lines), so no penalty is ever the
+            # correct answer here regardless.
             return self.overall_rating
 
-        allowed_groups = POSITION_ALLOWED_GROUPS.get(self.position)
-        if allowed_groups is None:
+        allowed_lines = POSITION_ALLOWED_LINES.get(self.position)
+        if allowed_lines is None:
             # unrecognized position - never penalized
             return self.overall_rating
-        if slot_group(self.slot) not in allowed_groups:
-            return self.overall_rating * OUT_OF_POSITION_PENALTY
 
-        # Ruck is a specialist role within midfield, not an interchangeable
-        # sixth slot - a ruck-eligible player NOT at R, or a non-ruck player
-        # AT R, is a full mismatch (not the smaller key-position one below)
-        is_ruck_eligible = self.position in RUCK_ELIGIBLE_POSITIONS
-        if is_ruck_eligible and self.slot in MIDFIELD_SLOTS and self.slot != RUCK_SLOT:
-            return self.overall_rating * OUT_OF_POSITION_PENALTY
-        if not is_ruck_eligible and self.slot == RUCK_SLOT:
-            return self.overall_rating * OUT_OF_POSITION_PENALTY
+        penalty = 0
+        # Flat penalty #1: the slot's LINE isn't one of the player's
+        # allowed lines (ruck is its own line here - see SLOT_LINE).
+        if SLOT_LINE[self.slot] not in allowed_lines:
+            penalty += LINE_MISMATCH_PENALTY
+        # Flat penalty #2: the slot is KEY- or GENERAL-typed and that
+        # doesn't match the player's own type (pockets are neutral -
+        # in neither KEY_SLOTS nor GENERAL_SLOTS, so never trigger this).
+        # Independent of the line check above - both can fire together
+        # (e.g. a GEN FWD at CHB: wrong line AND a generalist in a key slot).
+        if self.slot in KEY_SLOTS and self.position in GENERAL_POSITION_TYPES:
+            penalty += KEY_GENERAL_MISMATCH_PENALTY
+        elif self.slot in GENERAL_SLOTS and self.position in KEY_POSITION_TYPES:
+            penalty += KEY_GENERAL_MISMATCH_PENALTY
 
-        # In the right GROUP - key position players (and hybrids acting as
-        # one in this group - see KEY_DEF/FWD_EQUIVALENT_POSITIONS) need to
-        # be in their specific spine/pocket slot, not a flank, to be at full
-        # value (see KEY_POSITION_SLOT_PENALTY)
-        current_group = slot_group(self.slot)
-        is_key_here = (
-            (current_group == "defense" and self.position in KEY_DEF_EQUIVALENT_POSITIONS)
-            or (current_group == "forward" and self.position in KEY_FWD_EQUIVALENT_POSITIONS)
-        )
-        if current_group == "defense" and is_key_here and self.slot not in KEY_DEF_HOME_SLOTS:
-            return self.overall_rating * KEY_POSITION_SLOT_PENALTY
-        if current_group == "forward" and is_key_here and self.slot not in KEY_FWD_HOME_SLOTS:
-            return self.overall_rating * KEY_POSITION_SLOT_PENALTY
-
-        # Mirror image: a GENERALIST (eligible for this group but not
-        # key-position-equivalent in it) parked at one of the 4 TRUE spine
-        # slots (FB/CHB/FF/CHF - not the pockets, which are genuinely shared
-        # ground) is worth strictly less than an equally-rated key position
-        # player would be there (see GENERALIST_SPINE_PENALTY).
-        if current_group == "defense" and not is_key_here and self.slot in TRUE_DEF_SPINE_SLOTS:
-            return self.overall_rating * GENERALIST_SPINE_PENALTY
-        if current_group == "forward" and not is_key_here and self.slot in TRUE_FWD_SPINE_SLOTS:
-            return self.overall_rating * GENERALIST_SPINE_PENALTY
-        return self.overall_rating
+        return self.overall_rating - penalty
 
 
 # How much random noise MatchResult.brownlow_votes() applies to each
@@ -1238,10 +1244,10 @@ KEY_POSITION_COUNT_THRESHOLD = 3
 # a ~7-8 point swing.
 KEY_POSITION_OVERLOAD_PENALTY_PER_EXCESS = 0.02  # ~2% line strength per player past the threshold
 
-KEY_POSITION_EQUIVALENTS_BY_GROUP = {
-    "defense": KEY_DEF_EQUIVALENT_POSITIONS,
-    "forward": KEY_FWD_EQUIVALENT_POSITIONS,
-}
+# Lines this overload rule applies to - defense and forward only, never
+# midfield (a stack of midfielders isn't a "tall-heavy" problem the way a
+# stack of key position players is).
+KEY_POSITION_OVERLOAD_GROUPS = {"defense", "forward"}
 
 
 def _group_strength(players, group):
@@ -1253,16 +1259,19 @@ def _group_strength(players, group):
     voting, and this function all now share, rather than each guessing
     independently. "ruck" collapses to "midfield" here since that's a
     ruck's genuine strength-contribution group - ruck contests are won at
-    centre bounces, same reasoning as POSITION_ALLOWED_GROUPS["RUCK"]. An
+    centre bounces, same reasoning as POSITION_ALLOWED_LINES["RUCK"]. An
     on-field player's group is still exactly their own slot.
 
-    Also applies a small penalty when the line is overloaded with key
-    position players (more than KEY_POSITION_COUNT_THRESHOLD genuinely
-    on-field in this group) - see KEY_POSITION_OVERLOAD_PENALTY_PER_EXCESS.
-    Counts SWINGMAN/RUCK-FWD/RUCK-DEF as key-position-equivalent while
-    playing this group (KEY_DEF/FWD_EQUIVALENT_POSITIONS), not just literal
-    KEY DEF/KEY FWD - a swingman parked forward is a tall, same as a real
-    key forward. UTILITY never counts, regardless of group."""
+    Also applies a small penalty when the line (defense or forward - see
+    KEY_POSITION_OVERLOAD_GROUPS) is overloaded with key position players
+    (more than KEY_POSITION_COUNT_THRESHOLD genuinely on-field in this
+    group) - see KEY_POSITION_OVERLOAD_PENALTY_PER_EXCESS. Counts ANY
+    KEY_POSITION_TYPES player currently contributing to this line - not
+    just that line's own "natural" key-equivalent positions - since RUCK is
+    now a key-position type in its own right (see match_sim.py's
+    positioning-penalty model) and a mismatched KEY FWD/KEY DEF stuck in
+    the wrong line is still a tall crowding that line, not a non-event.
+    UTILITY never counts (it's a GENERAL_POSITION_TYPES member)."""
     def member_group(p):
         g = player_group(p)
         return "midfield" if g == "ruck" else g
@@ -1275,14 +1284,13 @@ def _group_strength(players, group):
         return 0.0
     strength = sum(p.effective_ovr * p.strength_weight for p in members) / total_weight
 
-    key_equivalents = KEY_POSITION_EQUIVALENTS_BY_GROUP.get(group)
-    if key_equivalents is not None:
+    if group in KEY_POSITION_OVERLOAD_GROUPS:
         # On-field only, per the "genuinely on-field" rule above - a bench
         # key-position player in this group doesn't crowd the line the way
         # an extra starter would, so they're excluded from the count here
         # even though they still count as members[] for the strength mean
         # itself just above.
-        key_count = sum(1 for p in members if p.position in key_equivalents and p.slot not in INTERCHANGE_SLOTS)
+        key_count = sum(1 for p in members if p.position in KEY_POSITION_TYPES and p.slot not in INTERCHANGE_SLOTS)
         excess = max(0, key_count - KEY_POSITION_COUNT_THRESHOLD)
         if excess:
             strength *= max(0.0, 1 - excess * KEY_POSITION_OVERLOAD_PENALTY_PER_EXCESS)

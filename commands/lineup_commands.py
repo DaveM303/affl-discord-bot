@@ -10,6 +10,7 @@ from utils import is_admin_user, get_team_emoji, get_team_emoji_str
 from match_sim import (
     slot_group, POSITION_ALLOWED_GROUPS, RUCK_SLOT, RUCK_ELIGIBLE_POSITIONS, Player,
     _team_strengths, _resolve_bench_groups, INTERCHANGE_SLOTS,
+    KEY_POSITION_TYPES, KEY_POSITION_COUNT_THRESHOLD,
 )
 
 # AFL lineup structure with 18 positions + 5 interchange
@@ -73,6 +74,40 @@ def format_lineup_description(lineup):
     field_text += f"**Int:**  {', '.join(int_players)}"
 
     return field_text
+
+
+def _display_ovr(pos_name, player_info):
+    """OVR to show for a player sitting in an on-field lineup slot - their
+    match_sim.py effective_ovr (rounded), which is lower than their base
+    overall_rating whenever they're out of position for that slot (wrong
+    group entirely, wrong ruck/non-ruck role, or a key position player
+    parked off their spine/pocket home slot - see Player._compute_effective_ovr).
+    Interchange slots are never adjusted (a bench player is never actually
+    "out of position" under the current position-group system - see
+    Player._compute_effective_ovr's own note), so this returns the base
+    rating unchanged for INT1-5."""
+    if pos_name in INTERCHANGE_SLOTS or not player_info.get('player_id'):
+        return player_info['rating']
+    player = Player(player_info['player_id'], player_info['name'], player_info['pos'], player_info['rating'], pos_name)
+    return round(player.effective_ovr)
+
+
+def fits_without_penalty(position, slot):
+    """True if a player of this natural position suffers zero
+    Player.effective_ovr penalty in this slot (fully in-group, correct
+    ruck/non-ruck role, and - for a key-position-equivalent player in a
+    key-position line - the right spine/pocket home slot; a generalist in a
+    pocket also qualifies, since GENERALIST_SPINE_PENALTY only applies at
+    the 4 true spine slots FB/CHB/FF/CHF). Shared by auto_fill_lineup
+    (prioritizing a slot's "ideal" position type before falling back to
+    whoever improves team strength the most regardless of fit) and
+    LineupView.get_sorted_roster (sorting the player-picker dropdown the
+    same way, instead of the old flat "any defender for any defensive
+    slot" bucket that didn't distinguish spine from pocket/flank).
+    Interchange slots never have a penalty concept (see
+    Player._compute_effective_ovr), so every position trivially qualifies
+    there."""
+    return Player(0, "", position, 100, slot).effective_ovr == 100
 
 
 async def team_playing_this_round(db, team_id, round_number):
@@ -195,13 +230,17 @@ async def auto_fill_lineup(db, team_id, current_round):
         the same way (from reserves only - interchange slots never borrow
         from each other, which would just chase the same vacancy in
         circles).
-    Whichever candidate yields the highest score is picked. There is no
-    positional-fit gate anywhere (not even the R/ruck slot) - a large
-    enough OVR gap can win a slot even fully out of position, since
-    match_sim.py's out-of-position penalty is a multiplier, not a hard
-    block, and this is deliberately just "whichever candidate improves team
-    strength the most," not a fit-first heuristic with strength as a
-    tiebreak.
+    Candidates are searched in two tiers (see fits_without_penalty):
+    first, only candidates whose natural position suffers zero
+    Player.effective_ovr penalty in this slot; if that tier is empty, every
+    candidate regardless of fit. Whichever candidate yields the highest
+    score WITHIN that tier is picked - still "whichever candidate improves
+    team strength the most," just searched fit-first rather than across
+    the whole roster every time. A large enough OVR gap can still win a
+    slot fully out of position, but only once nobody who actually fits is
+    left available - this is a search-order preference, not a hard
+    positional-fit gate (not even the R/ruck slot is a hard block, since
+    match_sim.py's out-of-position penalty is always just a multiplier).
 
     Duplicate detection runs across the WHOLE 23-slot lineup in
     AFL_POSITIONS order - a player_id appearing more than once (in any
@@ -383,7 +422,16 @@ async def auto_fill_lineup(db, team_id, current_round):
             unfilled.append(slot)
             continue
 
-        best_id, best_info, source_int_slot, _ = max(candidates, key=lambda item: item[3])
+        # Prioritize candidates whose natural position suffers no
+        # out-of-position penalty in this slot (see fits_without_penalty) -
+        # only fall back to the full candidate pool if none fit. Within
+        # whichever tier is used, still pick by best resulting team
+        # strength - this only changes WHICH pool is searched, not the
+        # underlying "biggest improvement wins" logic.
+        fitting_candidates = [c for c in candidates if fits_without_penalty(c[1]["position"], slot)]
+        pool = fitting_candidates if fitting_candidates else candidates
+
+        best_id, best_info, source_int_slot, _ = max(pool, key=lambda item: item[3])
 
         slot_to_player[slot] = best_id
         claimed_player_ids.add(best_id)
@@ -926,6 +974,8 @@ class TeamLineupMenu(discord.ui.View):
         self.lineups_locked = lineups_locked
         self.not_playing_this_round = not_playing_this_round
         self.warnings = []
+        self.injured_slots = set()  # Populated by update_warnings() - which
+        self.suspended_slots = set()  # slots to badge in create_menu_embed's field UI
 
         # Add buttons
         self.add_buttons()
@@ -1008,6 +1058,33 @@ class TeamLineupMenu(discord.ui.View):
                 seen.add(player_id)
         return duplicates
 
+    def get_key_position_overload(self):
+        """Check for too many key-position-TYPE players genuinely on-field
+        (never interchange) in the backline or forward line - mirrors
+        match_sim.py's own in-sim penalty (see
+        KEY_POSITION_COUNT_THRESHOLD/KEY_POSITION_OVERLOAD_PENALTY_PER_EXCESS/
+        KEY_POSITION_OVERLOAD_GROUPS and _group_strength) so what the
+        lineup screen warns about matches what actually costs the team
+        strength when simulated. Counts ANY KEY_POSITION_TYPES player
+        currently in that line, not just that line's own "natural" key
+        positions - a KEY FWD misplaced in defense (or any other
+        key-position player in the wrong line) still counts as a tall
+        crowding that line, same as match_sim.py's own rule. Returns a
+        list of (group_label, count, names) tuples for any line over the
+        threshold - empty if neither line is overloaded."""
+        line_labels = {"defense": "Backline", "forward": "Forward line"}
+        overloads = []
+        for group, group_label in line_labels.items():
+            names = [
+                p['name'] for pos_name, p in self.lineup.items()
+                if pos_name not in INTERCHANGE_SLOTS
+                and slot_group(pos_name) == group
+                and p['pos'] in KEY_POSITION_TYPES
+            ]
+            if len(names) > KEY_POSITION_COUNT_THRESHOLD:
+                overloads.append((group_label, len(names), names))
+        return overloads
+
     async def update_warnings(self):
         """Update the warnings list based on current lineup"""
         self.warnings = []
@@ -1017,17 +1094,25 @@ class TeamLineupMenu(discord.ui.View):
         if duplicates:
             self.warnings.append(f"⚠️ **Duplicate players:** {', '.join(duplicates)}")
 
-        # Check for injured players
+        # Check for injured players - also cached as a slot set (not just
+        # the warnings text) so create_menu_embed can badge the field UI
+        # itself, not just list names in the warnings block below it.
         injured = await self.get_injured_players()
+        self.injured_slots = {slot for _, slot in injured}
         if injured:
             injured_str = ', '.join([f"{name} ({slot})" for name, slot in injured])
             self.warnings.append(f"🚑 **Injured players:** {injured_str}")
 
-        # Check for suspended players
+        # Check for suspended players - same slot-set caching as injured above.
         suspended = await self.get_suspended_players()
+        self.suspended_slots = {slot for _, slot in suspended}
         if suspended:
             suspended_str = ', '.join([f"{name} ({slot})" for name, slot in suspended])
             self.warnings.append(f"🚫 **Suspended players:** {suspended_str}")
+
+        # Check for too many key position players in one line
+        for group_label, count, names in self.get_key_position_overload():
+            self.warnings.append(f"❗ **Too many key position players in {group_label}:** {count} ({', '.join(names)})")
 
     def add_buttons(self):
         """Add all menu buttons"""
@@ -1119,6 +1204,11 @@ class TeamLineupMenu(discord.ui.View):
         embed = view.create_embed()
 
         await interaction.response.edit_message(embed=embed, view=view)
+        # Store message reference so AutofillButton's confirmation flow can
+        # edit this same message later, once its own separate interaction
+        # (the confirm button's) is the one live at that point - same
+        # pattern as TeamLineupMenu.message above.
+        view.message = await interaction.original_response()
 
     async def submit_lineup_callback(self, interaction: discord.Interaction):
         """Submit the lineup as ready for the current round - no longer
@@ -1365,9 +1455,9 @@ class TeamLineupMenu(discord.ui.View):
 
         async with aiosqlite.connect(DB_PATH) as db:
             if await lineups_locked(db):
-                await interaction.followup.send(
-                    "❌ Lineups are locked for this round - the round has already been announced.",
-                    ephemeral=True
+                await interaction.edit_original_response(
+                    content="❌ Lineups are locked for this round - the round has already been announced.",
+                    view=None
                 )
                 return
 
@@ -1383,7 +1473,9 @@ class TeamLineupMenu(discord.ui.View):
         # Edit the original lineup menu message (not the confirmation message)
         await self.message.edit(embed=embed, view=self)
 
-        await interaction.followup.send("✅ Lineup cleared!", ephemeral=True)
+        # Edit the confirmation prompt itself into the result, rather than
+        # leaving "Clear Lineup?" on screen next to a separate followup.
+        await interaction.edit_original_response(content="✅ Lineup cleared!", view=None)
 
     async def view_starting_lineup_callback(self, interaction: discord.Interaction):
         """Display the saved starting lineup"""
@@ -1495,13 +1587,20 @@ class TeamLineupMenu(discord.ui.View):
             ("Fol", ["R", "RR", "RO"])
         ]
 
+        def status_badge(pos_name):
+            if pos_name in self.injured_slots:
+                return " 🚑"
+            if pos_name in self.suspended_slots:
+                return " 🚫"
+            return ""
+
         field_text = ""
         for line_name, positions in rows:
             row_text = []
             for pos_name in positions:
                 if pos_name in self.lineup:
                     p = self.lineup[pos_name]
-                    row_text.append(f"{p['name']} ({p['rating']})")
+                    row_text.append(f"{p['name']} ({_display_ovr(pos_name, p)}){status_badge(pos_name)}")
                 else:
                     row_text.append("*Empty*")
             field_text += f"**{line_name}:**  {', '.join(row_text)}\n"
@@ -1513,7 +1612,7 @@ class TeamLineupMenu(discord.ui.View):
         for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]:
             if pos_name in self.lineup:
                 p = self.lineup[pos_name]
-                int_players.append(f"{p['name']} ({p['rating']})")
+                int_players.append(f"{p['name']} ({p['rating']}){status_badge(pos_name)}")
             else:
                 int_players.append("*Empty*")
         field_text += f"**Int:**  {', '.join(int_players)}"
@@ -1583,6 +1682,12 @@ class LineupView(discord.ui.View):
         self.injured_player_ids = set()  # Whole-roster injury/suspension status,
         self.suspended_player_ids = set()  # populated by refresh_status_ids() - used
                                             # to badge PositionSelect/PlayerSelect options
+        self.message = None  # Set once by whichever callback first opens this
+                              # editor (via interaction.original_response(),
+                              # an InteractionMessage bound to that interaction's
+                              # own webhook token) - reused by do_autofill later
+                              # to edit this same message from a different,
+                              # later interaction (the confirm button's own).
 
         # Build lineup dict (position_name -> player info)
         self.lineup = {}
@@ -1662,52 +1767,37 @@ class LineupView(discord.ui.View):
             if total_players > 25:
                 total_pages = (total_players + 24) // 25
                 if self.player_page > 0:
-                    self.add_item(PrevPageButton(self))
+                    self.add_item(PrevPageButton(self, total_pages))
                 if (self.player_page + 1) * 25 < total_players:
                     self.add_item(NextPageButton(self, total_pages))
 
-        # Add clear and main menu buttons
+        # Add autofill, clear, and main menu buttons
+        self.add_item(AutofillButton(self))
         if self.selected_position and self.selected_position in self.lineup:
             self.add_item(ClearPositionButton(self))
         self.add_item(MainMenuButton(self))
     
     def get_sorted_roster(self):
-        """Get roster sorted by relevance to selected position"""
-        if not self.selected_position:
+        """Get roster sorted by relevance to the selected slot - players
+        whose natural position suffers zero effective_ovr penalty there
+        (see fits_without_penalty) sort first, then everyone else, each
+        group ordered by rating descending. Uses the exact same
+        slot-specific check as auto_fill_lineup rather than a flat
+        "any defender for any defensive slot" bucket - e.g. FB/CHB (true
+        spine) only rank KEY DEF/RUCK-DEF/SWINGMAN penalty-free, while
+        LBP/RBP/LHB/RHB (pockets/flanks) also rank GEN DEF/DEF-MID/UTILITY
+        penalty-free, matching Player._compute_effective_ovr's own rules."""
+        if not self.selected_position or self.selected_position in INTERCHANGE_SLOTS:
+            # No penalty concept on the interchange (see
+            # Player._compute_effective_ovr) - every position ties, so
+            # there's nothing meaningful to sort by fit.
             return self.roster
-        
-        # Define position priorities
-        defensive_positions = ["LBP", "FB", "RBP", "LHB", "CHB", "RHB"]
-        midfield_positions = ["LW", "C", "RW", "R", "RR", "RO"]
-        forward_positions = ["LHF", "CHF", "RHF", "LFP", "FF", "RFP"]
 
-        # Define preferred player positions for each field position type
-        if self.selected_position in defensive_positions:
-            priority_positions = ["GEN DEF", "KEY DEF", "DEF-MID", "RUCK-DEF", "UTILITY", "SWINGMAN"]
-        elif self.selected_position in midfield_positions:
-            # Prioritize ruck positions for R only
-            if self.selected_position == "R":
-                priority_positions = ["RUCK", "RUCK-DEF", "RUCK-FWD"]
-            else:
-                # LW, C, RW, RR, RO prioritize midfield positions
-                priority_positions = ["MID", "MID-FWD", "DEF-MID", "UTILITY"]
-        elif self.selected_position in forward_positions:
-            priority_positions = ["GEN FWD", "KEY FWD", "MID-FWD", "RUCK-FWD", "UTILITY", "SWINGMAN"]
-        else:  # Interchange
-            return self.roster  # No sorting for interchange
-        
-        # Get players already in lineup
-        used_ids = {p.get('player_id') for p in self.lineup.values() if p.get('player_id')}
-        
-        # Sort roster: priority positions first, then by rating
         def sort_key(player):
             pos = player[2]  # position
             rating = player[3]  # overall_rating
-            # Check if position is in priority list
-            if pos in priority_positions:
-                return (0, -rating)  # Highest priority
-            else:
-                return (1, -rating)  # Normal priority
+            fits = fits_without_penalty(pos, self.selected_position)
+            return (0 if fits else 1, -rating)
 
         return sorted(self.roster, key=sort_key)
     
@@ -1726,6 +1816,33 @@ class LineupView(discord.ui.View):
                 duplicates.append(player_info['name'])
                 seen.add(player_id)
         return duplicates
+
+    def get_key_position_overload(self):
+        """Check for too many key-position-TYPE players genuinely on-field
+        (never interchange) in the backline or forward line - mirrors
+        match_sim.py's own in-sim penalty (see
+        KEY_POSITION_COUNT_THRESHOLD/KEY_POSITION_OVERLOAD_PENALTY_PER_EXCESS/
+        KEY_POSITION_OVERLOAD_GROUPS and _group_strength) so what the
+        lineup screen warns about matches what actually costs the team
+        strength when simulated. Counts ANY KEY_POSITION_TYPES player
+        currently in that line, not just that line's own "natural" key
+        positions - a KEY FWD misplaced in defense (or any other
+        key-position player in the wrong line) still counts as a tall
+        crowding that line, same as match_sim.py's own rule. Returns a
+        list of (group_label, count, names) tuples for any line over the
+        threshold - empty if neither line is overloaded."""
+        line_labels = {"defense": "Backline", "forward": "Forward line"}
+        overloads = []
+        for group, group_label in line_labels.items():
+            names = [
+                p['name'] for pos_name, p in self.lineup.items()
+                if pos_name not in INTERCHANGE_SLOTS
+                and slot_group(pos_name) == group
+                and p['pos'] in KEY_POSITION_TYPES
+            ]
+            if len(names) > KEY_POSITION_COUNT_THRESHOLD:
+                overloads.append((group_label, len(names), names))
+        return overloads
 
     async def get_injured_players(self):
         """Check for injured players in lineup - returns list of
@@ -1814,6 +1931,76 @@ class LineupView(discord.ui.View):
             suspended_str = ', '.join([f"{name} ({slot})" for name, slot in suspended])
             self.warnings.append(f"🚫 **Suspended players:** {suspended_str}")
 
+        # Check for too many key position players in one line
+        for group_label, count, names in self.get_key_position_overload():
+            self.warnings.append(f"❗ **Too many key position players in {group_label}:** {count} ({', '.join(names)})")
+
+    async def do_autofill(self, interaction: discord.Interaction):
+        """Actually run autofill after confirmation - called by
+        ConfirmActionView via AutofillButton. Fills every empty slot and
+        replaces every invalid occupant (injured, suspended, or a duplicate
+        elsewhere in the lineup) using auto_fill_lineup - the same repair
+        logic the Announce Lineups panel's Force-submit button uses. Valid
+        slots are never touched. interaction here is the CONFIRM button's
+        own interaction (already responded to by ConfirmActionView) - its
+        edit_original_response updates the confirmation prompt itself,
+        while self.message (captured once when this editor was first
+        opened - see edit_lineup_callback) is what gets the real lineup
+        editor update, from this separate, later interaction."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT current_round, lineups_locked FROM seasons WHERE status = 'active' LIMIT 1"
+            )
+            season_info = await cursor.fetchone()
+            if not season_info:
+                await interaction.edit_original_response(content="❌ No active season!", view=None)
+                return
+            current_round, is_locked = season_info
+
+            if is_locked:
+                await interaction.edit_original_response(
+                    content="❌ Lineups are locked for this round - the round has already been announced.",
+                    view=None
+                )
+                return
+
+            changes, unfilled = await auto_fill_lineup(db, self.team_id, current_round)
+            await unconfirm_lineup(db, self.team_id)
+            await db.commit()
+
+            # Rebuild self.lineup from the DB rather than patching it in
+            # place - auto_fill_lineup can move players between slots (an
+            # interchange-borrow backfill) beyond just the slots named in
+            # `changes`' own text, so a full re-read is the only way to be
+            # sure the view matches what's actually now in the lineups table.
+            cursor = await db.execute(
+                """SELECT l.position_name, p.name, p.position, p.overall_rating, p.player_id
+                   FROM lineups l
+                   JOIN players p ON l.player_id = p.player_id AND p.team_id = l.team_id
+                   WHERE l.team_id = ?""",
+                (self.team_id,)
+            )
+            lineup_rows = await cursor.fetchall()
+
+        self.lineup = {
+            pos_name: {'name': name, 'pos': pos, 'rating': rating, 'player_id': player_id}
+            for pos_name, name, pos, rating, player_id in lineup_rows
+        }
+
+        await self.refresh_status_ids()
+        await self.update_warnings()
+        self.add_position_buttons()
+        embed = self.create_embed()
+        await self.message.edit(embed=embed, view=self)
+
+        if not changes:
+            result_text = "✅ Autofill made no changes - every slot was already valid."
+        else:
+            result_text = f"✅ Autofill updated {len(changes)} slot(s)."
+            if unfilled:
+                result_text += f" Could not fill: {', '.join(unfilled)} (roster exhausted)."
+        await interaction.edit_original_response(content=result_text, view=None)
+
     def create_embed(self):
         """Create the lineup display embed"""
         rows = [
@@ -1836,6 +2023,14 @@ class LineupView(discord.ui.View):
             color=discord.Color.green()
         )
         
+        def status_badge(player_info):
+            player_id = player_info.get('player_id')
+            if player_id in self.injured_player_ids:
+                return " 🚑"
+            if player_id in self.suspended_player_ids:
+                return " 🚫"
+            return ""
+
         # Show field positions
         field_text = ""
         for line_name, positions in rows:
@@ -1844,21 +2039,21 @@ class LineupView(discord.ui.View):
                 prefix = "→ " if pos_name == self.selected_position else ""
                 if pos_name in self.lineup:
                     p = self.lineup[pos_name]
-                    row_text.append(f"{prefix}{p['name']} ({p['rating']})")
+                    row_text.append(f"{prefix}{p['name']} ({_display_ovr(pos_name, p)}){status_badge(p)}")
                 else:
                     row_text.append(f"{prefix}*Empty*")
             field_text += f"**{line_name}:**  {', '.join(row_text)}\n"
-        
+
         # Add spacing before interchange
         field_text += "\n"
-        
+
         # Show interchange - all 5 on one line
         int_players = []
         for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]:
             prefix = "→ " if pos_name == self.selected_position else ""
             if pos_name in self.lineup:
                 p = self.lineup[pos_name]
-                int_players.append(f"{prefix}{p['name']} ({p['rating']})")
+                int_players.append(f"{prefix}{p['name']} ({p['rating']}){status_badge(p)}")
             else:
                 int_players.append(f"{prefix}*Empty*")
 
@@ -1894,7 +2089,7 @@ class PositionSelect(discord.ui.Select):
                 p = parent_view.lineup[pos_name]
                 age = age_by_player_id.get(p.get('player_id'))
                 age_part = f", {age}" if age is not None else ""
-                description = f"{p['name']} ({p['pos']}{age_part}, {p['rating']})"
+                description = f"{p['name']} ({p['pos']}{age_part}, {_display_ovr(pos_name, p)})"
                 badge = ""
                 player_id = p.get('player_id')
                 if player_id in parent_view.injured_player_ids:
@@ -1930,8 +2125,9 @@ class PositionSelect(discord.ui.Select):
 
 
 class PrevPageButton(discord.ui.Button):
-    def __init__(self, parent_view):
-        super().__init__(label="◀ Prev", style=discord.ButtonStyle.secondary, row=2)
+    def __init__(self, parent_view, total_pages):
+        prev_page = parent_view.player_page  # 1-indexed page being navigated to
+        super().__init__(label=f"◀ Page {prev_page}/{total_pages}", style=discord.ButtonStyle.secondary, row=2)
         self.parent_view = parent_view
     
     async def callback(self, interaction: discord.Interaction):
@@ -1952,6 +2148,27 @@ class NextPageButton(discord.ui.Button):
         self.parent_view.add_position_buttons()
         embed = self.parent_view.create_embed()
         await interaction.response.edit_message(embed=embed, view=self.parent_view)
+
+
+class AutofillButton(discord.ui.Button):
+    def __init__(self, parent_view):
+        super().__init__(label="⚡ Autofill", style=discord.ButtonStyle.success, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        """Shows a confirmation prompt before running auto_fill_lineup -
+        the actual work happens in LineupView.do_autofill once confirmed.
+        self.parent_view.message (captured once when this editor was first
+        opened - see edit_lineup_callback) is what gets the real lineup
+        editor update once confirmed, since the confirm button click is a
+        separate, later interaction with no direct reference of its own
+        back to this message."""
+        confirmation_view = ConfirmActionView(self.parent_view, 'do_autofill', discord.ButtonStyle.success)
+        message = (
+            "⚡ **Autofill?**\n\nAutofill will automatically fill empty position slots "
+            "and replace injured/suspended players. Are you sure you wish to continue?"
+        )
+        await interaction.response.send_message(message, view=confirmation_view, ephemeral=True)
 
 
 class ClearPositionButton(discord.ui.Button):

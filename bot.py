@@ -455,6 +455,7 @@ async def on_ready():
     await bot.load_extension('commands.free_agency_commands')
     await bot.load_extension('commands.match_commands')
     await bot.load_extension('commands.stats_commands')
+    await bot.load_extension('commands.awards_commands')
     
     try:
         if GUILD_ID:

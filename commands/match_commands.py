@@ -2226,6 +2226,16 @@ class MatchSimulationView(discord.ui.View):
 
     @discord.ui.button(label="Advance to Next Round", style=discord.ButtonStyle.success, row=1)
     async def advance_round_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Disable immediately so a second press before advance_to_next_round
+        # finishes (it does a fair amount of work - injury/suspension
+        # rolls, round summaries, ladder/draft updates) can't kick off a
+        # second overlapping advance; _refresh_panel() at the end re-derives
+        # the real disabled state either way, same pattern as
+        # announce_lineups_button/sim_full_round_button above.
+        button.disabled = True
+        if self.message is not None:
+            await self.message.edit(view=self)
+
         await interaction.response.defer(ephemeral=True)
         season_cog = self.cog.bot.get_cog('SeasonCommands')
         async with aiosqlite.connect(DB_PATH) as db:
