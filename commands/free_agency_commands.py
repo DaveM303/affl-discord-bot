@@ -4,6 +4,7 @@ from discord.ext import commands
 import aiosqlite
 from config import DB_PATH
 from utils import get_current_season, is_admin_user, calculate_contract_expiry, get_team_emoji, get_team_emoji_str, get_user_team
+from commands.lineup_commands import clear_departed_players_from_lineups
 from compensation_image import render_compensation_chart_image
 
 
@@ -1892,6 +1893,11 @@ class FreeAgencyCommands(commands.Cog):
                             "UPDATE players SET team_id = ?, contract_expiry = ? WHERE player_id = ?",
                             (winning_team_id, new_contract_expiry, player_id)
                         )
+                        # They no longer play for their old team, so strip
+                        # them out of its lineups - a leftover row reads as
+                        # an empty slot to validate_lineup and blocks
+                        # force-submit (see clear_departed_players_from_lineups).
+                        await clear_departed_players_from_lineups(db, [player_id], original_team_id)
                         players_transferred += 1
 
                         # Calculate compensation for original team

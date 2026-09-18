@@ -5,6 +5,7 @@ import aiosqlite
 import json
 from config import DB_PATH
 from utils import is_admin_user, get_team_emoji, get_team_emoji_str
+from commands.lineup_commands import clear_departed_players_from_lineups
 
 # Canonical embed color per trade state, used by build_trade_embed() so every
 # trade-detail embed renders consistently regardless of which flow built it
@@ -2837,26 +2838,6 @@ class ModeratorApprovalView(discord.ui.View):
                     )
                     return
 
-            async def remove_from_starting_lineup(old_team_id, traded_player_ids):
-                """Strip traded players out of the old team's saved starting lineup, if any."""
-                cursor = await db.execute(
-                    "SELECT lineup_data FROM starting_lineups WHERE team_id = ?",
-                    (old_team_id,)
-                )
-                result = await cursor.fetchone()
-                if not result:
-                    return
-
-                lineup_data = json.loads(result[0])
-                traded_ids_str = {str(pid) for pid in traded_player_ids}
-                remaining = {pos: pid for pos, pid in lineup_data.items() if str(pid) not in traded_ids_str}
-
-                if len(remaining) != len(lineup_data):
-                    await db.execute(
-                        "UPDATE starting_lineups SET lineup_data = ? WHERE team_id = ?",
-                        (json.dumps(remaining), old_team_id)
-                    )
-
             # Transfer players
             if init_players:
                 placeholders = ','.join('?' * len(init_players))
@@ -2864,12 +2845,8 @@ class ModeratorApprovalView(discord.ui.View):
                     f"UPDATE players SET team_id = ? WHERE player_id IN ({placeholders})",
                     [recv_team_id] + init_players
                 )
-                # Remove from the old team's saved lineup - they no longer play for them
-                await db.execute(
-                    f"DELETE FROM lineups WHERE player_id IN ({placeholders})",
-                    init_players
-                )
-                await remove_from_starting_lineup(init_team_id, init_players)
+                # Remove from the old team's lineups - they no longer play for them
+                await clear_departed_players_from_lineups(db, init_players, init_team_id)
 
             if recv_players:
                 placeholders = ','.join('?' * len(recv_players))
@@ -2877,12 +2854,8 @@ class ModeratorApprovalView(discord.ui.View):
                     f"UPDATE players SET team_id = ? WHERE player_id IN ({placeholders})",
                     [init_team_id] + recv_players
                 )
-                # Remove from the old team's saved lineup - they no longer play for them
-                await db.execute(
-                    f"DELETE FROM lineups WHERE player_id IN ({placeholders})",
-                    recv_players
-                )
-                await remove_from_starting_lineup(recv_team_id, recv_players)
+                # Remove from the old team's lineups - they no longer play for them
+                await clear_departed_players_from_lineups(db, recv_players, recv_team_id)
 
             # Transfer draft picks
             if init_picks:

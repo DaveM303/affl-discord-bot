@@ -110,6 +110,53 @@ def fits_without_penalty(position, slot):
     return Player(0, "", position, 100, slot).effective_ovr == 100
 
 
+async def clear_departed_players_from_lineups(db, player_ids, old_team_id=None):
+    """Strips players who have just left a team out of BOTH that team's
+    live lineup (`lineups`) and its saved main lineup (`starting_lineups`).
+    Call this from every path that moves a player off a team - trades,
+    free agency, delisting - right after the players row is updated.
+
+    Leaving these rows behind is not cosmetic: validate_lineup only counts
+    lineup rows that still join to a player on that team, so a departed
+    player's row reads as an EMPTY slot to validation, while anything
+    reading `lineups` directly sees the slot as filled. That mismatch is
+    what made force-submit refuse a lineup ("3 position(s) empty") that
+    auto-fill insisted had nothing to fix.
+
+    old_team_id is optional and only scopes the starting_lineups cleanup;
+    the `lineups` delete is keyed on player_id alone, since a player can
+    only ever hold a slot for the team they were on."""
+    player_ids = [pid for pid in player_ids if pid is not None]
+    if not player_ids:
+        return
+
+    placeholders = ','.join('?' * len(player_ids))
+    await db.execute(
+        f"DELETE FROM lineups WHERE player_id IN ({placeholders})",
+        player_ids
+    )
+
+    if old_team_id is None:
+        return
+
+    cursor = await db.execute(
+        "SELECT lineup_data FROM starting_lineups WHERE team_id = ?",
+        (old_team_id,)
+    )
+    result = await cursor.fetchone()
+    if not result:
+        return
+
+    lineup_data = json.loads(result[0])
+    departed = {str(pid) for pid in player_ids}
+    remaining = {pos: pid for pos, pid in lineup_data.items() if str(pid) not in departed}
+    if len(remaining) != len(lineup_data):
+        await db.execute(
+            "UPDATE starting_lineups SET lineup_data = ? WHERE team_id = ?",
+            (json.dumps(remaining), old_team_id)
+        )
+
+
 async def team_playing_this_round(db, team_id, round_number):
     """True if team_id has a fixture (as home or away) in round_number.
     Used to block lineup submission for teams on a bye or already
@@ -247,6 +294,14 @@ async def auto_fill_lineup(db, team_id, current_round):
     combination of starting/interchange slots) is only kept in the FIRST
     slot they appear in; every later occurrence is treated as invalid.
 
+    A slot whose occupant is no longer on this team (traded or delisted
+    since the lineup was last set, leaving the `lineups` row behind) counts
+    as invalid too, exactly like an empty one. validate_lineup only counts
+    rows that still join to a player ON this team, so without this such a
+    slot reads as "empty" to validation but "filled" to this function -
+    autofill would report nothing to do while force-submit kept refusing
+    the lineup as incomplete.
+
     A player already used earlier in this same run (moved or pulled from
     reserves) is never reused for a later slot, and a player who is
     themselves injured/suspended is never moved or pulled from reserves.
@@ -319,6 +374,11 @@ async def auto_fill_lineup(db, team_id, current_round):
         player_id = slot_to_player.get(slot)
         target_list = invalid_starting_slots if slot in starting_slots else invalid_interchange_slots
         if player_id is None:
+            target_list.append(slot)
+        elif player_id not in roster:
+            # Occupant has left the team (traded/delisted) but their
+            # lineups row survived - the slot is effectively empty, and
+            # validate_lineup already treats it that way.
             target_list.append(slot)
         elif player_id in seen_player_ids:
             target_list.append(slot)
@@ -561,7 +621,8 @@ class LineupCommands(commands.Cog):
         if team_name:
             if not await self.is_admin(interaction):
                 await interaction.response.send_message(
-                    "❌ Only admins can manage other teams' lineups!",
+                    "❌ Only admins can manage other teams' lineups! "
+                    "Type `/teamlineup` without a team parameter to access your own lineup.",
                     ephemeral=True
                 )
                 return
@@ -820,11 +881,11 @@ class LineupCommands(commands.Cog):
                     (current_season, player_id)
                 )
 
-                # Remove from lineups
-                await db.execute(
-                    "DELETE FROM lineups WHERE player_id = ?",
-                    (player_id,)
-                )
+                # Remove from the team's live lineup AND its saved main
+                # lineup - previously only `lineups` was cleared, which
+                # left the delisted player in starting_lineups to
+                # reappear the next time it was restored.
+                await clear_departed_players_from_lineups(db, [player_id], team_id)
 
                 delisted_players.append((full_name, position, rating, age))
 

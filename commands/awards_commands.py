@@ -173,17 +173,18 @@ class AwardsMenuView(discord.ui.View):
     def update_components(self):
         self.clear_items()
         self.add_item(_ViewBrownlowButton(self))
+        self.add_item(_ViewColemanButton(self))
         self.add_item(_ViewBestAndFairestButton(self))
 
     def create_embed(self):
         embed = discord.Embed(
-            title=f"Awards - Season {self.season_number}",
+            title=f"🏅 Awards - Season {self.season_number}",
             color=discord.Color.gold(),
         )
 
         if self.brownlow:
             embed.add_field(
-                name="🏅 Brownlow Medal - Top 3",
+                name="Brownlow Medal - Top 3",
                 value="\n".join(
                     f"{get_team_emoji_str(self.bot, p['emoji_id'])}{p['name']} ({p['overall_rating']}) - **{p['votes']}**"
                     for p in self.brownlow[:3]
@@ -192,7 +193,7 @@ class AwardsMenuView(discord.ui.View):
             )
         if self.coleman:
             embed.add_field(
-                name="🥅 Coleman Medal - Top 3",
+                name="Coleman Medal - Top 3",
                 value="\n".join(
                     f"{get_team_emoji_str(self.bot, p['emoji_id'])}{p['name']} ({p['overall_rating']}) - **{p['goals']}**"
                     for p in self.coleman[:3]
@@ -211,8 +212,24 @@ class _ViewBrownlowButton(discord.ui.Button):
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction):
-        brownlow_view = _BrownlowView(self.parent_view)
+        brownlow_view = _AwardLeaderboardView(
+            self.parent_view, "brownlow", "votes",
+            "Brownlow Medal Votes", "No Brownlow votes recorded yet this season."
+        )
         await interaction.response.edit_message(embed=brownlow_view.create_embed(), view=brownlow_view)
+
+
+class _ViewColemanButton(discord.ui.Button):
+    def __init__(self, parent_view: AwardsMenuView):
+        super().__init__(label="View Full Coleman Leaderboard", style=discord.ButtonStyle.primary)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        coleman_view = _AwardLeaderboardView(
+            self.parent_view, "coleman", "goals",
+            "Coleman Medal Goals", "No goals recorded yet this season."
+        )
+        await interaction.response.edit_message(embed=coleman_view.create_embed(), view=coleman_view)
 
 
 class _ViewBestAndFairestButton(discord.ui.Button):
@@ -228,38 +245,52 @@ class _ViewBestAndFairestButton(discord.ui.Button):
         await interaction.response.edit_message(embed=bf_view.create_embed(), view=bf_view)
 
 
-class _BrownlowView(discord.ui.View):
-    """Full league-wide Brownlow Medal leaderboard, paginated - same
+class _AwardLeaderboardView(discord.ui.View):
+    """Full league-wide leaderboard for one award, paginated - same
     Previous/Next convention as _StatLeaderboardView (stats_commands.py):
     labels "◀ Previous"/"Next ▶", disabled (not hidden) at the edges, page
-    number shown in the embed field name. No team filter/mode toggle -
-    Brownlow votes are already league-wide and vote-count-only (no
-    total/average distinction, unlike a raw box-score stat)."""
-    def __init__(self, parent_view: AwardsMenuView):
+    number shown in the embed field name. No team filter/mode toggle - both
+    awards are already league-wide and count-only (no total/average
+    distinction, unlike a raw box-score stat).
+
+    Shared by the Brownlow (vote tallies) and Coleman (goal tallies): the
+    two differ only in which list they page through and how they're
+    labelled, so `rows_attr` names the AwardsMenuView attribute holding the
+    already-fetched, already-sorted rows and `value_key` names the field in
+    each row carrying the number to show."""
+    def __init__(self, parent_view: AwardsMenuView, rows_attr, value_key, title, empty_text):
         super().__init__(timeout=1800)
         self.parent_view = parent_view
+        self.rows_attr = rows_attr
+        self.value_key = value_key
+        self.title = title
+        self.empty_text = empty_text
         self.page = 0
         self.update_components()
 
+    @property
+    def rows(self):
+        return getattr(self.parent_view, self.rows_attr)
+
     def _total_pages(self):
-        return max(1, -(-len(self.parent_view.brownlow) // AWARDS_PLAYERS_PER_PAGE))
+        return max(1, -(-len(self.rows) // AWARDS_PLAYERS_PER_PAGE))
 
     def create_embed(self):
         total_pages = self._total_pages()
         start = self.page * AWARDS_PLAYERS_PER_PAGE
-        page_players = self.parent_view.brownlow[start:start + AWARDS_PLAYERS_PER_PAGE]
+        page_players = self.rows[start:start + AWARDS_PLAYERS_PER_PAGE]
 
         embed = discord.Embed(
-            title=f"Brownlow Medal Votes - Season {self.parent_view.season_number}",
+            title=f"{self.title} - Season {self.parent_view.season_number}",
             color=discord.Color.gold(),
         )
 
         if not page_players:
-            embed.description = "No Brownlow votes recorded yet this season."
+            embed.description = self.empty_text
             return embed
 
         lines = [
-            f"{i}. {get_team_emoji_str(self.parent_view.bot, p['emoji_id'])}{p['name']} ({p['overall_rating']}) - **{p['votes']}**"
+            f"{i}. {get_team_emoji_str(self.parent_view.bot, p['emoji_id'])}{p['name']} ({p['overall_rating']}) - **{p[self.value_key]}**"
             for i, p in enumerate(page_players, start=start + 1)
         ]
         field_name = "Rankings"

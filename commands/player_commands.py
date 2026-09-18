@@ -97,32 +97,25 @@ class PlayerCommands(commands.Cog):
                 )
                 return
 
-            # Show list view for all results (single or multiple)
-            player_list = []
-            for player_id, p_name, pos, rating, age, team, emoji_id in unique_players:
-                # Build team display
-                if team:
-                    emoji = self.get_team_emoji(emoji_id)
-                    team_prefix = f"{emoji} " if emoji else ""
-                else:
-                    team_prefix = ""
+            search_display = "', '".join(search_terms)
 
-                # Hide OVR for draft pool players
-                if team == "Draft Pool":
-                    ovr_display = "??"
-                else:
-                    ovr_display = rating
-
-                player_list.append(
-                    f"{team_prefix}**{p_name}** - {pos} ({ovr_display} OVR, {age}yo)"
+            # A single hit is unambiguous, so skip the list and open that
+            # player's profile straight away. Several hits need the list (and
+            # its dropdown) to pick from.
+            if len(unique_players) == 1:
+                season_id, season_number = await resolve_profile_season(db)
+                data = await fetch_player_profile_data(db, unique_players[0][0], season_id)
+                view = PlayerProfileView(self, data, season_number)
+                await interaction.response.send_message(
+                    embed=view.create_embed(), view=view, ephemeral=True
                 )
+                return
 
-            embed = discord.Embed(
-                description="\n".join(player_list),
-                color=discord.Color.green()
-            )
-
-            await interaction.response.send_message(embed=embed)
+        view = PlayerSearchResultsView(self, unique_players, search_display)
+        await interaction.response.send_message(
+            embed=view.create_embed(), view=view, ephemeral=True
+        )
+        view.message = await interaction.original_response()
 
     async def team_name_autocomplete(
         self,
@@ -509,267 +502,781 @@ class PlayerCommands(commands.Cog):
                 color=discord.Color.blue()
             )
             await interaction.followup.send(embed=embed)
-
     @app_commands.command(name="filterplayers", description="Search for players with filters")
-    @app_commands.describe(
-        min_rating="Minimum overall rating",
-        max_rating="Maximum overall rating",
-        min_age="Minimum age",
-        max_age="Maximum age",
-        position1="First position filter (optional)",
-        position2="Second position filter (optional)",
-        position3="Third position filter (optional)",
-        team_name="Team name (or 'delisted')",
-        contract_expiry="Contract expiry season (optional)",
-        sort_by="Sort by (default: OVR desc)",
-        limit="Max results to show (default 100)"
-    )
-    @app_commands.autocomplete(
-        team_name=team_name_autocomplete,
-        position1=position_autocomplete,
-        position2=position_autocomplete,
-        position3=position_autocomplete
-    )
-    @app_commands.choices(sort_by=[
-        app_commands.Choice(name="OVR (High to Low)", value="ovr_desc"),
-        app_commands.Choice(name="OVR (Low to High)", value="ovr_asc"),
-        app_commands.Choice(name="Age (Oldest to Youngest)", value="age_desc"),
-        app_commands.Choice(name="Age (Youngest to Oldest)", value="age_asc"),
-        app_commands.Choice(name="Position", value="position"),
-    ])
-    async def search_players(
-        self,
-        interaction: discord.Interaction,
-        min_rating: int = None,
-        max_rating: int = None,
-        min_age: int = None,
-        max_age: int = None,
-        position1: str = None,
-        position2: str = None,
-        position3: str = None,
-        team_name: str = None,
-        contract_expiry: int = None,
-        sort_by: str = "ovr_desc",
-        limit: int = 100
-    ):
+    async def search_players(self, interaction: discord.Interaction):
+        """Opens the interactive filter menu. All filtering happens through
+        the menu's own dropdowns/buttons rather than command parameters, so
+        filters can be adjusted without re-running the command."""
         async with aiosqlite.connect(DB_PATH) as db:
-            # Build the query dynamically based on filters (exclude Draft Pool players;
-            # exclude delisted players too unless team_name="delisted" was requested)
-            query = """SELECT p.name, p.position, p.overall_rating, p.age, t.team_name, t.emoji_id
-                       FROM players p
-                       LEFT JOIN teams t ON p.team_id = t.team_id
-                       WHERE 1=1
-                       AND (t.team_name IS NULL OR t.team_name != 'Draft Pool')"""
-            params = []
+            cursor = await db.execute(
+                "SELECT team_id, team_name FROM teams WHERE team_name != 'Draft Pool' ORDER BY team_name"
+            )
+            teams = await cursor.fetchall()
 
-            searching_delisted = team_name is not None and team_name.lower() in ['delisted', 'delist', 'del']
-            if not searching_delisted:
-                query += " AND p.team_id IS NOT NULL"
-            
-            if min_rating is not None:
-                query += " AND p.overall_rating >= ?"
-                params.append(min_rating)
-            
-            if max_rating is not None:
-                query += " AND p.overall_rating <= ?"
-                params.append(max_rating)
-            
-            if min_age is not None:
-                query += " AND p.age >= ?"
-                params.append(min_age)
-            
-            if max_age is not None:
-                query += " AND p.age <= ?"
-                params.append(max_age)
+            view = FilterPlayersView(self, teams)
+            await view.load(db)
 
-            # Handle multiple position filters
-            positions_to_filter = [p for p in [position1, position2, position3] if p]
-            if positions_to_filter:
-                from positions import validate_position
-                normalized_positions = []
+        view.update_components()
+        await interaction.response.send_message(
+            embed=view.create_embed(), view=view, ephemeral=True
+        )
+        view.message = await interaction.original_response()
 
-                for pos in positions_to_filter:
-                    is_valid, normalized_pos = validate_position(pos)
-                    if not is_valid:
-                        await interaction.response.send_message(
-                            f"❌ Invalid position '{pos}'",
-                            ephemeral=True
-                        )
-                        return
-                    normalized_positions.append(normalized_pos)
 
-                # Use IN clause for multiple positions
-                placeholders = ", ".join(["?"] * len(normalized_positions))
-                query += f" AND p.position IN ({placeholders})"
-                params.extend(normalized_positions)
-            
-            if team_name is not None:
-                if searching_delisted:
-                    query += " AND p.team_id IS NULL"
-                else:
-                    query += " AND t.team_name = ?"
-                    params.append(team_name)
+# ---------------------------------------------------------------------------
+# Player profiles
+# ---------------------------------------------------------------------------
+# A profile is one embed showing a player's identity (name/team/position/age/
+# OVR), their availability, and their stats for a single season. Stats live in
+# player_match_stats (one row per player per simulated match), which has no
+# season column of its own - the season is reached by joining through matches,
+# so every query here goes player_match_stats -> matches -> seasons.
 
-            if contract_expiry is not None:
-                query += " AND p.contract_expiry = ?"
-                params.append(contract_expiry)
+# Stat columns in display order: (db column, short label, long label).
+PROFILE_STAT_COLUMNS = [
+    ('disposals', 'Disposals', 'Disposals'),
+    ('goals', 'Goals', 'Goals'),
+    ('behinds', 'Behinds', 'Behinds'),
+    ('marks', 'Marks', 'Marks'),
+    ('tackles', 'Tackles', 'Tackles'),
+    ('spoils', 'Spoils', 'Spoils'),
+    ('hitouts', 'Hitouts', 'Hitouts'),
+]
 
-            # Build ORDER BY clause
-            if sort_by == "ovr_desc":
-                order_clause = "p.overall_rating DESC, p.age ASC"
-            elif sort_by == "ovr_asc":
-                order_clause = "p.overall_rating ASC, p.age ASC"
-            elif sort_by == "age_desc":
-                order_clause = "p.age DESC, p.overall_rating DESC"
-            elif sort_by == "age_asc":
-                order_clause = "p.age ASC, p.overall_rating DESC"
-            elif sort_by == "position":
-                # Use CASE to order by POSITION_DISPLAY_ORDER
-                from positions import POSITION_DISPLAY_ORDER
-                case_parts = []
-                for idx, pos in enumerate(POSITION_DISPLAY_ORDER):
-                    case_parts.append(f"WHEN p.position = '{pos}' THEN {idx}")
-                case_statement = "CASE " + " ".join(case_parts) + " ELSE 999 END"
-                order_clause = f"{case_statement}, p.overall_rating DESC"
+
+async def resolve_profile_season(db):
+    """The season a profile's stats are shown for: the active season if there
+    is one, otherwise the most recent season that exists (so profiles still
+    work in the offseason, showing the season just completed). Returns
+    (season_id, season_number) or (None, None) if no season exists at all."""
+    cursor = await db.execute(
+        "SELECT season_id, season_number FROM seasons WHERE status = 'active' LIMIT 1"
+    )
+    row = await cursor.fetchone()
+    if row:
+        return row[0], row[1]
+
+    cursor = await db.execute(
+        "SELECT season_id, season_number FROM seasons ORDER BY season_number DESC LIMIT 1"
+    )
+    row = await cursor.fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+
+async def fetch_player_profile_data(db, player_id, season_id):
+    """Everything a profile embed needs for one player, as a dict. Returns
+    None if the player doesn't exist."""
+    cursor = await db.execute(
+        """SELECT p.player_id, p.name, p.position, p.overall_rating, p.age,
+                  p.contract_expiry, t.team_name, t.emoji_id
+           FROM players p
+           LEFT JOIN teams t ON p.team_id = t.team_id
+           WHERE p.player_id = ?""",
+        (player_id,)
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return None
+
+    data = {
+        'player_id': row[0],
+        'name': row[1],
+        'position': row[2],
+        'overall_rating': row[3],
+        'age': row[4],
+        'contract_expiry': row[5],
+        'team_name': row[6],
+        'emoji_id': row[7],
+    }
+
+    # Season stats. games_played is the row count, not a stored column - a row
+    # exists precisely when the player took the field in a simulated match.
+    stat_sums = ", ".join(f"COALESCE(SUM(pms.{col}), 0)" for col, _, _ in PROFILE_STAT_COLUMNS)
+    if season_id is not None:
+        cursor = await db.execute(
+            f"""SELECT COUNT(*), {stat_sums}
+                FROM player_match_stats pms
+                JOIN matches m ON pms.match_id = m.match_id
+                WHERE pms.player_id = ? AND m.season_id = ?""",
+            (player_id, season_id)
+        )
+    else:
+        cursor = await db.execute(
+            f"""SELECT COUNT(*), {stat_sums}
+                FROM player_match_stats pms
+                WHERE pms.player_id = ? AND 1 = 0""",
+            (player_id,)
+        )
+    stat_row = await cursor.fetchone()
+    data['games_played'] = stat_row[0]
+    data['stats'] = {
+        col: stat_row[idx + 1] for idx, (col, _, _) in enumerate(PROFILE_STAT_COLUMNS)
+    }
+
+    # Career games, across every season - context for a player whose current
+    # season has barely started.
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM player_match_stats WHERE player_id = ?",
+        (player_id,)
+    )
+    data['career_games'] = (await cursor.fetchone())[0]
+
+    # Availability. Mirrors the status wording used by /injurylist.
+    cursor = await db.execute(
+        """SELECT injury_type, return_round FROM injuries
+           WHERE player_id = ? AND status = 'injured'""",
+        (player_id,)
+    )
+    injury = await cursor.fetchone()
+    cursor = await db.execute(
+        """SELECT suspension_reason, games_remaining FROM suspensions
+           WHERE player_id = ? AND status = 'suspended'""",
+        (player_id,)
+    )
+    suspension = await cursor.fetchone()
+    data['injury'] = injury
+    data['suspension'] = suspension
+
+    return data
+
+
+def build_player_profile_embed(cog, data, season_number, per_game=False):
+    """One player's profile embed. per_game divides every stat by games
+    played (rendered to 1 decimal place); totals are shown as integers.
+
+    season_number is the season the stats were fetched for, and heads the
+    stats block."""
+    emoji = cog.get_team_emoji(data['emoji_id']) if data['emoji_id'] else ""
+
+    # Draft Pool ratings are hidden everywhere else, so keep them hidden here.
+    ovr_display = "??" if data['team_name'] == 'Draft Pool' else str(data['overall_rating'])
+
+    title = f"{emoji} {data['name']}" if emoji else data['name']
+
+    # The team is already carried by the title's emoji, so it isn't repeated
+    # as its own line.
+    header_bits = [
+        f"**{data['position']}** • {data['age']}yo • **{ovr_display}** OVR",
+    ]
+
+    # Availability line, only when there's something to report.
+    if data['suspension']:
+        reason, games_remaining = data['suspension']
+        display_reason = re.sub(r' - (low|medium|high) impact$', '', reason)
+        game_text = "match" if games_remaining == 1 else "matches"
+        header_bits.append(f"🟥 Suspended - {display_reason} ({games_remaining} {game_text})")
+    elif data['injury']:
+        injury_type, return_round = data['injury']
+        if return_round:
+            header_bits.append(f"🏥 Injured - {injury_type} (returns Round {return_round})")
+        else:
+            header_bits.append(f"🏥 Injured - {injury_type}")
+
+    embed = discord.Embed(
+        title=title,
+        description="\n".join(header_bits),
+        color=discord.Color.blue()
+    )
+
+    games = data['games_played']
+
+    # The header names the season only - which mode is showing is conveyed by
+    # the toggle button and by whether the values carry a decimal.
+    season_label = f"Season {season_number} Stats" if season_number is not None else "Stats"
+
+    if games == 0:
+        embed.add_field(
+            name=season_label,
+            value="No games played this season.",
+            inline=False
+        )
+    else:
+        stat_lines = [f"Games Played: **{games}**"]
+        for col, label, _ in PROFILE_STAT_COLUMNS:
+            total = data['stats'][col]
+            if per_game:
+                stat_lines.append(f"{label}: **{total / games:.1f}**")
             else:
-                order_clause = "p.overall_rating DESC, p.age ASC"
+                stat_lines.append(f"{label}: **{total}**")
+        embed.add_field(
+            name=season_label,
+            value="\n".join(stat_lines),
+            inline=False
+        )
 
-            query += f" ORDER BY {order_clause} LIMIT ?"
-            params.append(limit)
-            
-            cursor = await db.execute(query, params)
-            players = await cursor.fetchall()
-            
-            if not players:
+    if data['career_games'] != games:
+        embed.set_footer(text=f"Career games: {data['career_games']}")
+
+    return embed
+
+
+class PlayerProfileView(discord.ui.View):
+    """A player's profile with a totals/per-game toggle. `back_view` and
+    `back_embed`, when given, add a Back button returning to whatever menu
+    opened this profile (a filter results page, or a multi-result /player
+    list) so the profile can be opened and closed without re-running the
+    command."""
+
+    def __init__(self, cog, data, season_number, back_view=None, back_embed=None):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.data = data
+        self.season_number = season_number
+        self.per_game = False
+        self.back_view = back_view
+        self.back_embed = back_embed
+        self.update_components()
+
+    def create_embed(self):
+        return build_player_profile_embed(
+            self.cog, self.data, self.season_number, per_game=self.per_game
+        )
+
+    def update_components(self):
+        self.clear_items()
+
+        # The toggle is pointless with no games played - every stat is blank.
+        if self.data['games_played'] > 0:
+            toggle = discord.ui.Button(
+                label="Show Totals" if self.per_game else "Show Averages",
+                style=discord.ButtonStyle.primary
+            )
+            toggle.callback = self.toggle_mode
+            self.add_item(toggle)
+
+        if self.back_view is not None:
+            back = discord.ui.Button(label="◀ Back", style=discord.ButtonStyle.secondary)
+            back.callback = self.go_back
+            self.add_item(back)
+
+    async def toggle_mode(self, interaction: discord.Interaction):
+        self.per_game = not self.per_game
+        self.update_components()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    async def go_back(self, interaction: discord.Interaction):
+        embed = self.back_embed
+        if embed is None and hasattr(self.back_view, 'create_embed'):
+            embed = self.back_view.create_embed()
+        await interaction.response.edit_message(embed=embed, view=self.back_view)
+
+
+class ProfilePickSelect(discord.ui.Select):
+    """Opens a player's profile from a list of players. `players` is a list of
+    (player_id, name, position, rating, age, team_name, emoji_id) tuples,
+    capped by the caller to Discord's 25-option limit."""
+
+    def __init__(self, cog, players, parent_view, row=None, placeholder="View a player's profile..."):
+        options = []
+        for player_id, name, position, rating, age, team_name, emoji_id in players[:25]:
+            ovr_display = "??" if team_name == 'Draft Pool' else str(rating)
+            team_display = team_name or "Delisted"
+            options.append(discord.SelectOption(
+                label=name[:100],
+                value=str(player_id),
+                description=f"{team_display} • {position} • {age}yo • {ovr_display} OVR"[:100]
+            ))
+
+        super().__init__(placeholder=placeholder, options=options, min_values=1, max_values=1, row=row)
+        self.cog = cog
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        player_id = int(self.values[0])
+        async with aiosqlite.connect(DB_PATH) as db:
+            season_id, season_number = await resolve_profile_season(db)
+            data = await fetch_player_profile_data(db, player_id, season_id)
+
+        if data is None:
+            await interaction.response.send_message(
+                "❌ That player no longer exists.", ephemeral=True
+            )
+            return
+
+        back_embed = None
+        if hasattr(self.parent_view, 'create_embed'):
+            back_embed = self.parent_view.create_embed()
+
+        view = PlayerProfileView(
+            self.cog, data, season_number,
+            back_view=self.parent_view, back_embed=back_embed
+        )
+        await interaction.response.edit_message(embed=view.create_embed(), view=view)
+
+
+# ---------------------------------------------------------------------------
+# Interactive player filter menu (/filterplayers)
+# ---------------------------------------------------------------------------
+# Filters are held in a FilterState and re-queried on every change, rather
+# than fetching every player once and filtering in memory - the query is
+# cheap, and it keeps the SQL as the single source of truth for filtering.
+#
+# Component budget: Discord allows 5 action rows per message and a Select
+# eats a whole row. Position / team / sort / profile-pick dropdowns are 4 of
+# them, so the five numeric filters share ONE button opening a 5-field modal
+# (a modal's own limit is 5 inputs, which is exactly what's needed) and the
+# last row carries that button plus pagination.
+
+FILTER_SORT_OPTIONS = [
+    ('ovr_desc', 'OVR (High to Low)'),
+    ('ovr_asc', 'OVR (Low to High)'),
+    ('age_desc', 'Age (Oldest to Youngest)'),
+    ('age_asc', 'Age (Youngest to Oldest)'),
+]
+
+# (FilterState attribute, modal field label) for the numeric filters, in the
+# order they appear in the modal.
+NUMERIC_FILTER_FIELDS = [
+    ('min_age', 'Min Age'),
+    ('max_age', 'Max Age'),
+    ('min_ovr', 'Min OVR'),
+    ('max_ovr', 'Max OVR'),
+    ('contract_expiry', 'Contract Expiry (season)'),
+]
+
+
+class FilterState:
+    """The current filter selections, and the query that realises them."""
+
+    def __init__(self):
+        self.positions = []        # [] means all positions
+        self.team_ids = []         # [] means all teams
+        self.min_age = None
+        self.max_age = None
+        self.min_ovr = None
+        self.max_ovr = None
+        self.contract_expiry = None
+        self.sort_by = 'ovr_desc'
+
+    async def fetch(self, db):
+        # No LIMIT: the menu pages through whatever matches, and a cap here
+        # would silently truncate the list AND make the "(N found)" count in
+        # the embed title wrong. A full league is comfortably small enough to
+        # hold in memory.
+        query = """SELECT p.player_id, p.name, p.position, p.overall_rating, p.age,
+                          t.team_name, t.emoji_id
+                   FROM players p
+                   LEFT JOIN teams t ON p.team_id = t.team_id
+                   WHERE p.team_id IS NOT NULL
+                   AND (t.team_name IS NULL OR t.team_name != 'Draft Pool')"""
+        params = []
+
+        if self.positions:
+            placeholders = ", ".join(["?"] * len(self.positions))
+            query += f" AND p.position IN ({placeholders})"
+            params.extend(self.positions)
+
+        if self.team_ids:
+            placeholders = ", ".join(["?"] * len(self.team_ids))
+            query += f" AND p.team_id IN ({placeholders})"
+            params.extend(self.team_ids)
+
+        if self.min_age is not None:
+            query += " AND p.age >= ?"
+            params.append(self.min_age)
+        if self.max_age is not None:
+            query += " AND p.age <= ?"
+            params.append(self.max_age)
+        if self.min_ovr is not None:
+            query += " AND p.overall_rating >= ?"
+            params.append(self.min_ovr)
+        if self.max_ovr is not None:
+            query += " AND p.overall_rating <= ?"
+            params.append(self.max_ovr)
+        if self.contract_expiry is not None:
+            query += " AND p.contract_expiry = ?"
+            params.append(self.contract_expiry)
+
+        order_clauses = {
+            'ovr_desc': "p.overall_rating DESC, p.age ASC",
+            'ovr_asc': "p.overall_rating ASC, p.age ASC",
+            'age_desc': "p.age DESC, p.overall_rating DESC",
+            'age_asc': "p.age ASC, p.overall_rating DESC",
+        }
+        query += f" ORDER BY {order_clauses.get(self.sort_by, order_clauses['ovr_desc'])}"
+
+        cursor = await db.execute(query, params)
+        return await cursor.fetchall()
+
+    def describe(self, team_names):
+        """Human-readable summary of the active filters. `team_names` maps
+        team_id -> team_name for rendering the team filter."""
+        bits = []
+        if self.positions:
+            bits.append(f"Positions: {', '.join(self.positions)}")
+        if self.team_ids:
+            names = [team_names.get(tid, str(tid)) for tid in self.team_ids]
+            bits.append(f"Teams: {', '.join(names)}")
+        if self.min_ovr is not None:
+            bits.append(f"OVR min {self.min_ovr}")
+        if self.max_ovr is not None:
+            bits.append(f"OVR max {self.max_ovr}")
+        if self.min_age is not None:
+            bits.append(f"Age min {self.min_age}")
+        if self.max_age is not None:
+            bits.append(f"Age max {self.max_age}")
+        if self.contract_expiry is not None:
+            bits.append(f"Contract expiry: Season {self.contract_expiry}")
+        return " | ".join(bits) if bits else "No filters"
+
+
+class NumericFiltersModal(discord.ui.Modal, title="Set Numeric Filters"):
+    """All five numeric filters in one form. Each field is pre-filled with its
+    current value and is optional - clearing a field clears that filter, which
+    is how a user undoes a min/max they no longer want."""
+
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+        self.inputs = {}
+
+        for attribute, label in NUMERIC_FILTER_FIELDS:
+            current = getattr(parent_view.state, attribute)
+            field = discord.ui.TextInput(
+                label=label,
+                placeholder="Leave blank for no limit",
+                default=str(current) if current is not None else None,
+                required=False,
+                max_length=4
+            )
+            self.inputs[attribute] = field
+            self.add_item(field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Validate everything before applying any of it, so a single typo
+        # doesn't leave the filters half-updated.
+        parsed = {}
+        for attribute, label in NUMERIC_FILTER_FIELDS:
+            raw = self.inputs[attribute].value.strip()
+            if not raw:
+                parsed[attribute] = None
+                continue
+            try:
+                parsed[attribute] = int(raw)
+            except ValueError:
                 await interaction.response.send_message(
-                    "No players found matching those filters!"
+                    f"'{raw}' isn't a whole number - check the {label} field.",
+                    ephemeral=True
                 )
                 return
-            
-            # Build filter description
-            filters = []
-            if min_rating: filters.append(f"Rating ≥{min_rating}")
-            if max_rating: filters.append(f"Rating ≤{max_rating}")
-            if min_age: filters.append(f"Age ≥{min_age}")
-            if max_age: filters.append(f"Age ≤{max_age}")
-            if positions_to_filter:
-                positions_display = ", ".join(positions_to_filter)
-                filters.append(f"Positions: {positions_display}")
-            if team_name: filters.append(f"Team: {team_name}")
-            if contract_expiry is not None: filters.append(f"Contract Expiry: {contract_expiry}")
 
-            filter_text = " | ".join(filters) if filters else "No filters"
-            
-            # Create paginated view
-            view = SearchPlayersView(players, filter_text, self)
-            embed = view.create_embed()
+        for attribute, value in parsed.items():
+            setattr(self.parent_view.state, attribute, value)
 
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await self.parent_view.refresh(interaction)
 
 
-class SearchPlayersView(discord.ui.View):
-    def __init__(self, players, filter_text, cog, players_per_page=15):
-        super().__init__(timeout=180)  # 3 minute timeout
-        self.players = players
-        self.filter_text = filter_text
+class NumericFiltersButton(discord.ui.Button):
+    def __init__(self, parent_view, row):
+        state = parent_view.state
+        active = sum(
+            1 for attribute, _ in NUMERIC_FILTER_FIELDS
+            if getattr(state, attribute) is not None
+        )
+        super().__init__(
+            label=f"Age / OVR / Contract ({active})" if active else "Age / OVR / Contract",
+            style=discord.ButtonStyle.primary if active else discord.ButtonStyle.secondary,
+            row=row
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(NumericFiltersModal(self.parent_view))
+
+
+class ResetFiltersButton(discord.ui.Button):
+    def __init__(self, parent_view, row):
+        super().__init__(label="Reset Filters", style=discord.ButtonStyle.danger, row=row)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.state = FilterState()
+        await self.parent_view.refresh(interaction)
+
+
+class PositionFilterSelect(discord.ui.Select):
+    def __init__(self, parent_view, row):
+        from positions import POSITION_DISPLAY_ORDER
+        options = [
+            discord.SelectOption(
+                label=pos, value=pos,
+                default=pos in parent_view.state.positions
+            )
+            for pos in POSITION_DISPLAY_ORDER
+        ]
+        super().__init__(
+            placeholder="Filter by position",
+            options=options, min_values=0, max_values=len(options), row=row
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.state.positions = list(self.values)
+        self.parent_view.current_page = 0
+        await self.parent_view.refresh(interaction)
+
+
+class TeamFilterSelect(discord.ui.Select):
+    def __init__(self, parent_view, teams, row):
+        # Discord caps a Select at 25 options; an 18-20 team league fits, but
+        # trim defensively so an oversized league degrades rather than
+        # erroring out.
+        options = [
+            discord.SelectOption(
+                label=team_name, value=str(team_id),
+                default=team_id in parent_view.state.team_ids
+            )
+            for team_id, team_name in teams[:25]
+        ]
+        super().__init__(
+            placeholder="Filter by team",
+            options=options, min_values=0, max_values=len(options), row=row
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.state.team_ids = [int(v) for v in self.values]
+        self.parent_view.current_page = 0
+        await self.parent_view.refresh(interaction)
+
+
+class SortFilterSelect(discord.ui.Select):
+    def __init__(self, parent_view, row):
+        options = [
+            discord.SelectOption(
+                label=label, value=value,
+                default=value == parent_view.state.sort_by
+            )
+            for value, label in FILTER_SORT_OPTIONS
+        ]
+        super().__init__(placeholder="Sort by...", options=options,
+                         min_values=1, max_values=1, row=row)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.state.sort_by = self.values[0]
+        self.parent_view.current_page = 0
+        await self.parent_view.refresh(interaction)
+
+
+class FilterPlayersView(discord.ui.View):
+    """The /filterplayers menu: live filter controls plus the matching player
+    list. Every control change re-runs the query and edits the same message,
+    so the filters and their results are always one panel.
+
+    Row layout (Discord's cap is 5 rows, a Select taking a full row):
+        0  numeric-filters button, reset, pagination
+        1  position dropdown
+        2  team dropdown
+        3  sort dropdown
+        4  profile-pick dropdown (only when there are results)
+    """
+
+    PLAYERS_PER_PAGE = 15
+
+    def __init__(self, cog, teams, state=None):
+        super().__init__(timeout=300)
         self.cog = cog
-        self.players_per_page = players_per_page
+        self.teams = teams                                  # [(team_id, team_name)]
+        self.team_names = {tid: name for tid, name in teams}
+        self.state = state or FilterState()
+        self.players = []
         self.current_page = 0
-        self.total_pages = (len(players) + players_per_page - 1) // players_per_page
-        
-        # Update button states
-        self.update_buttons()
-    
-    def update_buttons(self):
-        """Update button states based on current page"""
+        self.message = None
+
+    @property
+    def total_pages(self):
+        if not self.players:
+            return 1
+        return (len(self.players) + self.PLAYERS_PER_PAGE - 1) // self.PLAYERS_PER_PAGE
+
+    def page_players(self):
+        start = self.current_page * self.PLAYERS_PER_PAGE
+        return self.players[start:start + self.PLAYERS_PER_PAGE]
+
+    async def load(self, db):
+        """Re-runs the filter query and clamps the page to the new result
+        count (a tightened filter can leave current_page past the end)."""
+        self.players = await self.state.fetch(db)
+        if self.current_page >= self.total_pages:
+            self.current_page = max(self.total_pages - 1, 0)
+
+    async def refresh(self, interaction: discord.Interaction):
+        """Re-query, rebuild the components, and edit the message in place.
+        Used by every filter control's callback."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await self.load(db)
+        self.update_components()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    def update_components(self):
         self.clear_items()
-        
-        # Only add navigation buttons if there are multiple pages
+
+        self.add_item(NumericFiltersButton(self, row=0))
+        self.add_item(ResetFiltersButton(self, row=0))
+
         if self.total_pages > 1:
-            # Previous button
             prev_button = discord.ui.Button(
-                label="◀ Previous",
-                style=discord.ButtonStyle.primary,
-                disabled=(self.current_page == 0)
+                label="◀ Prev",
+                style=discord.ButtonStyle.secondary,
+                disabled=(self.current_page == 0),
+                row=0
             )
             prev_button.callback = self.previous_page
             self.add_item(prev_button)
-            
-            # Page indicator button (disabled, just for display)
-            page_button = discord.ui.Button(
-                label=f"Page {self.current_page + 1}/{self.total_pages}",
-                style=discord.ButtonStyle.secondary,
-                disabled=True
-            )
-            self.add_item(page_button)
-            
-            # Next button
+
             next_button = discord.ui.Button(
                 label="Next ▶",
-                style=discord.ButtonStyle.primary,
-                disabled=(self.current_page >= self.total_pages - 1)
+                style=discord.ButtonStyle.secondary,
+                disabled=(self.current_page >= self.total_pages - 1),
+                row=0
             )
             next_button.callback = self.next_page
             self.add_item(next_button)
-    
+
+        self.add_item(PositionFilterSelect(self, row=1))
+        self.add_item(TeamFilterSelect(self, self.teams, row=2))
+        self.add_item(SortFilterSelect(self, row=3))
+
+        # The profile dropdown lists this page's players, so it stays within
+        # Discord's 25-option cap as long as a page does.
+        page_players = self.page_players()
+        if page_players:
+            self.add_item(ProfilePickSelect(self.cog, page_players, self, row=4))
+
     def create_embed(self):
-        """Create embed for current page"""
-        # Calculate slice indices
-        start_idx = self.current_page * self.players_per_page
-        end_idx = start_idx + self.players_per_page
-        page_players = self.players[start_idx:end_idx]
-        
-        # Build player list with emojis
-        player_lines = []
-        for name, pos, rating, age, team, emoji_id in page_players:
-            if team:
-                emoji = self.cog.get_team_emoji(emoji_id)
+        page_players = self.page_players()
+
+        if not self.players:
+            description = "No players match these filters."
+        else:
+            lines = []
+            for _, name, position, rating, age, team_name, emoji_id in page_players:
+                emoji = self.cog.get_team_emoji(emoji_id) if emoji_id else ""
                 team_prefix = f"{emoji} " if emoji else ""
-            else:
-                team_prefix = ""
+                ovr_display = "??" if team_name == 'Draft Pool' else str(rating)
+                lines.append(f"{team_prefix}**{name}** - {position} ({ovr_display} OVR, {age}yo)")
+            description = "\n".join(lines)
 
-            # Hide OVR for Draft Pool players
-            if team == "Draft Pool":
-                ovr_display = "??"
-            else:
-                ovr_display = str(rating)
-
-            player_lines.append(f"{team_prefix}**{name}** - {pos} ({ovr_display} OVR, {age}yo)")
-        
-        player_text = "\n".join(player_lines)
-        
         embed = discord.Embed(
-            title=f"Player Search Results ({len(self.players)} found)",
-            description=player_text,
+            title=f"Player Search ({len(self.players)} found)",
+            description=description,
             color=discord.Color.purple()
         )
-        
-        embed.add_field(name="Filters", value=self.filter_text, inline=False)
-        
-        if self.total_pages > 1:
-            embed.set_footer(text=f"Page {self.current_page + 1}/{self.total_pages} • Showing {start_idx + 1}-{min(end_idx, len(self.players))} of {len(self.players)}")
-        else:
-            embed.set_footer(text=f"Showing all {len(self.players)} results")
-        
+        embed.add_field(name="Filters", value=self.state.describe(self.team_names), inline=False)
+
+        if self.players and self.total_pages > 1:
+            start = self.current_page * self.PLAYERS_PER_PAGE
+            end = min(start + self.PLAYERS_PER_PAGE, len(self.players))
+            embed.set_footer(
+                text=f"Page {self.current_page + 1}/{self.total_pages} - "
+                     f"showing {start + 1}-{end} of {len(self.players)}"
+            )
+
         return embed
-    
+
     async def previous_page(self, interaction: discord.Interaction):
-        """Go to previous page"""
         if self.current_page > 0:
             self.current_page -= 1
-            self.update_buttons()
-            embed = self.create_embed()
-            await interaction.response.edit_message(embed=embed, view=self)
+            self.update_components()
+            await interaction.response.edit_message(embed=self.create_embed(), view=self)
         else:
             await interaction.response.defer()
-    
+
     async def next_page(self, interaction: discord.Interaction):
-        """Go to next page"""
         if self.current_page < self.total_pages - 1:
             self.current_page += 1
-            self.update_buttons()
-            embed = self.create_embed()
-            await interaction.response.edit_message(embed=embed, view=self)
+            self.update_components()
+            await interaction.response.edit_message(embed=self.create_embed(), view=self)
+        else:
+            await interaction.response.defer()
+
+
+class PlayerSearchResultsView(discord.ui.View):
+    """The multi-result list from /player: the matching players, with a
+    dropdown to open any of their profiles. Unlike FilterPlayersView this has
+    no filter controls - the search terms came from the command itself - so
+    the results are a fixed list captured at command time."""
+
+    PLAYERS_PER_PAGE = 15
+
+    def __init__(self, cog, players, search_display):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.players = players
+        self.search_display = search_display
+        self.current_page = 0
+        self.message = None
+        self.update_components()
+
+    @property
+    def total_pages(self):
+        if not self.players:
+            return 1
+        return (len(self.players) + self.PLAYERS_PER_PAGE - 1) // self.PLAYERS_PER_PAGE
+
+    def page_players(self):
+        start = self.current_page * self.PLAYERS_PER_PAGE
+        return self.players[start:start + self.PLAYERS_PER_PAGE]
+
+    def update_components(self):
+        self.clear_items()
+
+        page_players = self.page_players()
+        if page_players:
+            self.add_item(ProfilePickSelect(self.cog, page_players, self, row=0))
+
+        if self.total_pages > 1:
+            prev_button = discord.ui.Button(
+                label="◀ Prev",
+                style=discord.ButtonStyle.secondary,
+                disabled=(self.current_page == 0),
+                row=1
+            )
+            prev_button.callback = self.previous_page
+            self.add_item(prev_button)
+
+            next_button = discord.ui.Button(
+                label="Next ▶",
+                style=discord.ButtonStyle.secondary,
+                disabled=(self.current_page >= self.total_pages - 1),
+                row=1
+            )
+            next_button.callback = self.next_page
+            self.add_item(next_button)
+
+    def create_embed(self):
+        lines = []
+        for _, name, position, rating, age, team_name, emoji_id in self.page_players():
+            emoji = self.cog.get_team_emoji(emoji_id) if emoji_id else ""
+            team_prefix = f"{emoji} " if emoji else ""
+            ovr_display = "??" if team_name == 'Draft Pool' else str(rating)
+            lines.append(f"{team_prefix}**{name}** - {position} ({ovr_display} OVR, {age}yo)")
+
+        embed = discord.Embed(
+            title=f"Player Search ({len(self.players)} found)",
+            description="\n".join(lines),
+            color=discord.Color.green()
+        )
+        embed.set_footer(
+            text=f"Searched: {self.search_display}" if self.total_pages == 1
+            else f"Searched: {self.search_display} - page {self.current_page + 1}/{self.total_pages}"
+        )
+        return embed
+
+    async def previous_page(self, interaction: discord.Interaction):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_components()
+            await interaction.response.edit_message(embed=self.create_embed(), view=self)
+        else:
+            await interaction.response.defer()
+
+    async def next_page(self, interaction: discord.Interaction):
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+            self.update_components()
+            await interaction.response.edit_message(embed=self.create_embed(), view=self)
         else:
             await interaction.response.defer()
 

@@ -89,6 +89,12 @@ STAT_LABELS = {
 }
 BOX_SCORE_PLAYERS_PER_PAGE = 16
 
+# Rounds offered at once by the Match Centre's round dropdown. Discord caps a
+# Select at 25 options while a season can reach 29 rounds (24 regular + 5
+# finals), so the dropdown shows a window of this size that the Earlier/Later
+# buttons scroll.
+ROUND_WINDOW_SIZE = 25
+
 
 def _event_message(event, team_emoji, home_emoji, away_emoji, running_home_goals, running_home_behinds,
                     running_away_goals, running_away_behinds):
@@ -2013,48 +2019,13 @@ class MatchCommands(commands.Cog):
                 return
             season_id, season_number, _current_round = season
 
-            cursor = await db.execute("SELECT regular_rounds FROM seasons WHERE season_id = ?", (season_id,))
-            regular_rounds = (await cursor.fetchone())[0]
-
-            cursor = await db.execute(
-                "SELECT DISTINCT round_number FROM matches WHERE season_id = ? ORDER BY round_number",
-                (season_id,)
-            )
-            available_rounds = [row[0] for row in await cursor.fetchall()]
-            if not available_rounds:
+            view = await build_match_centre_view(self, db, season_id, season_number)
+            if view is None:
                 await interaction.response.send_message(
                     "❌ No fixture has been set for this season yet.", ephemeral=True
                 )
                 return
-            # Discord's Select hard-caps at 25 options - a season can have up
-            # to 24 regular rounds + 5 finals weeks. Trim to the most recent
-            # 25 (earliest regular-season rounds drop off first, as least
-            # likely to be browsed) rather than erroring out.
-            if len(available_rounds) > 25:
-                available_rounds = available_rounds[-25:]
 
-            # Default to the last FULLY COMPLETED round (every match
-            # simulated), not the season's current_round - that's the round
-            # about to be/still being played, which usually has no results
-            # to show yet. Falls back to the earliest available round if
-            # nothing has been completed at all (season just started).
-            cursor = await db.execute(
-                """SELECT round_number FROM matches
-                   WHERE season_id = ?
-                   GROUP BY round_number
-                   HAVING SUM(CASE WHEN simulated = 0 THEN 1 ELSE 0 END) = 0
-                   ORDER BY round_number DESC LIMIT 1"""
-            , (season_id,))
-            last_completed_row = await cursor.fetchone()
-            if last_completed_row and last_completed_row[0] in available_rounds:
-                default_round = last_completed_row[0]
-            else:
-                default_round = available_rounds[0]
-
-            view = MatchCentreView(self, season_id, season_number, regular_rounds, available_rounds, default_round)
-            await view.refresh(db)
-
-        view.update_components()
         await interaction.response.send_message(embed=view.create_embed(), view=view, ephemeral=True)
         view.message = await interaction.original_response()
 
@@ -2352,10 +2323,70 @@ class MatchModeView(discord.ui.View):
         await self.panel_view._refresh_panel()
 
 
+async def build_match_centre_view(cog, db, season_id, season_number, open_on_round=None):
+    """A ready-to-render MatchCentreView for a season, refreshed and holding
+    its round's matches. Returns None if the season has no fixture at all.
+
+    Shared by /matchcentre and by the round-summary posts' "View Player
+    Stats" button, so that "Main menu" from a box score lands on a real,
+    fully navigable Match Centre no matter which route opened it.
+
+    open_on_round picks the round to open on; when None (or when that round
+    has no fixture) it falls back to the last fully completed round."""
+    cursor = await db.execute("SELECT regular_rounds FROM seasons WHERE season_id = ?", (season_id,))
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    regular_rounds = row[0]
+
+    cursor = await db.execute(
+        "SELECT DISTINCT round_number FROM matches WHERE season_id = ? ORDER BY round_number",
+        (season_id,)
+    )
+    available_rounds = [r[0] for r in await cursor.fetchall()]
+    if not available_rounds:
+        return None
+
+    # Every round is kept. Discord's Select hard-caps at 25 options and a
+    # season can reach 29 rounds (24 regular + 5 finals), so MatchCentreView
+    # shows a sliding 25-round window with arrows to shift it, rather than
+    # discarding the rounds that don't fit.
+    if open_on_round is not None and open_on_round in available_rounds:
+        default_round = open_on_round
+    else:
+        # Default to the last FULLY COMPLETED round (every match simulated),
+        # not the season's current_round - that's the round about to be/still
+        # being played, which usually has no results to show yet. Falls back
+        # to the earliest available round if nothing has been completed at
+        # all (season just started).
+        cursor = await db.execute(
+            """SELECT round_number FROM matches
+               WHERE season_id = ?
+               GROUP BY round_number
+               HAVING SUM(CASE WHEN simulated = 0 THEN 1 ELSE 0 END) = 0
+               ORDER BY round_number DESC LIMIT 1""",
+            (season_id,)
+        )
+        last_completed_row = await cursor.fetchone()
+        if last_completed_row and last_completed_row[0] in available_rounds:
+            default_round = last_completed_row[0]
+        else:
+            default_round = available_rounds[0]
+
+    view = MatchCentreView(cog, season_id, season_number, regular_rounds, available_rounds, default_round)
+    await view.refresh(db)
+    # Build the components here too, so the returned view is renderable as-is.
+    # Callers that only stash it as a "back" target (the round summary's
+    # player-stats button) never get a chance to call this themselves, and
+    # would otherwise render a menu with no controls on it.
+    view.update_components()
+    return view
+
+
 class MatchCentreView(discord.ui.View):
     """Posted by /matchcentre - browse a season's fixture/results round by
     round, and drill into any completed match's full stats. Unlike
-    SearchPlayersView's pure in-memory pagination (a fixed list just gets
+    PlayerSearchResultsView's pure in-memory pagination (a fixed list just gets
     sliced per page), round selection here changes WHAT needs to be shown,
     not just which slice of an already-fetched list - so this re-queries
     the DB on every dropdown change via refresh(), each callback opening
@@ -2367,10 +2398,33 @@ class MatchCentreView(discord.ui.View):
         self.season_id = season_id
         self.season_number = season_number
         self.regular_rounds = regular_rounds
-        self.available_rounds = available_rounds  # round_numbers with a fixture so far, already trimmed to <=25
+        self.available_rounds = available_rounds  # every round_number with a fixture so far
         self.current_round = current_round
+        # Start index of the visible slice of available_rounds. Discord's
+        # Select caps at ROUND_WINDOW_SIZE options, so when a season has more
+        # rounds than that the dropdown scrolls (via the arrow buttons)
+        # instead of the extra rounds being dropped.
+        self.round_window_start = self._window_start_for(current_round)
         self.message = None
         self.matches = []  # (match_id, home_team_id, home_name, home_emoji_id, away_team_id, away_name, away_emoji_id, simulated, home_score, away_score)
+
+    def _window_start_for(self, round_number):
+        """Window start that keeps `round_number` visible, centred where
+        possible and clamped to the ends of available_rounds."""
+        total = len(self.available_rounds)
+        if total <= ROUND_WINDOW_SIZE:
+            return 0
+        try:
+            index = self.available_rounds.index(round_number)
+        except ValueError:
+            return 0
+        start = index - ROUND_WINDOW_SIZE // 2
+        return max(0, min(start, total - ROUND_WINDOW_SIZE))
+
+    def _visible_rounds(self):
+        return self.available_rounds[
+            self.round_window_start:self.round_window_start + ROUND_WINDOW_SIZE
+        ]
 
     async def refresh(self, db):
         """Re-populates self.matches for self.current_round - called after
@@ -2392,17 +2446,38 @@ class MatchCentreView(discord.ui.View):
 
         self.clear_items()
 
+        visible_rounds = self._visible_rounds()
         round_options = [
             discord.SelectOption(
                 label=get_round_name(r, self.regular_rounds),
                 value=str(r),
                 default=(r == self.current_round),
             )
-            for r in self.available_rounds
+            for r in visible_rounds
         ]
         self.add_item(_RoundSelect(self, round_options))
         if self.matches:
             self.add_item(_MatchCentreSelect(self))
+
+        # Arrows only appear when there are rounds outside the window; with a
+        # season of 25 rounds or fewer the dropdown holds everything and they
+        # would be dead controls.
+        if len(self.available_rounds) > ROUND_WINDOW_SIZE:
+            earlier_button = discord.ui.Button(
+                label="◀ Earlier Rounds",
+                style=discord.ButtonStyle.primary,
+                disabled=(self.round_window_start == 0),
+            )
+            earlier_button.callback = self._earlier_rounds
+            self.add_item(earlier_button)
+
+            later_button = discord.ui.Button(
+                label="Later Rounds ▶",
+                style=discord.ButtonStyle.primary,
+                disabled=(self.round_window_start + ROUND_WINDOW_SIZE >= len(self.available_rounds)),
+            )
+            later_button.callback = self._later_rounds
+            self.add_item(later_button)
 
         filter_button = discord.ui.Button(label="Filter by Team", style=discord.ButtonStyle.secondary)
         filter_button.callback = self._open_team_filter
@@ -2439,6 +2514,21 @@ class MatchCentreView(discord.ui.View):
         await self.refresh(db)
         self.update_components()
         await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    async def _shift_round_window(self, interaction: discord.Interaction, delta):
+        """Scrolls the round dropdown's window. The SELECTED round doesn't
+        change - only which rounds are offered - so the fixture on screen
+        stays put and no re-query is needed."""
+        max_start = max(0, len(self.available_rounds) - ROUND_WINDOW_SIZE)
+        self.round_window_start = max(0, min(self.round_window_start + delta, max_start))
+        self.update_components()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    async def _earlier_rounds(self, interaction: discord.Interaction):
+        await self._shift_round_window(interaction, -ROUND_WINDOW_SIZE)
+
+    async def _later_rounds(self, interaction: discord.Interaction):
+        await self._shift_round_window(interaction, ROUND_WINDOW_SIZE)
 
     async def _open_team_filter(self, interaction: discord.Interaction):
         async with aiosqlite.connect(DB_PATH) as db:
@@ -2653,7 +2743,9 @@ class _MatchStatsView(discord.ui.View):
     held here - switching stats or pages just re-sorts/re-renders in
     memory, no re-query needed. parent_view is whichever fixture view this
     was opened from (MatchCentreView or _TeamMatchesView) - both expose the
-    same create_embed()/is-a-View interface "Main menu" needs."""
+    same create_embed()/is-a-View interface "Main menu" needs. May be None
+    when the caller has no menu to return to, in which case no "Main menu"
+    button is rendered."""
     def __init__(self, parent_view, data, selected_stat="goals"):
         super().__init__(timeout=1800)
         self.parent_view = parent_view
@@ -2692,9 +2784,13 @@ class _MatchStatsView(discord.ui.View):
         next_button.callback = self._next_page
         self.add_item(next_button)
 
-        back_button = discord.ui.Button(label="Main menu", style=discord.ButtonStyle.secondary)
-        back_button.callback = self._back
-        self.add_item(back_button)
+        # No parent means there's nowhere to go back TO (the match's season
+        # or fixture couldn't be resolved), so the button is left off rather
+        # than offered and then failing on click.
+        if self.parent_view is not None:
+            back_button = discord.ui.Button(label="Main menu", style=discord.ButtonStyle.secondary)
+            back_button.callback = self._back
+            self.add_item(back_button)
 
     def _make_stat_callback(self, stat_key):
         async def callback(interaction: discord.Interaction):

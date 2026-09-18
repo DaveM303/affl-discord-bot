@@ -850,22 +850,6 @@ async def post_round_summaries(bot, db, season_id, season_number, current_round,
             await channel.send(embed=embed, view=view)
 
 
-class _RoundSummaryReturnView(discord.ui.View):
-    """Minimal stand-in "parent view" for _MatchStatsView's Main menu
-    button - _MatchStatsView only ever calls parent_view.create_embed(),
-    it doesn't need a real MatchCentreView/_TeamMatchesView, just
-    something exposing that one method (see _MatchStatsView's own
-    docstring in match_commands.py). Returns to a copy of the round
-    summary embed this was opened from (the ephemeral box-score message
-    it's attached to, not the original public channel post)."""
-    def __init__(self, summary_embed):
-        super().__init__(timeout=1800)
-        self.summary_embed = summary_embed
-
-    def create_embed(self):
-        return self.summary_embed
-
-
 class _RoundSummaryView(discord.ui.View):
     """Two buttons on each team's round-summary post: jump straight to
     that match's box score (/matchcentre's per-match stats view, opened
@@ -896,7 +880,7 @@ class _RoundSummaryView(discord.ui.View):
 
     @discord.ui.button(label="View Player Stats", style=discord.ButtonStyle.primary)
     async def view_player_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
-        from commands.match_commands import _MatchStatsView
+        from commands.match_commands import _MatchStatsView, build_match_centre_view
 
         # Ephemeral, not an edit of the round summary itself - that's a
         # public, permanent post to the whole channel; box-score browsing
@@ -907,16 +891,31 @@ class _RoundSummaryView(discord.ui.View):
         match_cog = self.bot.get_cog('MatchCommands')
         async with aiosqlite.connect(DB_PATH) as db:
             data = await match_cog._fetch_box_score_data(db, self.match_id)
-        if not data:
-            await interaction.followup.send("❌ Stats for this match aren't available.", ephemeral=True)
-            return
+            if not data:
+                await interaction.followup.send("❌ Stats for this match aren't available.", ephemeral=True)
+                return
 
-        # interaction.message is the round-summary post itself - read live
-        # rather than a captured embed, since this view no longer stores
-        # one (a persistent view rebuilt at startup has no send-time state).
-        summary_embed = interaction.message.embeds[0]
-        return_view = _RoundSummaryReturnView(summary_embed)
-        stats_view = _MatchStatsView(return_view, data)
+            # "Main menu" from the box score goes to a real Match Centre
+            # (opened on this match's own round), NOT back to the round
+            # summary - the summary is the public post that's still sitting
+            # in the channel, so returning to a private copy of it is a dead
+            # end. This matches what "Main menu" does when the box score was
+            # reached through /matchcentre itself.
+            cursor = await db.execute(
+                """SELECT m.season_id, m.round_number, s.season_number
+                   FROM matches m JOIN seasons s ON m.season_id = s.season_id
+                   WHERE m.match_id = ?""",
+                (self.match_id,)
+            )
+            match_row = await cursor.fetchone()
+            parent_view = None
+            if match_row:
+                season_id, round_number, season_number = match_row
+                parent_view = await build_match_centre_view(
+                    match_cog, db, season_id, season_number, open_on_round=round_number
+                )
+
+        stats_view = _MatchStatsView(parent_view, data)
         await interaction.followup.send(embed=stats_view.create_embed(), view=stats_view, ephemeral=True)
 
     @discord.ui.button(label="Set Lineup for Next Round", style=discord.ButtonStyle.secondary)
