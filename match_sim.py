@@ -970,11 +970,26 @@ BROWNLOW_POSITION_VOTE_WEIGHT = {
 # best-on-ground performances in winning sides, and this also helps break
 # up season-long concentration further: the same players' teams don't win
 # every single week, so this rotates who's even in the running for votes
-# more than a purely individual-stats model would. 1.5 (not a smaller
-# value like 1.15) for the same reason as BROWNLOW_POSITION_VOTE_WEIGHT
-# above - needs to be strong enough to register a clearly noticeable edge
-# (~64% head-to-head, empirically measured) against BROWNLOW_VOTE_NOISE_STDDEV=0.8.
-BROWNLOW_WINNING_TEAM_VOTE_WEIGHT = 1.5
+# more than a purely individual-stats model would.
+#
+# Lowered from 1.5 to 1.2. Unlike the noise, this is a DETERMINISTIC
+# handicap applied before any randomness, so at 1.5 it could erase a large
+# stat-sheet gap on its own: a 63-proxy game on the losing side ranked
+# behind a 43-proxy game on the winning side before a die was rolled, which
+# is how a 45-disposal/2-goal/9-tackle best-on-ground could routinely poll
+# nothing after a narrow loss.
+#
+# Measured over 60 simulated seasons, dropping to 1.2 leaves season
+# balance essentially untouched (medallist ~24.8 -> ~25.6 votes, top-10
+# spread 9.1 -> 9.4, similar number of players polling) while lifting how
+# often a dominant game - best on ground by 1.5x or more - takes the 3
+# votes, from ~39% to ~44%. Reshaping the noise instead was tried first
+# and was strictly worse: at matched season balance it barely moved
+# standout games at all.
+#
+# Note this boost is a step, not a slope - a 1-point win applies the same
+# multiplier as a 100-point win.
+BROWNLOW_WINNING_TEAM_VOTE_WEIGHT = 1.2
 
 
 # Club best & fairest is a DIFFERENT award from the Brownlow - voted

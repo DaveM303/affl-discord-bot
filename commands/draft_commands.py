@@ -76,6 +76,31 @@ class DraftCommands(commands.Cog):
         except Exception:
             return []
 
+    async def draft_pool_position_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Positions that actually appear in the draft pool right now, with
+        a count each - suggesting a position the pool has nobody for would
+        only ever return an empty list."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """SELECT p.position, COUNT(*)
+                   FROM players p
+                   JOIN teams t ON p.team_id = t.team_id
+                   WHERE t.team_name = 'Draft Pool'
+                   GROUP BY p.position
+                   ORDER BY p.position"""
+            )
+            rows = await cursor.fetchall()
+
+        return [
+            app_commands.Choice(name=f"{position} ({count})", value=position)
+            for position, count in rows
+            if current.lower() in position.lower()
+        ][:25]
+
     async def team_autocomplete(
         self,
         interaction: discord.Interaction,
@@ -355,6 +380,71 @@ class DraftCommands(commands.Cog):
                 return choices[:25]
         except Exception:
             return []
+
+    @app_commands.command(name="viewdraftpool", description="View the players available in the draft pool")
+    @app_commands.describe(position="Optional: only show players of this position")
+    @app_commands.autocomplete(position=draft_pool_position_autocomplete)
+    async def view_draft_pool(self, interaction: discord.Interaction, position: str = None):
+        """Browsable list of everyone currently in the Draft Pool.
+
+        Open to everyone, not admin-only - coaches need to see who's
+        available before a draft the same way /draftorder lets them see the
+        picks. OVR is deliberately NOT shown, matching how the Draft Pool is
+        treated everywhere else (the live draft's own player dropdown,
+        /player, /roster, /filterplayers) - pool players' ratings are hidden
+        until they're actually drafted onto a list.
+        """
+        await interaction.response.defer(ephemeral=True)
+
+        normalized_position = None
+        if position is not None:
+            from positions import validate_position
+            is_valid, normalized_position = validate_position(position)
+            if not is_valid:
+                await interaction.followup.send(
+                    f"❌ Invalid position '{position}'. Pick one from the autocomplete suggestions.",
+                    ephemeral=True
+                )
+                return
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            query = """SELECT p.name, p.position, p.age, t_fs.team_name
+                       FROM players p
+                       JOIN teams t ON p.team_id = t.team_id
+                       LEFT JOIN teams t_fs ON p.father_son_club_id = t_fs.team_id
+                       WHERE t.team_name = 'Draft Pool'"""
+            params = []
+            if normalized_position is not None:
+                query += " AND p.position = ?"
+                params.append(normalized_position)
+
+            # Ordered by position (POSITION_DISPLAY_ORDER, same as /roster)
+            # then name, so the list reads as a scouting board rather than a
+            # flat alphabetical dump.
+            from positions import POSITION_DISPLAY_ORDER
+            case_parts = " ".join(
+                f"WHEN p.position = '{pos}' THEN {idx}"
+                for idx, pos in enumerate(POSITION_DISPLAY_ORDER)
+            )
+            query += f" ORDER BY CASE {case_parts} ELSE 999 END, p.name"
+
+            cursor = await db.execute(query, params)
+            players = await cursor.fetchall()
+
+        if not players:
+            if normalized_position is not None:
+                await interaction.followup.send(
+                    f"No {normalized_position} players in the draft pool.", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "The draft pool is empty! Use `/updateplayer` to assign players to the 'Draft Pool' team.",
+                    ephemeral=True
+                )
+            return
+
+        view = DraftPoolView(players, normalized_position)
+        await interaction.followup.send(embed=view.create_embed(), view=view, ephemeral=True)
 
     @app_commands.command(name="transferpick", description="[ADMIN] Transfer a draft pick to another team")
     @app_commands.describe(
@@ -2356,6 +2446,98 @@ class DraftPointsCalculatorView(discord.ui.View):
                     item.disabled = (self.current_page == 0)
                 elif "Next ▶" in item.label:
                     item.disabled = (self.current_page >= total_pages - 1)
+
+
+class DraftPoolView(discord.ui.View):
+    """Paginated list of the Draft Pool for /viewdraftpool.
+
+    Purely in-memory paging over a list fetched once at command time (the
+    pool only changes when an admin edits it or a draft runs), matching
+    PlayerSearchResultsView's shape rather than re-querying per page.
+    """
+
+    PLAYERS_PER_PAGE = 20
+
+    def __init__(self, players, position_filter=None):
+        super().__init__(timeout=300)
+        self.players = players            # (name, position, age, father_son_club_name)
+        self.position_filter = position_filter
+        self.current_page = 0
+        self.update_components()
+
+    @property
+    def total_pages(self):
+        if not self.players:
+            return 1
+        return (len(self.players) + self.PLAYERS_PER_PAGE - 1) // self.PLAYERS_PER_PAGE
+
+    def page_players(self):
+        start = self.current_page * self.PLAYERS_PER_PAGE
+        return self.players[start:start + self.PLAYERS_PER_PAGE]
+
+    def update_components(self):
+        self.clear_items()
+        if self.total_pages <= 1:
+            return
+
+        prev_button = discord.ui.Button(
+            label="◀ Prev", style=discord.ButtonStyle.secondary,
+            disabled=(self.current_page == 0)
+        )
+        prev_button.callback = self.previous_page
+        self.add_item(prev_button)
+
+        next_button = discord.ui.Button(
+            label="Next ▶", style=discord.ButtonStyle.secondary,
+            disabled=(self.current_page >= self.total_pages - 1)
+        )
+        next_button.callback = self.next_page
+        self.add_item(next_button)
+
+    def create_embed(self):
+        lines = []
+        for name, position, age, fs_club_name in self.page_players():
+            # No OVR - pool ratings stay hidden until a player is drafted.
+            line = f"**{name}** - {position}, {age}yo"
+            if fs_club_name:
+                line += f" (F/S: {fs_club_name})"
+            lines.append(line)
+
+        title = "Draft Pool"
+        if self.position_filter:
+            title += f" - {self.position_filter}"
+        title += f" ({len(self.players)})"
+
+        embed = discord.Embed(
+            title=title,
+            description="\n".join(lines),
+            color=discord.Color.teal(),
+        )
+
+        footer = "Ratings are hidden until players are drafted"
+        if self.total_pages > 1:
+            start = self.current_page * self.PLAYERS_PER_PAGE
+            end = min(start + self.PLAYERS_PER_PAGE, len(self.players))
+            footer = (f"Page {self.current_page + 1}/{self.total_pages} - "
+                      f"showing {start + 1}-{end} of {len(self.players)} • " + footer)
+        embed.set_footer(text=footer)
+        return embed
+
+    async def previous_page(self, interaction: discord.Interaction):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_components()
+            await interaction.response.edit_message(embed=self.create_embed(), view=self)
+        else:
+            await interaction.response.defer()
+
+    async def next_page(self, interaction: discord.Interaction):
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+            self.update_components()
+            await interaction.response.edit_message(embed=self.create_embed(), view=self)
+        else:
+            await interaction.response.defer()
 
 
 async def setup(bot):

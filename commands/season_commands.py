@@ -514,7 +514,14 @@ async def _generate_finals_round(db, season_id, next_round_num, regular_rounds):
             slot: await _finals_slot_result(db, season_id, slot)
             for slot in ("PF1", "PF2")
         }
-        matches = finals_bracket_module.generate_grand_final(prelims_results)
+        # The frozen regular-season ladder decides which grand finalist is
+        # listed as home (the higher-placed one). Read the same way week 2
+        # reads it, from the ladder stored when finals began.
+        cursor = await db.execute(
+            "SELECT team_id FROM ladder_positions WHERE season_id = ? ORDER BY position", (season_id,)
+        )
+        ranked_team_ids = [row[0] for row in await cursor.fetchall()]
+        matches = finals_bracket_module.generate_grand_final(prelims_results, ranked_team_ids)
     else:
         return False
 

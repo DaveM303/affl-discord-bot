@@ -11,6 +11,38 @@ from config import DB_PATH, ADMIN_ROLE_ID
 from positions import validate_position, get_positions_string
 from utils import get_current_year, is_admin_user, get_team_emoji
 
+def _read_optional_sheet(excel_file, sheet_name, found=None, missing=None, **kwargs):
+    """Read one sheet from an /importdata workbook, or None if it isn't there.
+
+    Every sheet is optional, so an admin can delete the tabs they don't want
+    to touch, edit the ones they do, and reimport - only the sheets actually
+    present are applied. This matters because most sheets are a full replace
+    (a DELETE before the inserts): that DELETE lives inside the sheet's own
+    block, so skipping an absent sheet skips its DELETE too, leaving the
+    table exactly as it was.
+
+    A MISSING sheet and an EMPTY sheet deliberately mean different things:
+    missing means "don't touch this table", empty means "replace its contents
+    with nothing" (a real thing to want, e.g. clearing all injuries).
+
+    `found`/`missing` are lists the sheet's name is appended to, so the
+    import summary can report exactly which tables it did and didn't touch.
+    """
+    try:
+        df = pd.read_excel(excel_file, sheet_name=sheet_name, **kwargs)
+    except ValueError:
+        # pandas raises ValueError("Worksheet named 'X' not found") for a
+        # missing sheet. Any other failure (a corrupt file, an unreadable
+        # column) is a real error and propagates to the import's rollback.
+        if missing is not None:
+            missing.append(sheet_name)
+        return None
+
+    if found is not None:
+        found.append(sheet_name)
+    return df
+
+
 class AdminCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -1301,6 +1333,17 @@ class AdminCommands(commands.Cog):
                         '     Free_Agency sheets are cleared and replaced entirely from this file - double-check',
                         '     the data before importing',
                         '',
+                        '7. Every sheet is OPTIONAL - you can import just the ones you want to change',
+                        '   - Delete the tabs you do not want to touch, edit the ones you do, then import:',
+                        '     only the sheets still in the file are applied, and the rest are left alone',
+                        '   - A DELETED tab means "leave this table exactly as it is"',
+                        '   - An EMPTY tab (headers but no rows) still means "replace with nothing", i.e. it',
+                        '     CLEARS that table - so delete the tab, do not empty it, to leave data alone',
+                        '   - The import summary lists which sheets were skipped',
+                        '   - Careful with related sheets: Players resolve teams by name and Lineups resolve',
+                        '     players, so importing Lineups alone against changed Players may drop rows it',
+                        '     can no longer match',
+                        '',
                         '--- VALID POSITIONS ---',
                         '',
                         'Player Positions: MID, KEY FWD, RUCK, GEN DEF, etc.',
@@ -1408,937 +1451,1000 @@ class AdminCommands(commands.Cog):
             file_data = await file.read()
             excel_file = io.BytesIO(file_data)
             
+            # Every per-sheet counter is initialised up front, not inside its
+            # own sheet block: a sheet the workbook doesn't contain is skipped
+            # entirely, and the summary below still reads every counter.
             teams_added = 0
             teams_updated = 0
             players_added = 0
             players_updated = 0
             players_deleted = 0
+            current_lineups_imported = 0
+            starting_lineups_imported = 0
+            seasons_imported = 0
+            injuries_imported = 0
+            suspensions_imported = 0
+            trades_imported = 0
+            settings_imported = 0
+            matches_imported = 0
+            matches_added = 0
+            matches_updated = 0
+            player_match_stats_imported = 0
+            drafts_imported = 0
+            draft_picks_imported = 0
+            ladder_positions_imported = 0
+            compensation_chart_imported = 0
+            contract_config_imported = 0
+            draft_value_index_imported = 0
+            free_agency_bids_imported = 0
+            free_agency_resigns_imported = 0
+            free_agency_results_imported = 0
+            # Sheets found in the uploaded workbook, and those left out -
+            # reported back so a partial import is never silent about what it
+            # did and didn't touch.
+            sheets_imported = []
+            sheets_skipped = []
             errors = []
             duplicate_warnings = []
             
             async with aiosqlite.connect(DB_PATH) as db:
                 # Import Teams
-                teams_df = pd.read_excel(excel_file, sheet_name='Teams', dtype={'Role_ID': str, 'Emoji_ID': str, 'Channel_ID': str, 'Primary_Color': str, 'Secondary_Color': str})
+                teams_df = _read_optional_sheet(excel_file, 'Teams', found=sheets_imported, missing=sheets_skipped, dtype={'Role_ID': str, 'Emoji_ID': str, 'Channel_ID': str, 'Primary_Color': str, 'Secondary_Color': str})
+                if teams_df is not None:
 
-                for _, row in teams_df.iterrows():
-                    team_name = str(row['Team_Name']).strip()
-                    role_id = str(row['Role_ID']).strip() if pd.notna(row['Role_ID']) and row['Role_ID'] else None
-                    emoji_id = str(row['Emoji_ID']).strip() if pd.notna(row['Emoji_ID']) and row['Emoji_ID'] else None
-                    channel_id = str(row['Channel_ID']).strip() if 'Channel_ID' in row and pd.notna(row['Channel_ID']) and row['Channel_ID'] else None
-                    # Primary_Color/Secondary_Color are optional columns, absent
-                    # from exports made before team colors existed - checked
-                    # with 'in row' the same way Channel_ID is above, so an
-                    # older export file can still be imported without error.
-                    primary_color = str(row['Primary_Color']).strip() if 'Primary_Color' in row and pd.notna(row['Primary_Color']) and row['Primary_Color'] else None
-                    secondary_color = str(row['Secondary_Color']).strip() if 'Secondary_Color' in row and pd.notna(row['Secondary_Color']) and row['Secondary_Color'] else None
+                    for _, row in teams_df.iterrows():
+                        team_name = str(row['Team_Name']).strip()
+                        role_id = str(row['Role_ID']).strip() if pd.notna(row['Role_ID']) and row['Role_ID'] else None
+                        emoji_id = str(row['Emoji_ID']).strip() if pd.notna(row['Emoji_ID']) and row['Emoji_ID'] else None
+                        channel_id = str(row['Channel_ID']).strip() if 'Channel_ID' in row and pd.notna(row['Channel_ID']) and row['Channel_ID'] else None
+                        # Primary_Color/Secondary_Color are optional columns, absent
+                        # from exports made before team colors existed - checked
+                        # with 'in row' the same way Channel_ID is above, so an
+                        # older export file can still be imported without error.
+                        primary_color = str(row['Primary_Color']).strip() if 'Primary_Color' in row and pd.notna(row['Primary_Color']) and row['Primary_Color'] else None
+                        secondary_color = str(row['Secondary_Color']).strip() if 'Secondary_Color' in row and pd.notna(row['Secondary_Color']) and row['Secondary_Color'] else None
 
-                    cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
-                    existing = await cursor.fetchone()
+                        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
+                        existing = await cursor.fetchone()
 
-                    if existing:
-                        await db.execute(
-                            "UPDATE teams SET role_id = ?, emoji_id = ?, channel_id = ?, color = ?, color_secondary = ? WHERE team_name = ?",
-                            (role_id, emoji_id, channel_id, primary_color, secondary_color, team_name)
-                        )
-                        teams_updated += 1
-                    else:
-                        await db.execute(
-                            "INSERT INTO teams (team_name, role_id, emoji_id, channel_id, color, color_secondary) VALUES (?, ?, ?, ?, ?, ?)",
-                            (team_name, role_id, emoji_id, channel_id, primary_color, secondary_color)
-                        )
-                        teams_added += 1
-
-                # Import Players (full replace, same as every other sheet: rows with a
-                # Player_ID keep that exact ID so lineups/draft picks/etc. that reference
-                # them stay linked; rows with Player_ID left blank become new players)
-                players_df = pd.read_excel(excel_file, sheet_name='Players')
-
-                # Get team mapping
-                cursor = await db.execute("SELECT team_id, team_name FROM teams")
-                teams = await cursor.fetchall()
-                team_map = {name.lower(): id for id, name in teams}
-
-                # Count existing players so we can report how many were removed
-                # (any pre-existing player not carried over via a Player_ID in this sheet)
-                cursor = await db.execute("SELECT COUNT(*) FROM players")
-                players_before_count = (await cursor.fetchone())[0]
-
-                # Clear existing players before importing the replacement set
-                await db.execute("DELETE FROM players")
-
-                for _, row in players_df.iterrows():
-                    # Skip fully blank rows (e.g. a player's row was cleared rather than
-                    # deleted) instead of trying to parse them as a real player record
-                    if row.isna().all() or (not pd.notna(row.get('Name')) and not str(row.get('Name', '')).strip()):
-                        continue
-
-                    player_id = None
-                    if 'Player_ID' in players_df.columns and pd.notna(row['Player_ID']):
-                        player_id = int(row['Player_ID'])
-
-                    name = str(row['Name']).strip()
-                    position = str(row['Pos']).strip()
-                    rating = int(row['OVR'])
-                    age = int(row['Age'])
-
-                    # Get birth_year if present, otherwise calculate from age
-                    birth_year = None
-                    if 'Birth_Year' in players_df.columns and pd.notna(row['Birth_Year']) and row['Birth_Year']:
-                        birth_year = int(row['Birth_Year'])
-                    else:
-                        # Calculate birth_year from age
-                        current_year = await get_current_year(db)
-                        if current_year is None:
-                            current_year = 1
-                        birth_year = current_year - age
-
-                    # Get contract_expiry if present
-                    contract_expiry = None
-                    if 'Contract_Expiry' in players_df.columns and pd.notna(row['Contract_Expiry']) and row['Contract_Expiry']:
-                        contract_expiry = int(row['Contract_Expiry'])
-
-                    # Validate position
-                    is_valid, normalized_pos = validate_position(position)
-                    if not is_valid:
-                        errors.append(f"Player '{name}': Invalid position '{position}'")
-                        continue
-
-                    # Get team ID
-                    team_id = None
-                    if 'Team' in players_df.columns and pd.notna(row['Team']) and row['Team']:
-                        team_name_lower = str(row['Team']).strip().lower()
-                        team_id = team_map.get(team_name_lower)
-
-                    # Get father/son club ID
-                    father_son_club_id = None
-                    if 'Father_Son_Club' in players_df.columns and pd.notna(row['Father_Son_Club']) and row['Father_Son_Club']:
-                        fs_team_name_lower = str(row['Father_Son_Club']).strip().lower()
-                        father_son_club_id = team_map.get(fs_team_name_lower)
-
-                    # Get plays_like value
-                    plays_like = None
-                    if 'Plays_Like' in players_df.columns and pd.notna(row['Plays_Like']) and row['Plays_Like']:
-                        plays_like = str(row['Plays_Like']).strip()
-
-                    if player_id is not None:
-                        # Re-insert with the same ID so existing lineups/draft picks/
-                        # injuries/etc. that reference this player stay linked
-                        await db.execute(
-                            """INSERT INTO players (player_id, name, position, overall_rating, age, birth_year, team_id, contract_expiry, father_son_club_id, plays_like)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (player_id, name, normalized_pos, rating, age, birth_year, team_id, contract_expiry, father_son_club_id, plays_like)
-                        )
-                        players_updated += 1
-                    else:
-                        # No Player_ID - new player, let SQLite assign the next ID
-                        await db.execute(
-                            """INSERT INTO players (name, position, overall_rating, age, birth_year, team_id, contract_expiry, father_son_club_id, plays_like)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (name, normalized_pos, rating, age, birth_year, team_id, contract_expiry, father_son_club_id, plays_like)
-                        )
-                        players_added += 1
-
-                # Any pre-existing player not carried over via a Player_ID in this sheet
-                # was not re-inserted above, and so was effectively deleted
-                players_deleted = max(0, players_before_count - players_updated)
-
-                # Import Lineups (merged Current, Starting, and Submitted; full replace so
-                # a row removed from the sheet is actually removed from the database)
-                current_lineups_imported = 0
-                starting_lineups_imported = 0
-                lineups_df = pd.read_excel(excel_file, sheet_name='Lineups')
-
-                await db.execute("DELETE FROM lineups")
-                await db.execute("DELETE FROM starting_lineups")
-
-                # Valid lineup positions with slot numbers (for current lineups)
-                valid_lineup_positions = [
-                    "LBP", "FB", "RBP", "LHB", "CHB", "RHB",
-                    "LW", "C", "RW", "LHF", "CHF", "RHF",
-                    "LFP", "FF", "RFP", "R", "RR", "RO",
-                    "INT1", "INT2", "INT3", "INT4", "INT5"
-                ]
-
-                # Group starting lineups by team
-                team_starting_lineups = {}
-
-                for _, row in lineups_df.iterrows():
-                    lineup_type = str(row['Type']).strip().lower()
-                    team_name = str(row['Team_Name'])
-                    position = str(row['Position']).strip()
-                    player_id = int(row['Player_ID'])
-
-                    # Verify player exists
-                    cursor = await db.execute("SELECT player_id FROM players WHERE player_id = ?", (player_id,))
-                    player = await cursor.fetchone()
-                    if not player:
-                        continue
-
-                    # Get team ID
-                    cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
-                    team = await cursor.fetchone()
-                    if not team:
-                        continue
-
-                    if lineup_type == 'current':
-                        position_upper = position.upper()
-                        if position_upper in valid_lineup_positions:
-                            slot_number = valid_lineup_positions.index(position_upper) + 1
+                        if existing:
                             await db.execute(
-                                """INSERT OR REPLACE INTO lineups (team_id, player_id, slot_number, position_name)
-                                   VALUES (?, ?, ?, ?)""",
-                                (team[0], player_id, slot_number, position_upper)
+                                "UPDATE teams SET role_id = ?, emoji_id = ?, channel_id = ?, color = ?, color_secondary = ? WHERE team_name = ?",
+                                (role_id, emoji_id, channel_id, primary_color, secondary_color, team_name)
                             )
-                            current_lineups_imported += 1
+                            teams_updated += 1
                         else:
-                            errors.append(f"Current lineup: Invalid position '{position}' for Player_ID {player_id}")
+                            await db.execute(
+                                "INSERT INTO teams (team_name, role_id, emoji_id, channel_id, color, color_secondary) VALUES (?, ?, ?, ?, ?, ?)",
+                                (team_name, role_id, emoji_id, channel_id, primary_color, secondary_color)
+                            )
+                            teams_added += 1
 
-                    elif lineup_type == 'starting':
-                        if team_name not in team_starting_lineups:
-                            team_starting_lineups[team_name] = {}
-                        team_starting_lineups[team_name][position] = player_id
+                    # Import Players (full replace, same as every other sheet: rows with a
+                    # Player_ID keep that exact ID so lineups/draft picks/etc. that reference
+                    # them stay linked; rows with Player_ID left blank become new players)
+                players_df = _read_optional_sheet(excel_file, 'Players', found=sheets_imported, missing=sheets_skipped)
+                if players_df is not None:
 
-                # Insert/update starting lineups for each team
-                for team_name, lineup_dict in team_starting_lineups.items():
-                    # Get team ID
-                    cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
-                    team = await cursor.fetchone()
+                    # Get team mapping
+                    cursor = await db.execute("SELECT team_id, team_name FROM teams")
+                    teams = await cursor.fetchall()
+                    team_map = {name.lower(): id for id, name in teams}
 
-                    if team:
-                        lineup_json = json.dumps(lineup_dict)
-                        await db.execute(
-                            """INSERT OR REPLACE INTO starting_lineups (team_id, lineup_data, last_updated)
-                               VALUES (?, ?, CURRENT_TIMESTAMP)""",
-                            (team[0], lineup_json)
-                        )
-                        starting_lineups_imported += 1
+                    # Count existing players so we can report how many were removed
+                    # (any pre-existing player not carried over via a Player_ID in this sheet)
+                    cursor = await db.execute("SELECT COUNT(*) FROM players")
+                    players_before_count = (await cursor.fetchone())[0]
 
-                # Import Seasons
-                seasons_imported = 0
-                seasons_df = pd.read_excel(excel_file, sheet_name='Seasons')
-                for _, row in seasons_df.iterrows():
-                    await db.execute(
-                        """INSERT OR REPLACE INTO seasons
-                           (season_number, current_round, regular_rounds, total_rounds, round_name, status)
-                           VALUES (?, ?, ?, ?, ?, ?)""",
-                        (int(row['Season']), int(row['Current_Round']), int(row['Regular_Rounds']),
-                         int(row['Total_Rounds']), str(row['Round_Name']), str(row['Status']))
-                    )
-                    seasons_imported += 1
+                    # Clear existing players before importing the replacement set
+                    await db.execute("DELETE FROM players")
 
-                # Import Injuries (calculate recovery_rounds from injury_round and return_round)
-                injuries_imported = 0
-                injuries_df = pd.read_excel(excel_file, sheet_name='Injuries')
+                    for _, row in players_df.iterrows():
+                        # Skip fully blank rows (e.g. a player's row was cleared rather than
+                        # deleted) instead of trying to parse them as a real player record
+                        if row.isna().all() or (not pd.notna(row.get('Name')) and not str(row.get('Name', '')).strip()):
+                            continue
 
-                # Clear existing injuries before importing to avoid duplicates
-                await db.execute("DELETE FROM injuries")
+                        player_id = None
+                        if 'Player_ID' in players_df.columns and pd.notna(row['Player_ID']):
+                            player_id = int(row['Player_ID'])
 
-                for _, row in injuries_df.iterrows():
-                    # Find player by ID
-                    player_id = int(row['Player_ID'])
-                    cursor = await db.execute("SELECT player_id FROM players WHERE player_id = ?", (player_id,))
-                    player = await cursor.fetchone()
-                    if player:
-                        injury_round = int(row['Injury_Round'])
-                        # Return_Round can be blank - recovery length still
-                        # TBC (see season_commands.py's
-                        # _roll_pending_injury_recoveries), not yet rolled
-                        # at export time. Preserve that through the
-                        # round-trip rather than crashing on int(NaN).
-                        if pd.notna(row['Return_Round']):
-                            return_round = int(row['Return_Round'])
-                            recovery_rounds = return_round - injury_round
+                        name = str(row['Name']).strip()
+                        position = str(row['Pos']).strip()
+                        rating = int(row['OVR'])
+                        age = int(row['Age'])
+
+                        # Get birth_year if present, otherwise calculate from age
+                        birth_year = None
+                        if 'Birth_Year' in players_df.columns and pd.notna(row['Birth_Year']) and row['Birth_Year']:
+                            birth_year = int(row['Birth_Year'])
                         else:
-                            return_round = None
-                            recovery_rounds = None
-                        await db.execute(
-                            """INSERT INTO injuries
-                               (player_id, injury_type, injury_round, recovery_rounds, return_round, status)
-                               VALUES (?, ?, ?, ?, ?, 'injured')""",
-                            (player_id, str(row['Injury_Type']), injury_round,
-                             recovery_rounds, return_round)
-                        )
-                        injuries_imported += 1
+                            # Calculate birth_year from age
+                            current_year = await get_current_year(db)
+                            if current_year is None:
+                                current_year = 1
+                            birth_year = current_year - age
 
-                # Import Suspensions
-                suspensions_imported = 0
-                suspensions_df = pd.read_excel(excel_file, sheet_name='Suspensions')
+                        # Get contract_expiry if present
+                        contract_expiry = None
+                        if 'Contract_Expiry' in players_df.columns and pd.notna(row['Contract_Expiry']) and row['Contract_Expiry']:
+                            contract_expiry = int(row['Contract_Expiry'])
 
-                # Clear existing suspensions before importing to avoid duplicates
-                await db.execute("DELETE FROM suspensions")
+                        # Validate position
+                        is_valid, normalized_pos = validate_position(position)
+                        if not is_valid:
+                            errors.append(f"Player '{name}': Invalid position '{position}'")
+                            continue
 
-                for _, row in suspensions_df.iterrows():
-                    # Find player by ID
-                    player_id = int(row['Player_ID'])
-                    cursor = await db.execute("SELECT player_id FROM players WHERE player_id = ?", (player_id,))
-                    player = await cursor.fetchone()
-                    if player:
-                        suspension_round = int(row['Suspension_Round'])
-                        # Older export files predate Games_Missed/Games_Remaining
-                        # (they had Return_Round instead) - fall back to
-                        # deriving from Return_Round if present, else assume
-                        # the suspension is fully unserved. A blank
-                        # Games_Missed cell in a CURRENT-format file (the
-                        # Games_Missed column exists but this row's value is
-                        # NaN) means a report-driven suspension that was
-                        # still TBC at export time (see
-                        # season_commands.py's _roll_pending_report_suspensions)
-                        # - preserved as NULL/NULL rather than coerced to 0,
-                        # so it still needs rolling after import instead of
-                        # silently reading as "already served".
-                        games_missed_col_exists = 'Games_Missed' in suspensions_df.columns
-                        if games_missed_col_exists and not pd.isna(row['Games_Missed']):
-                            games_missed = int(row['Games_Missed'])
-                        elif games_missed_col_exists:
-                            games_missed = None
-                        elif 'Return_Round' in suspensions_df.columns:
-                            games_missed = int(row['Return_Round']) - suspension_round
+                        # Get team ID
+                        team_id = None
+                        if 'Team' in players_df.columns and pd.notna(row['Team']) and row['Team']:
+                            team_name_lower = str(row['Team']).strip().lower()
+                            team_id = team_map.get(team_name_lower)
+
+                        # Get father/son club ID
+                        father_son_club_id = None
+                        if 'Father_Son_Club' in players_df.columns and pd.notna(row['Father_Son_Club']) and row['Father_Son_Club']:
+                            fs_team_name_lower = str(row['Father_Son_Club']).strip().lower()
+                            father_son_club_id = team_map.get(fs_team_name_lower)
+
+                        # Get plays_like value
+                        plays_like = None
+                        if 'Plays_Like' in players_df.columns and pd.notna(row['Plays_Like']) and row['Plays_Like']:
+                            plays_like = str(row['Plays_Like']).strip()
+
+                        if player_id is not None:
+                            # Re-insert with the same ID so existing lineups/draft picks/
+                            # injuries/etc. that reference this player stay linked
+                            await db.execute(
+                                """INSERT INTO players (player_id, name, position, overall_rating, age, birth_year, team_id, contract_expiry, father_son_club_id, plays_like)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (player_id, name, normalized_pos, rating, age, birth_year, team_id, contract_expiry, father_son_club_id, plays_like)
+                            )
+                            players_updated += 1
                         else:
-                            games_missed = 0
+                            # No Player_ID - new player, let SQLite assign the next ID
+                            await db.execute(
+                                """INSERT INTO players (name, position, overall_rating, age, birth_year, team_id, contract_expiry, father_son_club_id, plays_like)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (name, normalized_pos, rating, age, birth_year, team_id, contract_expiry, father_son_club_id, plays_like)
+                            )
+                            players_added += 1
 
-                        if games_missed is None:
-                            games_remaining = None
-                        elif 'Games_Remaining' in suspensions_df.columns and not pd.isna(row['Games_Remaining']):
-                            games_remaining = int(row['Games_Remaining'])
-                        else:
-                            games_remaining = games_missed
+                    # Any pre-existing player not carried over via a Player_ID in this sheet
+                    # was not re-inserted above, and so was effectively deleted
+                    players_deleted = max(0, players_before_count - players_updated)
 
-                        await db.execute(
-                            """INSERT INTO suspensions
-                               (player_id, suspension_round, games_missed, games_remaining, suspension_reason, status)
-                               VALUES (?, ?, ?, ?, ?, 'suspended')""",
-                            (player_id, suspension_round, games_missed,
-                             games_remaining, str(row['Reason']))
-                        )
-                        suspensions_imported += 1
+                    # Import Lineups (merged Current, Starting, and Submitted; full replace so
+                    # a row removed from the sheet is actually removed from the database)
+                    current_lineups_imported = 0
+                    starting_lineups_imported = 0
+                lineups_df = _read_optional_sheet(excel_file, 'Lineups', found=sheets_imported, missing=sheets_skipped)
+                if lineups_df is not None:
 
-                # Import Trades
-                trades_imported = 0
-                trades_df = pd.read_excel(excel_file, sheet_name='Trades', dtype={'Created_By_User_ID': str, 'Responded_By_User_ID': str, 'Approved_By_User_ID': str})
+                    await db.execute("DELETE FROM lineups")
+                    await db.execute("DELETE FROM starting_lineups")
 
-                # Clear existing trades
-                await db.execute("DELETE FROM trades")
-                for _, row in trades_df.iterrows():
-                    # Get team IDs
-                    cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Initiating_Team']),))
-                    init_team = await cursor.fetchone()
-                    cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Receiving_Team']),))
-                    recv_team = await cursor.fetchone()
+                    # Valid lineup positions with slot numbers (for current lineups)
+                    valid_lineup_positions = [
+                        "LBP", "FB", "RBP", "LHB", "CHB", "RHB",
+                        "LW", "C", "RW", "LHF", "CHF", "RHF",
+                        "LFP", "FF", "RFP", "R", "RR", "RO",
+                        "INT1", "INT2", "INT3", "INT4", "INT5"
+                    ]
 
-                    if init_team and recv_team:
-                        original_trade_id = int(row['Original_Trade_ID']) if pd.notna(row['Original_Trade_ID']) and row['Original_Trade_ID'] else None
-                        created_by = str(row['Created_By_User_ID']) if pd.notna(row['Created_By_User_ID']) and row['Created_By_User_ID'] else None
-                        responded_by = str(row['Responded_By_User_ID']) if pd.notna(row['Responded_By_User_ID']) and row['Responded_By_User_ID'] else None
-                        approved_by = str(row['Approved_By_User_ID']) if pd.notna(row['Approved_By_User_ID']) and row['Approved_By_User_ID'] else None
-                        created_at = str(row['Created_At']) if pd.notna(row['Created_At']) and row['Created_At'] else None
-                        responded_at = str(row['Responded_At']) if pd.notna(row['Responded_At']) and row['Responded_At'] else None
-                        approved_at = str(row['Approved_At']) if pd.notna(row['Approved_At']) and row['Approved_At'] else None
+                    # Group starting lineups by team
+                    team_starting_lineups = {}
 
-                        # Initiating_Picks/Receiving_Picks may be absent in files exported
-                        # before these columns were added - default to '' for older files
-                        initiating_picks = str(row['Initiating_Picks']) if 'Initiating_Picks' in row and pd.notna(row['Initiating_Picks']) else ''
-                        receiving_picks = str(row['Receiving_Picks']) if 'Receiving_Picks' in row and pd.notna(row['Receiving_Picks']) else ''
-
-                        await db.execute(
-                            """INSERT INTO trades
-                               (trade_id, initiating_team_id, receiving_team_id, initiating_players, receiving_players,
-                                initiating_picks, receiving_picks, status, created_at, responded_at, approved_at,
-                                created_by_user_id, responded_by_user_id, approved_by_user_id, original_trade_id)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (int(row['Trade_ID']), init_team[0], recv_team[0], str(row['Initiating_Players']),
-                             str(row['Receiving_Players']), initiating_picks, receiving_picks,
-                             str(row['Status']), created_at, responded_at, approved_at, created_by, responded_by, approved_by, original_trade_id)
-                        )
-                        trades_imported += 1
-
-                # Import Settings
-                settings_imported = 0
-                settings_df = pd.read_excel(excel_file, sheet_name='Settings', dtype={'Setting_Value': str})
-                for _, row in settings_df.iterrows():
-                    setting_value = str(row['Setting_Value']) if pd.notna(row['Setting_Value']) and row['Setting_Value'] else None
-                    await db.execute(
-                        """INSERT OR REPLACE INTO settings (setting_key, setting_value)
-                           VALUES (?, ?)""",
-                        (str(row['Setting_Key']), setting_value)
-                    )
-                    settings_imported += 1
-
-                # Import Matches - fixtures as well as results. Rows WITH a
-                # Match_ID keep that exact ID (so player_match_stats rows
-                # that reference an already-simulated match stay linked);
-                # rows with Match_ID left BLANK are added as new fixture
-                # entries, same "blank ID = new row" convention as Players.
-                # Home_Score/Away_Score/Simulated default to an unplayed
-                # fixture (0/0/False) when left blank, so a new fixture row
-                # only needs Season/Round/Home_Team/Away_Team filled in.
-                matches_added = 0
-                matches_updated = 0
-                matches_df = pd.read_excel(excel_file, sheet_name='Matches')
-
-                await db.execute("DELETE FROM matches")
-
-                for _, row in matches_df.iterrows():
-                    if row.isna().all():
-                        continue
-
-                    # Season/Round are required - no sensible default for a
-                    # fixture row - so skip (rather than crash on int(NaN))
-                    # if either is left blank.
-                    if pd.isna(row.get('Season')) or pd.isna(row.get('Round')):
-                        errors.append(f"Matches: row skipped - Season and Round are both required (Home_Team={row.get('Home_Team')}, Away_Team={row.get('Away_Team')})")
-                        continue
-
-                    cursor = await db.execute("SELECT season_id FROM seasons WHERE season_number = ?", (int(row['Season']),))
-                    season = await cursor.fetchone()
-
-                    cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Home_Team']),))
-                    home_team = await cursor.fetchone()
-
-                    cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Away_Team']),))
-                    away_team = await cursor.fetchone()
-
-                    if not (season and home_team and away_team):
-                        problems = []
-                        if not season:
-                            problems.append(f"Season '{row['Season']}' not found")
-                        if not home_team:
-                            problems.append(f"Home_Team '{row['Home_Team']}' not found")
-                        if not away_team:
-                            problems.append(f"Away_Team '{row['Away_Team']}' not found")
-                        errors.append(f"Matches: row skipped - {'; '.join(problems)}")
-                        continue
-
-                    home_score = int(row['Home_Score']) if 'Home_Score' in matches_df.columns and pd.notna(row['Home_Score']) else 0
-                    away_score = int(row['Away_Score']) if 'Away_Score' in matches_df.columns and pd.notna(row['Away_Score']) else 0
-                    simulated = int(bool(row['Simulated'])) if 'Simulated' in matches_df.columns and pd.notna(row['Simulated']) else 0
-
-                    match_id = None
-                    if 'Match_ID' in matches_df.columns and pd.notna(row['Match_ID']):
-                        match_id = int(row['Match_ID'])
-
-                    if match_id is not None:
-                        await db.execute(
-                            """INSERT INTO matches
-                               (match_id, season_id, round_number, home_team_id, away_team_id, home_score, away_score, simulated)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (match_id, season[0], int(row['Round']), home_team[0], away_team[0],
-                             home_score, away_score, simulated)
-                        )
-                        matches_updated += 1
-                    else:
-                        await db.execute(
-                            """INSERT INTO matches
-                               (season_id, round_number, home_team_id, away_team_id, home_score, away_score, simulated)
-                               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                            (season[0], int(row['Round']), home_team[0], away_team[0],
-                             home_score, away_score, simulated)
-                        )
-                        matches_added += 1
-
-                matches_imported = matches_added + matches_updated
-
-                # Import Player_Match_Stats - full replace, same as every
-                # other sheet (Injuries/Suspensions/etc): the sheet's
-                # contents entirely replace what's in the table. No ID
-                # preservation needed (nothing references stat_id as a FK),
-                # so this is just DELETE then re-insert whatever rows are
-                # present, resolving Match_ID/Player_ID/Team. Since Matches
-                # was just fully replaced above, this also means reimporting
-                # an OLD Matches sheet alongside an OLD (or empty)
-                # Player_Match_Stats sheet naturally resets accumulated
-                # match stats back to that snapshot too - matches this
-                # sheet's real use case (undoing a round of test-season
-                # simulation by reimporting an earlier data file).
-                player_match_stats_imported = 0
-                player_match_stats_df = pd.read_excel(excel_file, sheet_name='Player_Match_Stats')
-
-                await db.execute("DELETE FROM player_match_stats")
-
-                for _, row in player_match_stats_df.iterrows():
-                    if row.isna().all():
-                        continue
-
-                    if pd.isna(row.get('Match_ID')) or pd.isna(row.get('Player_ID')):
-                        errors.append(f"Player_Match_Stats: row skipped - Match_ID and Player_ID are both required (Player_Name={row.get('Player_Name')})")
-                        continue
-
-                    match_id = int(row['Match_ID'])
-                    player_id = int(row['Player_ID'])
-
-                    cursor = await db.execute("SELECT 1 FROM matches WHERE match_id = ?", (match_id,))
-                    match_exists = await cursor.fetchone()
-                    cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row.get('Team')),))
-                    team = await cursor.fetchone()
-
-                    if not (match_exists and team):
-                        problems = []
-                        if not match_exists:
-                            problems.append(f"Match_ID {match_id} not found")
-                        if not team:
-                            problems.append(f"Team '{row.get('Team')}' not found")
-                        errors.append(f"Player_Match_Stats: row skipped - {'; '.join(problems)}")
-                        continue
-
-                    disposals = int(row['Disposals']) if 'Disposals' in player_match_stats_df.columns and pd.notna(row['Disposals']) else 0
-                    goals = int(row['Goals']) if 'Goals' in player_match_stats_df.columns and pd.notna(row['Goals']) else 0
-                    behinds = int(row['Behinds']) if 'Behinds' in player_match_stats_df.columns and pd.notna(row['Behinds']) else 0
-                    marks = int(row['Marks']) if 'Marks' in player_match_stats_df.columns and pd.notna(row['Marks']) else 0
-                    tackles = int(row['Tackles']) if 'Tackles' in player_match_stats_df.columns and pd.notna(row['Tackles']) else 0
-                    spoils = int(row['Spoils']) if 'Spoils' in player_match_stats_df.columns and pd.notna(row['Spoils']) else 0
-                    hitouts = int(row['Hitouts']) if 'Hitouts' in player_match_stats_df.columns and pd.notna(row['Hitouts']) else 0
-                    # Older export files predate Brownlow_Votes/Best_Fairest_Votes -
-                    # default to 0 rather than failing the import.
-                    brownlow_votes = int(row['Brownlow_Votes']) if 'Brownlow_Votes' in player_match_stats_df.columns and pd.notna(row['Brownlow_Votes']) else 0
-                    best_fairest_votes = int(row['Best_Fairest_Votes']) if 'Best_Fairest_Votes' in player_match_stats_df.columns and pd.notna(row['Best_Fairest_Votes']) else 0
-
-                    await db.execute(
-                        """INSERT INTO player_match_stats
-                           (match_id, player_id, team_id, disposals, goals, behinds, marks, tackles, spoils, hitouts, brownlow_votes, best_fairest_votes)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (match_id, player_id, team[0], disposals, goals, behinds, marks, tackles, spoils, hitouts, brownlow_votes, best_fairest_votes)
-                    )
-                    player_match_stats_imported += 1
-
-                # Import Drafts (full replace, same as Players/Draft_Picks: rows with a
-                # Draft_ID keep that exact ID so draft_picks stay linked; rows with
-                # Draft_ID left blank become new drafts; omitted rows are deleted)
-                drafts_imported = 0
-                drafts_df = pd.read_excel(excel_file, sheet_name='Drafts')
-
-                await db.execute("DELETE FROM drafts")
-
-                for _, row in drafts_df.iterrows():
-                    # Skip fully blank rows
-                    if row.isna().all() or not str(row.get('Draft_Name', '')).strip():
-                        continue
-
-                    draft_id = int(row['Draft_ID']) if pd.notna(row['Draft_ID']) else None
-                    draft_name = str(row['Draft_Name']).strip()
-                    season_number = int(row['Season_Number']) if pd.notna(row['Season_Number']) else None
-                    status = str(row['Status']) if pd.notna(row['Status']) and row['Status'] else 'future'
-                    rounds = int(row['Rounds']) if pd.notna(row['Rounds']) else 4
-                    rookie_contract_years = int(row['Rookie_Contract_Years']) if pd.notna(row['Rookie_Contract_Years']) else 3
-                    created_at = str(row['Created_At']) if pd.notna(row['Created_At']) and row['Created_At'] else None
-                    ladder_set_at = str(row['Ladder_Set_At']) if pd.notna(row['Ladder_Set_At']) and row['Ladder_Set_At'] else None
-                    started_at = str(row['Started_At']) if 'Started_At' in row and pd.notna(row['Started_At']) and row['Started_At'] else None
-                    completed_at = str(row['Completed_At']) if 'Completed_At' in row and pd.notna(row['Completed_At']) and row['Completed_At'] else None
-                    current_pick_number = int(row['Current_Pick_Number']) if 'Current_Pick_Number' in row and pd.notna(row['Current_Pick_Number']) else 0
-
-                    if draft_id is not None:
-                        # Re-insert with the same ID so draft_picks referencing this draft stay linked
-                        await db.execute(
-                            """INSERT INTO drafts
-                               (draft_id, draft_name, season_number, status, rounds, rookie_contract_years,
-                                created_at, ladder_set_at, started_at, completed_at, current_pick_number)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (draft_id, draft_name, season_number, status, rounds, rookie_contract_years,
-                             created_at, ladder_set_at, started_at, completed_at, current_pick_number)
-                        )
-                    else:
-                        # No Draft_ID - new draft, let SQLite assign the next ID
-                        await db.execute(
-                            """INSERT INTO drafts
-                               (draft_name, season_number, status, rounds, rookie_contract_years,
-                                created_at, ladder_set_at, started_at, completed_at, current_pick_number)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (draft_name, season_number, status, rounds, rookie_contract_years,
-                             created_at, ladder_set_at, started_at, completed_at, current_pick_number)
-                        )
-                    drafts_imported += 1
-
-                # Import Draft Picks
-                draft_picks_imported = 0
-                draft_picks_df = pd.read_excel(excel_file, sheet_name='Draft_Picks')
-
-                # Clear existing draft picks before importing to avoid duplicates
-                await db.execute("DELETE FROM draft_picks")
-
-                for _, row in draft_picks_df.iterrows():
-                    # Get current team ID
-                    cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Current_Team']),))
-                    current_team = await cursor.fetchone()
-
-                    # Parse original_team_id from pick_origin
-                    original_team_id = None
-                    pick_origin = str(row['Pick_Origin']) if pd.notna(row['Pick_Origin']) and row['Pick_Origin'] else ''
-                    if pick_origin:
-                        # Parse pick_origin format: "Team Name R1" or "Team Name F/S Match"
-                        if ' R' in pick_origin:
-                            team_name = pick_origin.split(' R')[0]
-                        elif ' F/S' in pick_origin:
-                            team_name = pick_origin.split(' F/S')[0]
-                        else:
-                            team_name = None
-
-                        if team_name:
-                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
-                            orig_team = await cursor.fetchone()
-                            if orig_team:
-                                original_team_id = orig_team[0]
-
-                    # Fallback to current team if pick_origin parsing failed
-                    if not original_team_id:
-                        original_team_id = current_team[0] if current_team else None
-
-                    # Get player ID if selected
-                    player_id = None
-                    if pd.notna(row['Player_ID']) and row['Player_ID']:
+                    for _, row in lineups_df.iterrows():
+                        lineup_type = str(row['Type']).strip().lower()
+                        team_name = str(row['Team_Name'])
+                        position = str(row['Position']).strip()
                         player_id = int(row['Player_ID'])
+
                         # Verify player exists
                         cursor = await db.execute("SELECT player_id FROM players WHERE player_id = ?", (player_id,))
                         player = await cursor.fetchone()
                         if not player:
-                            player_id = None
-
-                    # Handle NaN values for numeric fields
-                    pick_id = int(row['Pick_ID']) if pd.notna(row['Pick_ID']) else None
-                    round_number = int(row['Round']) if pd.notna(row['Round']) else None
-                    pick_number = int(row['Pick']) if pd.notna(row['Pick']) else None
-                    draft_name = str(row['Draft_Name']) if pd.notna(row['Draft_Name']) else ''
-
-                    # Get season_number from draft_name if possible (format: "Season X National Draft")
-                    season_number = None
-                    if 'Season' in draft_name:
-                        try:
-                            # Extract season number from draft name (e.g., "Season 9 National Draft")
-                            season_str = draft_name.split('Season')[1].split()[0]
-                            # Draft is for season_number + 1 (Season 9 Draft is for Season 10)
-                            season_number = int(season_str) + 1
-                        except Exception:
-                            pass
-
-                    # Get or create draft_id
-                    draft_id = None
-                    if draft_name:
-                        cursor = await db.execute(
-                            "SELECT draft_id FROM drafts WHERE draft_name = ?",
-                            (draft_name,)
-                        )
-                        draft_result = await cursor.fetchone()
-
-                        if draft_result:
-                            draft_id = draft_result[0]
-                        else:
-                            # Create draft if it doesn't exist
-                            # Determine status based on whether pick_number is set
-                            draft_status = 'current' if pick_number is not None else 'future'
-                            cursor = await db.execute(
-                                """INSERT INTO drafts (draft_name, season_number, status, rounds)
-                                   VALUES (?, ?, ?, 4)""",
-                                (draft_name, season_number, draft_status)
-                            )
-                            draft_id = cursor.lastrowid
-
-                    if current_team and pick_id and draft_id:
-                        # Get passed and picked_at if they exist
-                        passed = int(row['Passed']) if 'Passed' in row and pd.notna(row['Passed']) else 0
-                        picked_at = str(row['Picked_At']) if 'Picked_At' in row and pd.notna(row['Picked_At']) and row['Picked_At'] else None
-
-                        # Use 0 for season_number if it's NULL/empty (manual drafts)
-                        season_num = season_number if pd.notna(season_number) and season_number else 0
-
-                        await db.execute(
-                            """INSERT INTO draft_picks
-                               (pick_id, draft_id, draft_name, season_number, round_number, pick_number,
-                                pick_origin, original_team_id, current_team_id, player_selected_id, passed, picked_at)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (pick_id, draft_id, draft_name, season_num, round_number, pick_number,
-                             pick_origin, original_team_id, current_team[0], player_id, passed, picked_at)
-                        )
-                        draft_picks_imported += 1
-
-                # Import Ladder Positions
-                ladder_positions_imported = 0
-                ladder_positions_df = pd.read_excel(excel_file, sheet_name='Ladder_Positions')
-
-                # Clear existing ladder positions
-                await db.execute("DELETE FROM ladder_positions")
-
-                for _, row in ladder_positions_df.iterrows():
-                    # Get season ID
-                    cursor = await db.execute("SELECT season_id FROM seasons WHERE season_number = ?", (int(row['Season']),))
-                    season = await cursor.fetchone()
-
-                    # Get team ID
-                    cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Team']),))
-                    team = await cursor.fetchone()
-
-                    if season and team:
-                        await db.execute(
-                            """INSERT INTO ladder_positions
-                               (ladder_id, season_id, team_id, position)
-                               VALUES (?, ?, ?, ?)""",
-                            (int(row['Ladder_ID']), season[0], team[0], int(row['Position']))
-                        )
-                        ladder_positions_imported += 1
-
-                # Import Compensation Chart (2D table format with individual ages/OVRs)
-                compensation_chart_imported = 0
-                compensation_chart_df = pd.read_excel(excel_file, sheet_name='Compensation_Chart')
-
-                # Clear existing compensation chart
-                await db.execute("DELETE FROM compensation_chart")
-
-                # Parse 2D table: first column is ages, other columns are individual OVRs
-                age_col = compensation_chart_df.columns[0]  # Should be "Age \ OVR" or similar
-                ovr_cols = compensation_chart_df.columns[1:]  # All other columns are OVR values
-
-                # Build a map of (age, ovr) -> band
-                cell_map = {}
-                for _, row in compensation_chart_df.iterrows():
-                    age_str = str(row[age_col]).strip()
-                    if not age_str or age_str == '' or age_str == 'nan':
-                        continue
-
-                    age = int(float(age_str))  # Convert through float first to handle "19.0" format
-
-                    # Process each OVR column
-                    for ovr_col in ovr_cols:
-                        band_value = row[ovr_col]
-                        if pd.isna(band_value) or band_value == '':
                             continue
 
-                        band = int(float(band_value))  # Convert through float first
-                        # Column name might be int or string
-                        try:
-                            ovr = int(ovr_col)
-                        except Exception:
-                            ovr = int(float(str(ovr_col)))  # Handle string column names
-                        cell_map[(age, ovr)] = band
+                        # Get team ID
+                        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
+                        team = await cursor.fetchone()
+                        if not team:
+                            continue
 
-                # Check if we parsed any data
-                if not cell_map:
-                    errors.append("Compensation Chart: No valid data found in sheet. Check that cells contain numeric values for bands.")
-
-                # Group consecutive cells with same band into ranges
-                # Process by band number
-                bands = set(cell_map.values())
-                for band in sorted(bands):
-                    # Get all cells for this band
-                    band_cells = {k for k, v in cell_map.items() if v == band}
-
-                    # Group by age, then find consecutive OVR ranges
-                    age_groups = {}
-                    for age, ovr in band_cells:
-                        if age not in age_groups:
-                            age_groups[age] = []
-                        age_groups[age].append(ovr)
-
-                    # For each age, find consecutive OVR ranges
-                    for age, ovrs in age_groups.items():
-                        ovrs = sorted(ovrs)
-                        # Find consecutive ranges
-                        ranges = []
-                        start = ovrs[0]
-                        prev = ovrs[0]
-
-                        for ovr in ovrs[1:]:
-                            if ovr == prev + 1:
-                                prev = ovr
+                        if lineup_type == 'current':
+                            position_upper = position.upper()
+                            if position_upper in valid_lineup_positions:
+                                slot_number = valid_lineup_positions.index(position_upper) + 1
+                                await db.execute(
+                                    """INSERT OR REPLACE INTO lineups (team_id, player_id, slot_number, position_name)
+                                       VALUES (?, ?, ?, ?)""",
+                                    (team[0], player_id, slot_number, position_upper)
+                                )
+                                current_lineups_imported += 1
                             else:
-                                ranges.append((start, prev))
-                                start = ovr
-                                prev = ovr
-                        ranges.append((start, prev))
+                                errors.append(f"Current lineup: Invalid position '{position}' for Player_ID {player_id}")
 
-                        # Insert each range
-                        for min_ovr, max_ovr in ranges:
+                        elif lineup_type == 'starting':
+                            if team_name not in team_starting_lineups:
+                                team_starting_lineups[team_name] = {}
+                            team_starting_lineups[team_name][position] = player_id
+
+                    # Insert/update starting lineups for each team
+                    for team_name, lineup_dict in team_starting_lineups.items():
+                        # Get team ID
+                        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
+                        team = await cursor.fetchone()
+
+                        if team:
+                            lineup_json = json.dumps(lineup_dict)
                             await db.execute(
-                                """INSERT INTO compensation_chart (min_age, max_age, min_ovr, max_ovr, compensation_band)
-                                   VALUES (?, ?, ?, ?, ?)""",
-                                (age, age, min_ovr, max_ovr if max_ovr != min_ovr else None, band)
+                                """INSERT OR REPLACE INTO starting_lineups (team_id, lineup_data, last_updated)
+                                   VALUES (?, ?, CURRENT_TIMESTAMP)""",
+                                (team[0], lineup_json)
                             )
-                            compensation_chart_imported += 1
+                            starting_lineups_imported += 1
 
-                # Import Contract Config
-                contract_config_imported = 0
-                contract_config_df = pd.read_excel(excel_file, sheet_name='Contract_Config')
+                    # Import Seasons
+                    seasons_imported = 0
+                seasons_df = _read_optional_sheet(excel_file, 'Seasons', found=sheets_imported, missing=sheets_skipped)
+                if seasons_df is not None:
+                    for _, row in seasons_df.iterrows():
+                        await db.execute(
+                            """INSERT OR REPLACE INTO seasons
+                               (season_number, current_round, regular_rounds, total_rounds, round_name, status)
+                               VALUES (?, ?, ?, ?, ?, ?)""",
+                            (int(row['Season']), int(row['Current_Round']), int(row['Regular_Rounds']),
+                             int(row['Total_Rounds']), str(row['Round_Name']), str(row['Status']))
+                        )
+                        seasons_imported += 1
 
-                # Clear existing contract config
-                await db.execute("DELETE FROM contract_config")
+                    # Import Injuries (calculate recovery_rounds from injury_round and return_round)
+                    injuries_imported = 0
+                injuries_df = _read_optional_sheet(excel_file, 'Injuries', found=sheets_imported, missing=sheets_skipped)
+                if injuries_df is not None:
 
-                for _, row in contract_config_df.iterrows():
-                    # Skip empty rows
-                    if pd.isna(row['Min_Age']) or row['Min_Age'] == '':
-                        continue
+                    # Clear existing injuries before importing to avoid duplicates
+                    await db.execute("DELETE FROM injuries")
 
-                    min_age = int(row['Min_Age'])
-                    # Blank Max_Age means "no upper bound" - use 99 rather than NULL so the
-                    # UNIQUE(min_age, max_age) constraint can actually detect duplicates
-                    max_age = int(row['Max_Age']) if pd.notna(row['Max_Age']) and row['Max_Age'] != '' else 99
-                    contract_years = int(row['Contract_Years'])
+                    for _, row in injuries_df.iterrows():
+                        # Find player by ID
+                        player_id = int(row['Player_ID'])
+                        cursor = await db.execute("SELECT player_id FROM players WHERE player_id = ?", (player_id,))
+                        player = await cursor.fetchone()
+                        if player:
+                            injury_round = int(row['Injury_Round'])
+                            # Return_Round can be blank - recovery length still
+                            # TBC (see season_commands.py's
+                            # _roll_pending_injury_recoveries), not yet rolled
+                            # at export time. Preserve that through the
+                            # round-trip rather than crashing on int(NaN).
+                            if pd.notna(row['Return_Round']):
+                                return_round = int(row['Return_Round'])
+                                recovery_rounds = return_round - injury_round
+                            else:
+                                return_round = None
+                                recovery_rounds = None
+                            await db.execute(
+                                """INSERT INTO injuries
+                                   (player_id, injury_type, injury_round, recovery_rounds, return_round, status)
+                                   VALUES (?, ?, ?, ?, ?, 'injured')""",
+                                (player_id, str(row['Injury_Type']), injury_round,
+                                 recovery_rounds, return_round)
+                            )
+                            injuries_imported += 1
 
-                    await db.execute(
-                        """INSERT INTO contract_config (min_age, max_age, contract_years)
-                           VALUES (?, ?, ?)""",
-                        (min_age, max_age, contract_years)
+                    # Import Suspensions
+                    suspensions_imported = 0
+                suspensions_df = _read_optional_sheet(excel_file, 'Suspensions', found=sheets_imported, missing=sheets_skipped)
+                if suspensions_df is not None:
+
+                    # Clear existing suspensions before importing to avoid duplicates
+                    await db.execute("DELETE FROM suspensions")
+
+                    for _, row in suspensions_df.iterrows():
+                        # Find player by ID
+                        player_id = int(row['Player_ID'])
+                        cursor = await db.execute("SELECT player_id FROM players WHERE player_id = ?", (player_id,))
+                        player = await cursor.fetchone()
+                        if player:
+                            suspension_round = int(row['Suspension_Round'])
+                            # Older export files predate Games_Missed/Games_Remaining
+                            # (they had Return_Round instead) - fall back to
+                            # deriving from Return_Round if present, else assume
+                            # the suspension is fully unserved. A blank
+                            # Games_Missed cell in a CURRENT-format file (the
+                            # Games_Missed column exists but this row's value is
+                            # NaN) means a report-driven suspension that was
+                            # still TBC at export time (see
+                            # season_commands.py's _roll_pending_report_suspensions)
+                            # - preserved as NULL/NULL rather than coerced to 0,
+                            # so it still needs rolling after import instead of
+                            # silently reading as "already served".
+                            games_missed_col_exists = 'Games_Missed' in suspensions_df.columns
+                            if games_missed_col_exists and not pd.isna(row['Games_Missed']):
+                                games_missed = int(row['Games_Missed'])
+                            elif games_missed_col_exists:
+                                games_missed = None
+                            elif 'Return_Round' in suspensions_df.columns:
+                                games_missed = int(row['Return_Round']) - suspension_round
+                            else:
+                                games_missed = 0
+
+                            if games_missed is None:
+                                games_remaining = None
+                            elif 'Games_Remaining' in suspensions_df.columns and not pd.isna(row['Games_Remaining']):
+                                games_remaining = int(row['Games_Remaining'])
+                            else:
+                                games_remaining = games_missed
+
+                            await db.execute(
+                                """INSERT INTO suspensions
+                                   (player_id, suspension_round, games_missed, games_remaining, suspension_reason, status)
+                                   VALUES (?, ?, ?, ?, ?, 'suspended')""",
+                                (player_id, suspension_round, games_missed,
+                                 games_remaining, str(row['Reason']))
+                            )
+                            suspensions_imported += 1
+
+                    # Import Trades
+                    trades_imported = 0
+                trades_df = _read_optional_sheet(excel_file, 'Trades', found=sheets_imported, missing=sheets_skipped, dtype={'Created_By_User_ID': str, 'Responded_By_User_ID': str, 'Approved_By_User_ID': str})
+                if trades_df is not None:
+
+                    # Clear existing trades
+                    await db.execute("DELETE FROM trades")
+                    for _, row in trades_df.iterrows():
+                        # Get team IDs
+                        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Initiating_Team']),))
+                        init_team = await cursor.fetchone()
+                        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Receiving_Team']),))
+                        recv_team = await cursor.fetchone()
+
+                        if init_team and recv_team:
+                            original_trade_id = int(row['Original_Trade_ID']) if pd.notna(row['Original_Trade_ID']) and row['Original_Trade_ID'] else None
+                            created_by = str(row['Created_By_User_ID']) if pd.notna(row['Created_By_User_ID']) and row['Created_By_User_ID'] else None
+                            responded_by = str(row['Responded_By_User_ID']) if pd.notna(row['Responded_By_User_ID']) and row['Responded_By_User_ID'] else None
+                            approved_by = str(row['Approved_By_User_ID']) if pd.notna(row['Approved_By_User_ID']) and row['Approved_By_User_ID'] else None
+                            created_at = str(row['Created_At']) if pd.notna(row['Created_At']) and row['Created_At'] else None
+                            responded_at = str(row['Responded_At']) if pd.notna(row['Responded_At']) and row['Responded_At'] else None
+                            approved_at = str(row['Approved_At']) if pd.notna(row['Approved_At']) and row['Approved_At'] else None
+
+                            # Initiating_Picks/Receiving_Picks may be absent in files exported
+                            # before these columns were added - default to '' for older files
+                            initiating_picks = str(row['Initiating_Picks']) if 'Initiating_Picks' in row and pd.notna(row['Initiating_Picks']) else ''
+                            receiving_picks = str(row['Receiving_Picks']) if 'Receiving_Picks' in row and pd.notna(row['Receiving_Picks']) else ''
+
+                            await db.execute(
+                                """INSERT INTO trades
+                                   (trade_id, initiating_team_id, receiving_team_id, initiating_players, receiving_players,
+                                    initiating_picks, receiving_picks, status, created_at, responded_at, approved_at,
+                                    created_by_user_id, responded_by_user_id, approved_by_user_id, original_trade_id)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (int(row['Trade_ID']), init_team[0], recv_team[0], str(row['Initiating_Players']),
+                                 str(row['Receiving_Players']), initiating_picks, receiving_picks,
+                                 str(row['Status']), created_at, responded_at, approved_at, created_by, responded_by, approved_by, original_trade_id)
+                            )
+                            trades_imported += 1
+
+                    # Import Settings
+                    settings_imported = 0
+                settings_df = _read_optional_sheet(excel_file, 'Settings', found=sheets_imported, missing=sheets_skipped, dtype={'Setting_Value': str})
+                if settings_df is not None:
+                    for _, row in settings_df.iterrows():
+                        setting_value = str(row['Setting_Value']) if pd.notna(row['Setting_Value']) and row['Setting_Value'] else None
+                        await db.execute(
+                            """INSERT OR REPLACE INTO settings (setting_key, setting_value)
+                               VALUES (?, ?)""",
+                            (str(row['Setting_Key']), setting_value)
+                        )
+                        settings_imported += 1
+
+                    # Import Matches - fixtures as well as results. Rows WITH a
+                    # Match_ID keep that exact ID (so player_match_stats rows
+                    # that reference an already-simulated match stay linked);
+                    # rows with Match_ID left BLANK are added as new fixture
+                    # entries, same "blank ID = new row" convention as Players.
+                    # Home_Score/Away_Score/Simulated default to an unplayed
+                    # fixture (0/0/False) when left blank, so a new fixture row
+                    # only needs Season/Round/Home_Team/Away_Team filled in.
+                    matches_added = 0
+                    matches_updated = 0
+                matches_df = _read_optional_sheet(excel_file, 'Matches', found=sheets_imported, missing=sheets_skipped)
+                if matches_df is not None:
+
+                    await db.execute("DELETE FROM matches")
+
+                    for _, row in matches_df.iterrows():
+                        if row.isna().all():
+                            continue
+
+                        # Season/Round are required - no sensible default for a
+                        # fixture row - so skip (rather than crash on int(NaN))
+                        # if either is left blank.
+                        if pd.isna(row.get('Season')) or pd.isna(row.get('Round')):
+                            errors.append(f"Matches: row skipped - Season and Round are both required (Home_Team={row.get('Home_Team')}, Away_Team={row.get('Away_Team')})")
+                            continue
+
+                        cursor = await db.execute("SELECT season_id FROM seasons WHERE season_number = ?", (int(row['Season']),))
+                        season = await cursor.fetchone()
+
+                        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Home_Team']),))
+                        home_team = await cursor.fetchone()
+
+                        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Away_Team']),))
+                        away_team = await cursor.fetchone()
+
+                        if not (season and home_team and away_team):
+                            problems = []
+                            if not season:
+                                problems.append(f"Season '{row['Season']}' not found")
+                            if not home_team:
+                                problems.append(f"Home_Team '{row['Home_Team']}' not found")
+                            if not away_team:
+                                problems.append(f"Away_Team '{row['Away_Team']}' not found")
+                            errors.append(f"Matches: row skipped - {'; '.join(problems)}")
+                            continue
+
+                        home_score = int(row['Home_Score']) if 'Home_Score' in matches_df.columns and pd.notna(row['Home_Score']) else 0
+                        away_score = int(row['Away_Score']) if 'Away_Score' in matches_df.columns and pd.notna(row['Away_Score']) else 0
+                        simulated = int(bool(row['Simulated'])) if 'Simulated' in matches_df.columns and pd.notna(row['Simulated']) else 0
+
+                        match_id = None
+                        if 'Match_ID' in matches_df.columns and pd.notna(row['Match_ID']):
+                            match_id = int(row['Match_ID'])
+
+                        if match_id is not None:
+                            await db.execute(
+                                """INSERT INTO matches
+                                   (match_id, season_id, round_number, home_team_id, away_team_id, home_score, away_score, simulated)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (match_id, season[0], int(row['Round']), home_team[0], away_team[0],
+                                 home_score, away_score, simulated)
+                            )
+                            matches_updated += 1
+                        else:
+                            await db.execute(
+                                """INSERT INTO matches
+                                   (season_id, round_number, home_team_id, away_team_id, home_score, away_score, simulated)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                (season[0], int(row['Round']), home_team[0], away_team[0],
+                                 home_score, away_score, simulated)
+                            )
+                            matches_added += 1
+
+                    matches_imported = matches_added + matches_updated
+
+                    # Import Player_Match_Stats - full replace, same as every
+                    # other sheet (Injuries/Suspensions/etc): the sheet's
+                    # contents entirely replace what's in the table. No ID
+                    # preservation needed (nothing references stat_id as a FK),
+                    # so this is just DELETE then re-insert whatever rows are
+                    # present, resolving Match_ID/Player_ID/Team. Since Matches
+                    # was just fully replaced above, this also means reimporting
+                    # an OLD Matches sheet alongside an OLD (or empty)
+                    # Player_Match_Stats sheet naturally resets accumulated
+                    # match stats back to that snapshot too - matches this
+                    # sheet's real use case (undoing a round of test-season
+                    # simulation by reimporting an earlier data file).
+                    player_match_stats_imported = 0
+                player_match_stats_df = _read_optional_sheet(excel_file, 'Player_Match_Stats', found=sheets_imported, missing=sheets_skipped)
+                if player_match_stats_df is not None:
+
+                    await db.execute("DELETE FROM player_match_stats")
+
+                    for _, row in player_match_stats_df.iterrows():
+                        if row.isna().all():
+                            continue
+
+                        if pd.isna(row.get('Match_ID')) or pd.isna(row.get('Player_ID')):
+                            errors.append(f"Player_Match_Stats: row skipped - Match_ID and Player_ID are both required (Player_Name={row.get('Player_Name')})")
+                            continue
+
+                        match_id = int(row['Match_ID'])
+                        player_id = int(row['Player_ID'])
+
+                        cursor = await db.execute("SELECT 1 FROM matches WHERE match_id = ?", (match_id,))
+                        match_exists = await cursor.fetchone()
+                        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row.get('Team')),))
+                        team = await cursor.fetchone()
+
+                        if not (match_exists and team):
+                            problems = []
+                            if not match_exists:
+                                problems.append(f"Match_ID {match_id} not found")
+                            if not team:
+                                problems.append(f"Team '{row.get('Team')}' not found")
+                            errors.append(f"Player_Match_Stats: row skipped - {'; '.join(problems)}")
+                            continue
+
+                        disposals = int(row['Disposals']) if 'Disposals' in player_match_stats_df.columns and pd.notna(row['Disposals']) else 0
+                        goals = int(row['Goals']) if 'Goals' in player_match_stats_df.columns and pd.notna(row['Goals']) else 0
+                        behinds = int(row['Behinds']) if 'Behinds' in player_match_stats_df.columns and pd.notna(row['Behinds']) else 0
+                        marks = int(row['Marks']) if 'Marks' in player_match_stats_df.columns and pd.notna(row['Marks']) else 0
+                        tackles = int(row['Tackles']) if 'Tackles' in player_match_stats_df.columns and pd.notna(row['Tackles']) else 0
+                        spoils = int(row['Spoils']) if 'Spoils' in player_match_stats_df.columns and pd.notna(row['Spoils']) else 0
+                        hitouts = int(row['Hitouts']) if 'Hitouts' in player_match_stats_df.columns and pd.notna(row['Hitouts']) else 0
+                        # Older export files predate Brownlow_Votes/Best_Fairest_Votes -
+                        # default to 0 rather than failing the import.
+                        brownlow_votes = int(row['Brownlow_Votes']) if 'Brownlow_Votes' in player_match_stats_df.columns and pd.notna(row['Brownlow_Votes']) else 0
+                        best_fairest_votes = int(row['Best_Fairest_Votes']) if 'Best_Fairest_Votes' in player_match_stats_df.columns and pd.notna(row['Best_Fairest_Votes']) else 0
+
+                        await db.execute(
+                            """INSERT INTO player_match_stats
+                               (match_id, player_id, team_id, disposals, goals, behinds, marks, tackles, spoils, hitouts, brownlow_votes, best_fairest_votes)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (match_id, player_id, team[0], disposals, goals, behinds, marks, tackles, spoils, hitouts, brownlow_votes, best_fairest_votes)
+                        )
+                        player_match_stats_imported += 1
+
+                    # Import Drafts (full replace, same as Players/Draft_Picks: rows with a
+                    # Draft_ID keep that exact ID so draft_picks stay linked; rows with
+                    # Draft_ID left blank become new drafts; omitted rows are deleted)
+                    drafts_imported = 0
+                drafts_df = _read_optional_sheet(excel_file, 'Drafts', found=sheets_imported, missing=sheets_skipped)
+                if drafts_df is not None:
+
+                    await db.execute("DELETE FROM drafts")
+
+                    for _, row in drafts_df.iterrows():
+                        # Skip fully blank rows
+                        if row.isna().all() or not str(row.get('Draft_Name', '')).strip():
+                            continue
+
+                        draft_id = int(row['Draft_ID']) if pd.notna(row['Draft_ID']) else None
+                        draft_name = str(row['Draft_Name']).strip()
+                        season_number = int(row['Season_Number']) if pd.notna(row['Season_Number']) else None
+                        status = str(row['Status']) if pd.notna(row['Status']) and row['Status'] else 'future'
+                        rounds = int(row['Rounds']) if pd.notna(row['Rounds']) else 4
+                        rookie_contract_years = int(row['Rookie_Contract_Years']) if pd.notna(row['Rookie_Contract_Years']) else 3
+                        created_at = str(row['Created_At']) if pd.notna(row['Created_At']) and row['Created_At'] else None
+                        ladder_set_at = str(row['Ladder_Set_At']) if pd.notna(row['Ladder_Set_At']) and row['Ladder_Set_At'] else None
+                        started_at = str(row['Started_At']) if 'Started_At' in row and pd.notna(row['Started_At']) and row['Started_At'] else None
+                        completed_at = str(row['Completed_At']) if 'Completed_At' in row and pd.notna(row['Completed_At']) and row['Completed_At'] else None
+                        current_pick_number = int(row['Current_Pick_Number']) if 'Current_Pick_Number' in row and pd.notna(row['Current_Pick_Number']) else 0
+
+                        if draft_id is not None:
+                            # Re-insert with the same ID so draft_picks referencing this draft stay linked
+                            await db.execute(
+                                """INSERT INTO drafts
+                                   (draft_id, draft_name, season_number, status, rounds, rookie_contract_years,
+                                    created_at, ladder_set_at, started_at, completed_at, current_pick_number)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (draft_id, draft_name, season_number, status, rounds, rookie_contract_years,
+                                 created_at, ladder_set_at, started_at, completed_at, current_pick_number)
+                            )
+                        else:
+                            # No Draft_ID - new draft, let SQLite assign the next ID
+                            await db.execute(
+                                """INSERT INTO drafts
+                                   (draft_name, season_number, status, rounds, rookie_contract_years,
+                                    created_at, ladder_set_at, started_at, completed_at, current_pick_number)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (draft_name, season_number, status, rounds, rookie_contract_years,
+                                 created_at, ladder_set_at, started_at, completed_at, current_pick_number)
+                            )
+                        drafts_imported += 1
+
+                    # Import Draft Picks
+                    draft_picks_imported = 0
+                draft_picks_df = _read_optional_sheet(excel_file, 'Draft_Picks', found=sheets_imported, missing=sheets_skipped)
+                if draft_picks_df is not None:
+
+                    # Clear existing draft picks before importing to avoid duplicates
+                    await db.execute("DELETE FROM draft_picks")
+
+                    for _, row in draft_picks_df.iterrows():
+                        # Get current team ID
+                        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Current_Team']),))
+                        current_team = await cursor.fetchone()
+
+                        # Parse original_team_id from pick_origin
+                        original_team_id = None
+                        pick_origin = str(row['Pick_Origin']) if pd.notna(row['Pick_Origin']) and row['Pick_Origin'] else ''
+                        if pick_origin:
+                            # Parse pick_origin format: "Team Name R1" or "Team Name F/S Match"
+                            if ' R' in pick_origin:
+                                team_name = pick_origin.split(' R')[0]
+                            elif ' F/S' in pick_origin:
+                                team_name = pick_origin.split(' F/S')[0]
+                            else:
+                                team_name = None
+
+                            if team_name:
+                                cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
+                                orig_team = await cursor.fetchone()
+                                if orig_team:
+                                    original_team_id = orig_team[0]
+
+                        # Fallback to current team if pick_origin parsing failed
+                        if not original_team_id:
+                            original_team_id = current_team[0] if current_team else None
+
+                        # Get player ID if selected
+                        player_id = None
+                        if pd.notna(row['Player_ID']) and row['Player_ID']:
+                            player_id = int(row['Player_ID'])
+                            # Verify player exists
+                            cursor = await db.execute("SELECT player_id FROM players WHERE player_id = ?", (player_id,))
+                            player = await cursor.fetchone()
+                            if not player:
+                                player_id = None
+
+                        # Handle NaN values for numeric fields
+                        pick_id = int(row['Pick_ID']) if pd.notna(row['Pick_ID']) else None
+                        round_number = int(row['Round']) if pd.notna(row['Round']) else None
+                        pick_number = int(row['Pick']) if pd.notna(row['Pick']) else None
+                        draft_name = str(row['Draft_Name']) if pd.notna(row['Draft_Name']) else ''
+
+                        # Get season_number from draft_name if possible (format: "Season X National Draft")
+                        season_number = None
+                        if 'Season' in draft_name:
+                            try:
+                                # Extract season number from draft name (e.g., "Season 9 National Draft")
+                                season_str = draft_name.split('Season')[1].split()[0]
+                                # Draft is for season_number + 1 (Season 9 Draft is for Season 10)
+                                season_number = int(season_str) + 1
+                            except Exception:
+                                pass
+
+                        # Get or create draft_id
+                        draft_id = None
+                        if draft_name:
+                            cursor = await db.execute(
+                                "SELECT draft_id FROM drafts WHERE draft_name = ?",
+                                (draft_name,)
+                            )
+                            draft_result = await cursor.fetchone()
+
+                            if draft_result:
+                                draft_id = draft_result[0]
+                            else:
+                                # Create draft if it doesn't exist
+                                # Determine status based on whether pick_number is set
+                                draft_status = 'current' if pick_number is not None else 'future'
+                                cursor = await db.execute(
+                                    """INSERT INTO drafts (draft_name, season_number, status, rounds)
+                                       VALUES (?, ?, ?, 4)""",
+                                    (draft_name, season_number, draft_status)
+                                )
+                                draft_id = cursor.lastrowid
+
+                        if current_team and pick_id and draft_id:
+                            # Get passed and picked_at if they exist
+                            passed = int(row['Passed']) if 'Passed' in row and pd.notna(row['Passed']) else 0
+                            picked_at = str(row['Picked_At']) if 'Picked_At' in row and pd.notna(row['Picked_At']) and row['Picked_At'] else None
+
+                            # Use 0 for season_number if it's NULL/empty (manual drafts)
+                            season_num = season_number if pd.notna(season_number) and season_number else 0
+
+                            await db.execute(
+                                """INSERT INTO draft_picks
+                                   (pick_id, draft_id, draft_name, season_number, round_number, pick_number,
+                                    pick_origin, original_team_id, current_team_id, player_selected_id, passed, picked_at)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (pick_id, draft_id, draft_name, season_num, round_number, pick_number,
+                                 pick_origin, original_team_id, current_team[0], player_id, passed, picked_at)
+                            )
+                            draft_picks_imported += 1
+
+                    # Import Ladder Positions
+                    ladder_positions_imported = 0
+                ladder_positions_df = _read_optional_sheet(excel_file, 'Ladder_Positions', found=sheets_imported, missing=sheets_skipped)
+                if ladder_positions_df is not None:
+
+                    # Clear existing ladder positions
+                    await db.execute("DELETE FROM ladder_positions")
+
+                    for _, row in ladder_positions_df.iterrows():
+                        # Get season ID
+                        cursor = await db.execute("SELECT season_id FROM seasons WHERE season_number = ?", (int(row['Season']),))
+                        season = await cursor.fetchone()
+
+                        # Get team ID
+                        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (str(row['Team']),))
+                        team = await cursor.fetchone()
+
+                        if season and team:
+                            await db.execute(
+                                """INSERT INTO ladder_positions
+                                   (ladder_id, season_id, team_id, position)
+                                   VALUES (?, ?, ?, ?)""",
+                                (int(row['Ladder_ID']), season[0], team[0], int(row['Position']))
+                            )
+                            ladder_positions_imported += 1
+
+                    # Import Compensation Chart (2D table format with individual ages/OVRs)
+                    compensation_chart_imported = 0
+                compensation_chart_df = _read_optional_sheet(excel_file, 'Compensation_Chart', found=sheets_imported, missing=sheets_skipped)
+                if compensation_chart_df is not None:
+
+                    # Clear existing compensation chart
+                    await db.execute("DELETE FROM compensation_chart")
+
+                    # Parse 2D table: first column is ages, other columns are individual OVRs
+                    age_col = compensation_chart_df.columns[0]  # Should be "Age \ OVR" or similar
+                    ovr_cols = compensation_chart_df.columns[1:]  # All other columns are OVR values
+
+                    # Build a map of (age, ovr) -> band
+                    cell_map = {}
+                    for _, row in compensation_chart_df.iterrows():
+                        age_str = str(row[age_col]).strip()
+                        if not age_str or age_str == '' or age_str == 'nan':
+                            continue
+
+                        age = int(float(age_str))  # Convert through float first to handle "19.0" format
+
+                        # Process each OVR column
+                        for ovr_col in ovr_cols:
+                            band_value = row[ovr_col]
+                            if pd.isna(band_value) or band_value == '':
+                                continue
+
+                            band = int(float(band_value))  # Convert through float first
+                            # Column name might be int or string
+                            try:
+                                ovr = int(ovr_col)
+                            except Exception:
+                                ovr = int(float(str(ovr_col)))  # Handle string column names
+                            cell_map[(age, ovr)] = band
+
+                    # Check if we parsed any data
+                    if not cell_map:
+                        errors.append("Compensation Chart: No valid data found in sheet. Check that cells contain numeric values for bands.")
+
+                    # Group consecutive cells with same band into ranges
+                    # Process by band number
+                    bands = set(cell_map.values())
+                    for band in sorted(bands):
+                        # Get all cells for this band
+                        band_cells = {k for k, v in cell_map.items() if v == band}
+
+                        # Group by age, then find consecutive OVR ranges
+                        age_groups = {}
+                        for age, ovr in band_cells:
+                            if age not in age_groups:
+                                age_groups[age] = []
+                            age_groups[age].append(ovr)
+
+                        # For each age, find consecutive OVR ranges
+                        for age, ovrs in age_groups.items():
+                            ovrs = sorted(ovrs)
+                            # Find consecutive ranges
+                            ranges = []
+                            start = ovrs[0]
+                            prev = ovrs[0]
+
+                            for ovr in ovrs[1:]:
+                                if ovr == prev + 1:
+                                    prev = ovr
+                                else:
+                                    ranges.append((start, prev))
+                                    start = ovr
+                                    prev = ovr
+                            ranges.append((start, prev))
+
+                            # Insert each range
+                            for min_ovr, max_ovr in ranges:
+                                await db.execute(
+                                    """INSERT INTO compensation_chart (min_age, max_age, min_ovr, max_ovr, compensation_band)
+                                       VALUES (?, ?, ?, ?, ?)""",
+                                    (age, age, min_ovr, max_ovr if max_ovr != min_ovr else None, band)
+                                )
+                                compensation_chart_imported += 1
+
+                    # Import Contract Config
+                    contract_config_imported = 0
+                contract_config_df = _read_optional_sheet(excel_file, 'Contract_Config', found=sheets_imported, missing=sheets_skipped)
+                if contract_config_df is not None:
+
+                    # Clear existing contract config
+                    await db.execute("DELETE FROM contract_config")
+
+                    for _, row in contract_config_df.iterrows():
+                        # Skip empty rows
+                        if pd.isna(row['Min_Age']) or row['Min_Age'] == '':
+                            continue
+
+                        min_age = int(row['Min_Age'])
+                        # Blank Max_Age means "no upper bound" - use 99 rather than NULL so the
+                        # UNIQUE(min_age, max_age) constraint can actually detect duplicates
+                        max_age = int(row['Max_Age']) if pd.notna(row['Max_Age']) and row['Max_Age'] != '' else 99
+                        contract_years = int(row['Contract_Years'])
+
+                        await db.execute(
+                            """INSERT INTO contract_config (min_age, max_age, contract_years)
+                               VALUES (?, ?, ?)""",
+                            (min_age, max_age, contract_years)
+                        )
+                        contract_config_imported += 1
+
+                    # Import Draft Value Index
+                    draft_value_index_imported = 0
+                draft_value_index_df = _read_optional_sheet(excel_file, 'Draft_Value_Index', found=sheets_imported, missing=sheets_skipped)
+                if draft_value_index_df is not None:
+
+                    # Clear existing draft value index
+                    await db.execute("DELETE FROM draft_value_index")
+
+                    for _, row in draft_value_index_df.iterrows():
+                        # Skip empty rows
+                        if pd.isna(row['Pick_Number']) or row['Pick_Number'] == '':
+                            continue
+
+                        pick_number = int(row['Pick_Number'])
+                        points_value = int(row['Points_Value'])
+
+                        await db.execute(
+                            """INSERT INTO draft_value_index (pick_number, points_value)
+                               VALUES (?, ?)""",
+                            (pick_number, points_value)
+                        )
+                        draft_value_index_imported += 1
+
+                    # Note: the free agency period is now imported via the Settings sheet
+                    # (fa_period_status / fa_period_season / fa_period_auction_points)
+
+                    # Import Free Agency Bids (optional - clears existing bids)
+                    free_agency_bids_imported = 0
+                free_agency_bids_df = _read_optional_sheet(excel_file, 'Free_Agency_Bids', found=sheets_imported, missing=sheets_skipped)
+                if free_agency_bids_df is not None:
+
+                    # Clear existing free agency bids
+                    await db.execute("DELETE FROM free_agency_bids")
+
+                    for _, row in free_agency_bids_df.iterrows():
+                        if pd.isna(row['Bid_ID']) or not row['Bid_ID']:
+                            continue
+
+                        bid_id = int(row['Bid_ID'])
+                        season_number = int(row['Season_Number'])
+                        team_name = str(row['Team'])
+                        player_id = int(row['Player_ID'])
+                        bid_amount = int(row['Bid_Amount'])
+                        status = str(row['Status'])
+                        placed_at = str(row['Placed_At']) if pd.notna(row['Placed_At']) and row['Placed_At'] else None
+
+                        # Get team_id from name and verify player_id exists
+                        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
+                        team = await cursor.fetchone()
+                        if not team:
+                            errors.append(f"Free Agency Bids: Team '{team_name}' not found")
+                            continue
+                        team_id = team[0]
+
+                        cursor = await db.execute("SELECT player_id FROM players WHERE player_id = ?", (player_id,))
+                        player = await cursor.fetchone()
+                        if not player:
+                            errors.append(f"Free Agency Bids: Player_ID '{player_id}' not found")
+                            continue
+
+                        await db.execute(
+                            """INSERT INTO free_agency_bids (bid_id, season_number, team_id, player_id, bid_amount, status, placed_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            (bid_id, season_number, team_id, player_id, bid_amount, status, placed_at)
+                        )
+                        free_agency_bids_imported += 1
+
+                    # Import Free Agency Re-Signs
+                    free_agency_resigns_imported = 0
+                free_agency_resigns_df = _read_optional_sheet(excel_file, 'Free_Agency_Re-Signs', found=sheets_imported, missing=sheets_skipped)
+                if free_agency_resigns_df is not None:
+
+                    # Clear existing free agency re-signs
+                    await db.execute("DELETE FROM free_agency_resigns")
+
+                    for _, row in free_agency_resigns_df.iterrows():
+                        if pd.isna(row['Resign_ID']) or not row['Resign_ID']:
+                            continue
+
+                        resign_id = int(row['Resign_ID'])
+                        season_number = int(row['Season_Number'])
+                        team_name = str(row['Team'])
+                        player_id = int(row['Player_ID'])
+                        confirmed = int(row['Confirmed']) if pd.notna(row['Confirmed']) else 0
+                        confirmed_at = str(row['Confirmed_At']) if pd.notna(row['Confirmed_At']) and row['Confirmed_At'] else None
+
+                        # Get team_id from name and verify player_id exists
+                        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
+                        team = await cursor.fetchone()
+                        if not team:
+                            errors.append(f"Free Agency Re-Sign: Team '{team_name}' not found")
+                            continue
+                        team_id = team[0]
+
+                        cursor = await db.execute("SELECT player_id FROM players WHERE player_id = ?", (player_id,))
+                        player = await cursor.fetchone()
+                        if not player:
+                            errors.append(f"Free Agency Re-Sign: Player_ID '{player_id}' not found")
+                            continue
+
+                        await db.execute(
+                            """INSERT INTO free_agency_resigns (resign_id, season_number, team_id, player_id, confirmed, confirmed_at)
+                               VALUES (?, ?, ?, ?, ?, ?)""",
+                            (resign_id, season_number, team_id, player_id, confirmed, confirmed_at)
+                        )
+                        free_agency_resigns_imported += 1
+
+                    # Import Free Agency Results
+                    free_agency_results_imported = 0
+                free_agency_results_df = _read_optional_sheet(excel_file, 'Free_Agency_Results', found=sheets_imported, missing=sheets_skipped)
+                if free_agency_results_df is not None:
+
+                    # Clear existing free agency results
+                    await db.execute("DELETE FROM free_agency_results")
+
+                    for _, row in free_agency_results_df.iterrows():
+                        if pd.isna(row['Result_ID']) or not row['Result_ID']:
+                            continue
+
+                        result_id = int(row['Result_ID'])
+                        season_number = int(row['Season_Number'])
+                        player_id = int(row['Player_ID'])
+                        original_team_name = str(row['Original_Team'])
+                        winning_team_name = str(row['Winning_Team']) if pd.notna(row['Winning_Team']) and row['Winning_Team'] else None
+                        winning_bid = int(row['Winning_Bid']) if pd.notna(row['Winning_Bid']) and row['Winning_Bid'] else None
+                        matched = int(row['Matched']) if pd.notna(row['Matched']) else 0
+                        compensation_band = int(row['Compensation_Band']) if pd.notna(row['Compensation_Band']) and row['Compensation_Band'] else None
+                        confirmed_at = str(row['Confirmed_At']) if pd.notna(row['Confirmed_At']) and row['Confirmed_At'] else None
+
+                        # Verify player_id exists and get team IDs from names
+                        cursor = await db.execute("SELECT player_id FROM players WHERE player_id = ?", (player_id,))
+                        player = await cursor.fetchone()
+                        if not player:
+                            errors.append(f"Free Agency Results: Player_ID '{player_id}' not found")
+                            continue
+
+                        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (original_team_name,))
+                        orig_team = await cursor.fetchone()
+                        if not orig_team:
+                            errors.append(f"Free Agency Results: Original team '{original_team_name}' not found")
+                            continue
+                        original_team_id = orig_team[0]
+
+                        winning_team_id = None
+                        if winning_team_name:
+                            cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (winning_team_name,))
+                            win_team = await cursor.fetchone()
+                            if win_team:
+                                winning_team_id = win_team[0]
+
+                        await db.execute(
+                            """INSERT INTO free_agency_results
+                               (result_id, season_number, player_id, original_team_id, winning_team_id, winning_bid, matched, compensation_band, confirmed_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (result_id, season_number, player_id, original_team_id, winning_team_id, winning_bid, matched, compensation_band, confirmed_at)
+                        )
+                        free_agency_results_imported += 1
+
+                    # All sheets processed successfully with no errors - commit the entire
+                    # import as a single atomic transaction. If anything above raised, this
+                    # line is never reached and aiosqlite rolls back all uncommitted writes
+                    # automatically when the "async with" block exits via exception.
+                # Nothing recognised in the workbook - almost certainly the
+                # wrong file rather than a deliberate no-op import, so say so
+                # instead of reporting a successful import of nothing.
+                if not sheets_imported:
+                    await interaction.followup.send(
+                        "❌ No recognised sheets found in that file - nothing was imported.\n"
+                        "Expected at least one of: " + ", ".join(sheets_skipped),
+                        ephemeral=True
                     )
-                    contract_config_imported += 1
+                    return
 
-                # Import Draft Value Index
-                draft_value_index_imported = 0
-                draft_value_index_df = pd.read_excel(excel_file, sheet_name='Draft_Value_Index')
-
-                # Clear existing draft value index
-                await db.execute("DELETE FROM draft_value_index")
-
-                for _, row in draft_value_index_df.iterrows():
-                    # Skip empty rows
-                    if pd.isna(row['Pick_Number']) or row['Pick_Number'] == '':
-                        continue
-
-                    pick_number = int(row['Pick_Number'])
-                    points_value = int(row['Points_Value'])
-
-                    await db.execute(
-                        """INSERT INTO draft_value_index (pick_number, points_value)
-                           VALUES (?, ?)""",
-                        (pick_number, points_value)
-                    )
-                    draft_value_index_imported += 1
-
-                # Note: the free agency period is now imported via the Settings sheet
-                # (fa_period_status / fa_period_season / fa_period_auction_points)
-
-                # Import Free Agency Bids (optional - clears existing bids)
-                free_agency_bids_imported = 0
-                free_agency_bids_df = pd.read_excel(excel_file, sheet_name='Free_Agency_Bids')
-
-                # Clear existing free agency bids
-                await db.execute("DELETE FROM free_agency_bids")
-
-                for _, row in free_agency_bids_df.iterrows():
-                    if pd.isna(row['Bid_ID']) or not row['Bid_ID']:
-                        continue
-
-                    bid_id = int(row['Bid_ID'])
-                    season_number = int(row['Season_Number'])
-                    team_name = str(row['Team'])
-                    player_id = int(row['Player_ID'])
-                    bid_amount = int(row['Bid_Amount'])
-                    status = str(row['Status'])
-                    placed_at = str(row['Placed_At']) if pd.notna(row['Placed_At']) and row['Placed_At'] else None
-
-                    # Get team_id from name and verify player_id exists
-                    cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
-                    team = await cursor.fetchone()
-                    if not team:
-                        errors.append(f"Free Agency Bids: Team '{team_name}' not found")
-                        continue
-                    team_id = team[0]
-
-                    cursor = await db.execute("SELECT player_id FROM players WHERE player_id = ?", (player_id,))
-                    player = await cursor.fetchone()
-                    if not player:
-                        errors.append(f"Free Agency Bids: Player_ID '{player_id}' not found")
-                        continue
-
-                    await db.execute(
-                        """INSERT INTO free_agency_bids (bid_id, season_number, team_id, player_id, bid_amount, status, placed_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                        (bid_id, season_number, team_id, player_id, bid_amount, status, placed_at)
-                    )
-                    free_agency_bids_imported += 1
-
-                # Import Free Agency Re-Signs
-                free_agency_resigns_imported = 0
-                free_agency_resigns_df = pd.read_excel(excel_file, sheet_name='Free_Agency_Re-Signs')
-
-                # Clear existing free agency re-signs
-                await db.execute("DELETE FROM free_agency_resigns")
-
-                for _, row in free_agency_resigns_df.iterrows():
-                    if pd.isna(row['Resign_ID']) or not row['Resign_ID']:
-                        continue
-
-                    resign_id = int(row['Resign_ID'])
-                    season_number = int(row['Season_Number'])
-                    team_name = str(row['Team'])
-                    player_id = int(row['Player_ID'])
-                    confirmed = int(row['Confirmed']) if pd.notna(row['Confirmed']) else 0
-                    confirmed_at = str(row['Confirmed_At']) if pd.notna(row['Confirmed_At']) and row['Confirmed_At'] else None
-
-                    # Get team_id from name and verify player_id exists
-                    cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (team_name,))
-                    team = await cursor.fetchone()
-                    if not team:
-                        errors.append(f"Free Agency Re-Sign: Team '{team_name}' not found")
-                        continue
-                    team_id = team[0]
-
-                    cursor = await db.execute("SELECT player_id FROM players WHERE player_id = ?", (player_id,))
-                    player = await cursor.fetchone()
-                    if not player:
-                        errors.append(f"Free Agency Re-Sign: Player_ID '{player_id}' not found")
-                        continue
-
-                    await db.execute(
-                        """INSERT INTO free_agency_resigns (resign_id, season_number, team_id, player_id, confirmed, confirmed_at)
-                           VALUES (?, ?, ?, ?, ?, ?)""",
-                        (resign_id, season_number, team_id, player_id, confirmed, confirmed_at)
-                    )
-                    free_agency_resigns_imported += 1
-
-                # Import Free Agency Results
-                free_agency_results_imported = 0
-                free_agency_results_df = pd.read_excel(excel_file, sheet_name='Free_Agency_Results')
-
-                # Clear existing free agency results
-                await db.execute("DELETE FROM free_agency_results")
-
-                for _, row in free_agency_results_df.iterrows():
-                    if pd.isna(row['Result_ID']) or not row['Result_ID']:
-                        continue
-
-                    result_id = int(row['Result_ID'])
-                    season_number = int(row['Season_Number'])
-                    player_id = int(row['Player_ID'])
-                    original_team_name = str(row['Original_Team'])
-                    winning_team_name = str(row['Winning_Team']) if pd.notna(row['Winning_Team']) and row['Winning_Team'] else None
-                    winning_bid = int(row['Winning_Bid']) if pd.notna(row['Winning_Bid']) and row['Winning_Bid'] else None
-                    matched = int(row['Matched']) if pd.notna(row['Matched']) else 0
-                    compensation_band = int(row['Compensation_Band']) if pd.notna(row['Compensation_Band']) and row['Compensation_Band'] else None
-                    confirmed_at = str(row['Confirmed_At']) if pd.notna(row['Confirmed_At']) and row['Confirmed_At'] else None
-
-                    # Verify player_id exists and get team IDs from names
-                    cursor = await db.execute("SELECT player_id FROM players WHERE player_id = ?", (player_id,))
-                    player = await cursor.fetchone()
-                    if not player:
-                        errors.append(f"Free Agency Results: Player_ID '{player_id}' not found")
-                        continue
-
-                    cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (original_team_name,))
-                    orig_team = await cursor.fetchone()
-                    if not orig_team:
-                        errors.append(f"Free Agency Results: Original team '{original_team_name}' not found")
-                        continue
-                    original_team_id = orig_team[0]
-
-                    winning_team_id = None
-                    if winning_team_name:
-                        cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = ?", (winning_team_name,))
-                        win_team = await cursor.fetchone()
-                        if win_team:
-                            winning_team_id = win_team[0]
-
-                    await db.execute(
-                        """INSERT INTO free_agency_results
-                           (result_id, season_number, player_id, original_team_id, winning_team_id, winning_bid, matched, compensation_band, confirmed_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (result_id, season_number, player_id, original_team_id, winning_team_id, winning_bid, matched, compensation_band, confirmed_at)
-                    )
-                    free_agency_results_imported += 1
-
-                # All sheets processed successfully with no errors - commit the entire
-                # import as a single atomic transaction. If anything above raised, this
-                # line is never reached and aiosqlite rolls back all uncommitted writes
-                # automatically when the "async with" block exits via exception.
                 await db.commit()
 
-            # Build response
+            # Build response. Teams/Players are reported only when their sheet
+            # was actually present - every other line is already conditional on
+            # its own counter, and a "0 added, 0 updated" line for a sheet that
+            # was never in the file would read as though it had been wiped.
             response = "✅ **Import Complete!**\n\n"
-            response += f"**Teams:** {teams_added} added, {teams_updated} updated\n"
-            response += f"**Players:** {players_added} added, {players_updated} updated, {players_deleted} deleted\n"
+            if 'Teams' in sheets_imported:
+                response += f"**Teams:** {teams_added} added, {teams_updated} updated\n"
+            if 'Players' in sheets_imported:
+                response += f"**Players:** {players_added} added, {players_updated} updated, {players_deleted} deleted\n"
             if current_lineups_imported > 0:
                 response += f"**Current Lineups:** {current_lineups_imported} imported\n"
             if starting_lineups_imported > 0:
@@ -2375,6 +2481,12 @@ class AdminCommands(commands.Cog):
                 response += f"**Free Agency Re-Signs:** {free_agency_resigns_imported} imported\n"
             if free_agency_results_imported > 0:
                 response += f"**Free Agency Results:** {free_agency_results_imported} imported\n"
+
+            if sheets_skipped:
+                response += (
+                    f"\nℹ️ **{len(sheets_skipped)} sheet(s) not in the file - left untouched:**\n"
+                    + ", ".join(sheets_skipped) + "\n"
+                )
 
             if duplicate_warnings:
                 response += f"\n⚠️ **{len(duplicate_warnings)} Duplicate Name Warning(s):**\n"

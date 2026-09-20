@@ -19,6 +19,11 @@ the team from the more advanced bracket position) is listed as "home" by
 convention, matching how the real AFL grants home advantage to the
 higher-placed team in each final. "Results" dicts passed between rounds are
 always {slot_code: (winner_team_id, loser_team_id)}.
+
+The Grand Final is the exception: it's played at a neutral venue, so no
+home-ground advantage is applied in the simulation, and "home" there means
+only "listed first" - awarded to whichever finalist placed higher on the
+regular-season ladder (see generate_grand_final).
 """
 
 
@@ -89,12 +94,29 @@ def generate_prelims_round(qf_ef_results, semis_results):
     ]
 
 
-def generate_grand_final(prelims_results):
-    """GF: PF1 winner vs PF2 winner. Arbitrarily lists the PF1 winner as
-    home - AFL grand finals are played at a fixed neutral venue in reality,
-    so "home" here is nominal only."""
+def generate_grand_final(prelims_results, ranked_team_ids):
+    """GF: PF1 winner vs PF2 winner, with the team that finished HIGHER on
+    the regular-season ladder listed as home.
+
+    "Home" is nominal here: the Grand Final is played at a neutral venue, so
+    neither side gets home-ground advantage in the simulation (see
+    match_commands.py, which disables it for slot_code "GF"). Listing the
+    higher-placed team first is purely presentational - it decides the order
+    in the fixture, score line and box score - but it should still reflect
+    the better season rather than which half of the bracket a team came
+    through, which is what PF1-vs-PF2 would have meant.
+
+    ranked_team_ids is the frozen final regular-season ladder (index 0 =
+    1st place), the same list the earlier finals rounds are seeded from."""
     pf1_winner, _ = prelims_results["PF1"]
     pf2_winner, _ = prelims_results["PF2"]
+
+    rank_of = {team_id: index for index, team_id in enumerate(ranked_team_ids)}
+    # A team missing from the ladder shouldn't be possible (both grand
+    # finalists played the whole season), but rank it last rather than
+    # raising - a KeyError here would strand the finals with no GF fixture.
+    if rank_of.get(pf2_winner, len(ranked_team_ids)) < rank_of.get(pf1_winner, len(ranked_team_ids)):
+        return [("GF", pf2_winner, pf1_winner)]
     return [("GF", pf1_winner, pf2_winner)]
 
 
