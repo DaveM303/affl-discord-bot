@@ -914,11 +914,19 @@ async def _post_bye_round_summaries(bot, db, season_id, current_round, regular_r
             description += "\n\n" + "\n".join(injury_lines)
 
         team_emoji_str = get_team_emoji_str(bot, emoji_id)
-        await channel.send(embed=discord.Embed(
-            title=f"{team_emoji_str}{round_display} Summary",
-            description=description,
-            color=discord.Color.greyple(),
-        ))
+        # No box-score button (no match), but the team still plays next
+        # round, so the lineup button is just as relevant as on a normal
+        # round summary.
+        view = _ByeRoundSummaryView(bot, current_round, team_id)
+        bot.add_view(view)
+        await channel.send(
+            embed=discord.Embed(
+                title=f"{team_emoji_str}{round_display} Summary",
+                description=description,
+                color=discord.Color.greyple(),
+            ),
+            view=view,
+        )
 
 
 class _RoundSummaryView(discord.ui.View):
@@ -990,6 +998,38 @@ class _RoundSummaryView(discord.ui.View):
 
         stats_view = _MatchStatsView(parent_view, data)
         await interaction.followup.send(embed=stats_view.create_embed(), view=stats_view, ephemeral=True)
+
+    @discord.ui.button(label="Set Lineup for Next Round", style=discord.ButtonStyle.secondary)
+    async def set_lineup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from commands.lineup_commands import build_team_lineup_menu
+
+        await interaction.response.defer(ephemeral=True)
+        async with aiosqlite.connect(DB_PATH) as db:
+            lineup_view, lineup_embed = await build_team_lineup_menu(db, self.bot, self.team_id)
+        await interaction.followup.send(embed=lineup_embed, view=lineup_view, ephemeral=True)
+
+
+class _ByeRoundSummaryView(discord.ui.View):
+    """The single button a BYE summary carries: open this team's lineup menu
+    for next round.
+
+    Separate from _RoundSummaryView rather than a flag on it, because that
+    view declares both buttons with @discord.ui.button decorators - they're
+    created at class definition, so an instance can't simply omit the
+    match-specific "View Player Stats" one. A bye has no match to show stats
+    for, but the lineup button matters just as much: the team still plays
+    next round.
+
+    Persistent for the same reason, with custom_ids keyed on (round, team)
+    since there's no match_id to key on. Re-registered on startup by
+    register_persistent_round_summary_views.
+    """
+    def __init__(self, bot, round_number, team_id):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.round_number = round_number
+        self.team_id = team_id
+        self.set_lineup.custom_id = f"bye_summary_lineup_{round_number}_{team_id}"
 
     @discord.ui.button(label="Set Lineup for Next Round", style=discord.ButtonStyle.secondary)
     async def set_lineup(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1374,7 +1414,45 @@ class SeasonCommands(commands.Cog):
                         self.bot.add_view(_RoundSummaryView(self.bot, match_id, team_id))
                         count += 1
 
+                # BYE summaries carry their own single-button view, so they
+                # need re-registering too - otherwise their "Set Lineup"
+                # button dies on restart exactly as a match summary's would.
+                cursor = await db.execute(
+                    "SELECT round_number, home_team_id, away_team_id FROM matches "
+                    "WHERE season_id = ? AND round_number IN (" + placeholders + ")",
+                    (season_id, *rounds)
+                )
+                played_by_round = {}
+                for round_number, home_team_id, away_team_id in await cursor.fetchall():
+                    played_by_round.setdefault(round_number, set()).update(
+                        (home_team_id, away_team_id))
+
+                cursor = await db.execute(
+                    "SELECT regular_rounds FROM seasons WHERE season_id = ?", (season_id,))
+                row = await cursor.fetchone()
+                regular_rounds = row[0] if row else None
+
+                cursor = await db.execute(
+                    "SELECT team_id FROM teams "
+                    "WHERE team_name != 'Draft Pool' AND channel_id IS NOT NULL"
+                )
+                all_team_ids = [row[0] for row in await cursor.fetchall()]
+
+                bye_count = 0
+                for round_number in rounds:
+                    played = played_by_round.get(round_number, set())
+                    eliminated = set()
+                    if regular_rounds is not None and round_number > regular_rounds:
+                        eliminated = await get_eliminated_finals_team_ids(db, season_id)
+                    for team_id in all_team_ids:
+                        if team_id in played or team_id in eliminated:
+                            continue
+                        self.bot.add_view(
+                            _ByeRoundSummaryView(self.bot, round_number, team_id))
+                        bye_count += 1
+
                 print(f"Re-registered {count} round summary views "
+                      f"and {bye_count} bye summary views "
                       f"(round{'s' if len(rounds) > 1 else ''} {', '.join(map(str, sorted(rounds)))})")
         except Exception as e:
             print(f"Error registering round summary persistent views: {e}")
