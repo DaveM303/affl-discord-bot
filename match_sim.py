@@ -7,6 +7,7 @@ tuples) and the league's current average OVR, then call simulate_match().
 See the "Match Simulation Engine" design doc for the full model rationale.
 """
 
+import math
 import random
 
 # ---------------------------------------------------------------------------
@@ -354,7 +355,14 @@ DISPOSAL_TIER_WEIGHT = {
     "low": 0.85,   # KEY DEF/FWD, GEN DEF/FWD elsewhere on the ground
 }
 
-DISPOSAL_HIGH_TIER_POSITIONS = {"MID", "DEF-MID", "MID-FWD"}
+# UTILITY is included: a utility genuinely playing midfield is treated as a
+# midfielder there, same as DEF-MID/MID-FWD. Its flexibility is already
+# expressed by taking no out-of-position penalty across three lines (see
+# POSITION_ALLOWED_LINES) - it shouldn't ALSO be worse than a specialist at
+# the job it's actually doing. Note disposal_tier() only reaches this set
+# for a player whose resolved group IS midfield/ruck this match, so a
+# UTILITY parked in defense or attack still gets the low tier.
+DISPOSAL_HIGH_TIER_POSITIONS = {"MID", "DEF-MID", "MID-FWD", "UTILITY"}
 DISPOSAL_MID_TIER_POSITIONS = {"RUCK", "RUCK-FWD", "RUCK-DEF"}
 
 
@@ -425,6 +433,17 @@ TACKLE_TIER_POSITIONS = {
     "mid": {"RUCK", "RUCK-FWD", "RUCK-DEF", "GEN DEF", "SWINGMAN", "UTILITY"},
     # KEY FWD/KEY DEF -> low: tall targets tackle the least
 }
+
+# A UTILITY genuinely playing MIDFIELD is treated as a midfielder for
+# tackles, matching how DISPOSAL_HIGH_TIER_POSITIONS now treats it - when it
+# IS the midfielder this match, it does a midfielder's job.
+#
+# Handled as a separate promotion rather than adding UTILITY to "high"
+# above, because _position_group_tier only ever DEMOTES a player found
+# outside POSITION_ALLOWED_GROUPS - and UTILITY allows all three lines, so
+# it would never be demoted and would keep midfield-grade tackles in defense
+# and attack too. This keeps the promotion where it belongs.
+TACKLE_MIDFIELD_ONLY_PROMOTIONS = {"UTILITY"}
 TACKLE_TIER_WEIGHT = {"high": 1.0, "mid": 0.7, "low": 0.4}
 
 SPOIL_TIER_POSITIONS = {
@@ -480,12 +499,20 @@ def _position_group_tier(player, tier_positions):
     else:
         tier = "low"
 
+    group = player_group(player)
+    group = "midfield" if group == "ruck" else group
+
+    # Promoted to the midfield tier, but only while actually playing there
+    # (see TACKLE_MIDFIELD_ONLY_PROMOTIONS).
+    if (tier_positions is TACKLE_TIER_POSITIONS
+            and position in TACKLE_MIDFIELD_ONLY_PROMOTIONS
+            and group == "midfield"):
+        return "high"
+
     if tier == "low":
         return tier
 
     allowed_groups = POSITION_ALLOWED_GROUPS.get(position)
-    group = player_group(player)
-    group = "midfield" if group == "ruck" else group
     if allowed_groups is not None and group not in allowed_groups:
         return "mid" if tier == "high" else "low"
     return tier
@@ -660,6 +687,11 @@ DEFAULT_VARIANCE = 0.6         # match_sim_variance setting default - dialed dow
 # See the "Live Match Feed" design doc for the full model rationale.
 # ---------------------------------------------------------------------------
 
+# ELAPSED quarter length, not playing time. An AFL quarter is nominally 20
+# minutes of PLAYING time, but the clock stops at every stoppage and the
+# time is added back on ("time on"), so a quarter actually runs ~25-35
+# minutes wall-clock. These are those elapsed figures - the ~8 minutes over
+# the nominal 20 IS the time on.
 QUARTER_LENGTH_MIN = 25
 QUARTER_LENGTH_MAX = 35
 QUARTER_LENGTH_MODE = 28  # triangular distribution - most quarters land near 27-29
@@ -736,10 +768,10 @@ def _enforce_minimum_event_gap_flat(events, period_length):
     half) rather than a list of quarters - there's no quarter_lengths
     offset to add, and after-siren events (already placed past
     period_length) are excluded the same way. A very short period
-    (EXTRA_TIME_HALF_LENGTH_MINUTES=3) combined with the same
-    MINIMUM_EVENT_GAP_MINUTES floor caps how many events can realistically
-    fit without clamping - fine in practice since a scaled-down 3-minute
-    shot count is naturally low (usually 0-4 shots per team)."""
+    (~4-5 minutes) combined with the same MINIMUM_EVENT_GAP_MINUTES floor
+    caps how many events can realistically fit without clamping - fine in
+    practice since a scaled-down shot count over that span is naturally low
+    (around 4-5 shots per team, of which only some actually score)."""
     normal_events = [e for e in events if not e.after_siren]
     if not normal_events:
         return
@@ -1653,7 +1685,7 @@ def _simulate_team_shots(team_players, opp_strengths, own_strengths, league_avg_
             events.append(MatchEvent(kind, quarter, minute, match_minute, team_name, shooter, rushed=rushed))
 
 
-# Extra time (finals-only draw-breaker) - 2x3-minute halves, repeated in
+# Extra time (finals-only draw-breaker) - two short halves, repeated in
 # further pairs of halves for as long as the scores stay level. Genuinely
 # INCREMENTAL, unlike the rest of the match: the normal 4-quarter simulation
 # is always fully pre-computed up front (see simulate_match_with_events),
@@ -1662,17 +1694,87 @@ def _simulate_team_shots(team_players, opp_strengths, own_strengths, league_avg_
 # and checked - so each half is simulated fresh, one at a time, by the
 # live-match command loop calling simulate_extra_time_half() as it goes,
 # rather than being part of the single big up-front simulate call.
-EXTRA_TIME_HALF_LENGTH_MINUTES = 3
+#
+# Like QUARTER_LENGTH_* above, these are ELAPSED minutes, not playing time.
+# The league's rule is "2 x 3 minute halves + time on" (as stated in the
+# rules embed the feed posts - see _extra_time_info_embed in
+# match_commands.py); the extra elapsed minutes ARE that time on.
+#
+# Derived from the quarter's own figures rather than hardcoded, so extra
+# time gets stoppages at exactly the same rate as the rest of the match: a
+# quarter is 20 minutes of playing time that elapses ~28, so a 3-minute half
+# elapses 3 * 28/20 = 4.2. Changing a quarter's length now carries through
+# here automatically instead of quietly leaving the two inconsistent.
+EXTRA_TIME_HALF_PLAYING_MINUTES = 3  # the league's stated "3 minute halves"
+QUARTER_PLAYING_MINUTES = 20  # an AFL quarter's nominal playing time
+
+_TIME_ON_SCALE = EXTRA_TIME_HALF_PLAYING_MINUTES / QUARTER_PLAYING_MINUTES
+
+EXTRA_TIME_HALF_LENGTH_MIN = QUARTER_LENGTH_MIN * _TIME_ON_SCALE    # 3.75
+EXTRA_TIME_HALF_LENGTH_MAX = QUARTER_LENGTH_MAX * _TIME_ON_SCALE    # 5.25
+EXTRA_TIME_HALF_LENGTH_MODE = QUARTER_LENGTH_MODE * _TIME_ON_SCALE  # 4.20
+
+
+def extra_time_half_length_minutes(rng):
+    return rng.triangular(
+        EXTRA_TIME_HALF_LENGTH_MIN, EXTRA_TIME_HALF_LENGTH_MAX, EXTRA_TIME_HALF_LENGTH_MODE
+    )
+
+
+# Nominal length used for anything that needs a single representative value
+# rather than one half's actual roll (the shot-count scale below).
+EXTRA_TIME_HALF_LENGTH_MINUTES = EXTRA_TIME_HALF_LENGTH_MODE
 
 # Same team-strength-driven formula as _shot_count, just scaled down to a
 # much shorter period - reuses the tuned team-strength inputs/accuracy
 # model rather than a separately-tuned extra-time-only formula. _shot_count
 # itself isn't reused directly since its floor (8.0 expected, 4 minimum)
-# is calibrated for a ~28-minute quarter and would swamp a 3-minute half.
-_EXTRA_TIME_SHOT_COUNT_SCALE = EXTRA_TIME_HALF_LENGTH_MINUTES / QUARTER_LENGTH_MODE
+# is calibrated for a ~28-minute quarter and would swamp a short half.
+# Scaled off the MODE rather than each half's own roll so the shot rate
+# stays consistent; a longer half then naturally has its shots spread over
+# more minutes rather than getting proportionally more of them.
+# Extra time scores at the SAME per-minute rate as normal play. Note this
+# is deliberately NOT BASE_SHOTS_PER_TEAM scaled by period length: that
+# constant feeds _shot_count, whose output is a raw contest/possession count
+# that later gets filtered down before anything reaches the scoreboard
+# (~27 per team per quarter becomes ~6 scoring shots). _extra_time_shot_count
+# has no such filtering - almost every shot it returns becomes a score via
+# ON_TARGET_CHANCE - so scaling off BASE_SHOTS_PER_TEAM over-scored extra
+# time roughly fourfold.
+#
+# Calibrated instead against the MEASURED full-match rate: 4000 simulated
+# matches between even sides produce ~49 scoring shots across 4x28 minutes,
+# i.e. ~0.44 per minute for both teams, ~0.22 per team.
+_MATCH_SCORING_SHOTS_PER_TEAM_PER_MINUTE = 0.219
+
+# Divided back out by ON_TARGET_CHANCE because that is applied per shot by
+# the caller - this figure is raw shots, of which ~91% become a score.
+_EXTRA_TIME_SHOTS_PER_TEAM_PER_MINUTE = (
+    _MATCH_SCORING_SHOTS_PER_TEAM_PER_MINUTE / ON_TARGET_CHANCE
+)
+
+# How much a strength mismatch tilts the rate, as a fraction of the even-teams
+# baseline. SHOT_DIFF_SENSITIVITY is calibrated in raw _shot_count units and
+# would swamp a rate this small, so the same `diff` is applied proportionally
+# instead: a clearly stronger side gets meaningfully more of the ball without
+# the weaker side ever dropping to a guaranteed zero.
+_EXTRA_TIME_DIFF_SENSITIVITY = 0.02
+_EXTRA_TIME_MIN_RATE_MULTIPLIER = 0.4
+_EXTRA_TIME_MAX_RATE_MULTIPLIER = 1.8
 
 
-def _extra_time_shot_count(own_strengths, opp_strengths, league_avg_ovr, variance, rng):
+def _extra_time_shot_count(own_strengths, opp_strengths, league_avg_ovr, variance, rng,
+                           half_length_minutes=None):
+    """Scoring shots for ONE team in one extra-time half.
+
+    Poisson-distributed rather than a rounded gaussian: at roughly one shot
+    per team per half, the count distribution near zero is the whole point
+    (a goalless extra-time period is a real outcome), and a gaussian
+    rounds that badly.
+    """
+    if half_length_minutes is None:
+        half_length_minutes = EXTRA_TIME_HALF_LENGTH_MODE
+
     attacking = (
         own_strengths["forward"] * FORWARD_OFFENSE_SHARE
         + own_strengths["midfield"] * MIDFIELD_OFFENSE_SHARE
@@ -1682,29 +1784,55 @@ def _extra_time_shot_count(own_strengths, opp_strengths, league_avg_ovr, varianc
         + opp_strengths["midfield"] * MIDFIELD_DEFENSE_SHARE
     )
     diff = attacking - suppression - league_avg_ovr * _LEAGUE_AVG_BASELINE_WEIGHT
-    expected = (BASE_SHOTS_PER_TEAM + diff * SHOT_DIFF_SENSITIVITY) * _EXTRA_TIME_SHOT_COUNT_SCALE
-    expected = max(0.5, expected)  # a weak team can still register the odd shot in 3 minutes
 
+    multiplier = 1.0 + diff * _EXTRA_TIME_DIFF_SENSITIVITY
+    multiplier = min(_EXTRA_TIME_MAX_RATE_MULTIPLIER,
+                     max(_EXTRA_TIME_MIN_RATE_MULTIPLIER, multiplier))
+
+    expected = _EXTRA_TIME_SHOTS_PER_TEAM_PER_MINUTE * half_length_minutes * multiplier
+
+    # `variance` widens the spread around that mean without changing it -
+    # the same knob the rest of the engine exposes.
     spread = max(0.05, variance)
-    shots = rng.gauss(expected, expected * 0.18 * spread)
-    return max(0, round(shots))
+    if spread != 1.0:
+        expected *= max(0.1, rng.gauss(1.0, 0.18 * spread))
+
+    # Poisson sampling by Knuth's method - no numpy dependency anywhere in
+    # this module, and the rate here is small enough for it to be cheap.
+    limit = math.exp(-expected)
+    product = 1.0
+    shots = 0
+    while True:
+        product *= rng.random()
+        if product <= limit:
+            return shots
+        shots += 1
 
 
 def simulate_extra_time_half(home_players, away_players, home_result, away_result,
                               home_team_name, away_team_name, league_avg_ovr, variance, rng,
                               home_ground_advantage=True):
-    """Simulates one 3-minute extra-time half and adds its goals/behinds
-    DIRECTLY into the same ongoing home_result/away_result (season/match
-    stat lines keep accumulating - this isn't a fresh separate match).
-    Reuses the same Player objects from the original simulate_match_with_events
-    call (effective_OVR, positions, slots all already resolved) - just more
-    shots added on top of the same two lineups.
+    """Simulates one extra-time half and adds its goals/behinds DIRECTLY
+    into the same ongoing home_result/away_result (season/match stat lines
+    keep accumulating - this isn't a fresh separate match). Reuses the same
+    Player objects from the original simulate_match_with_events call
+    (effective_OVR, positions, slots all already resolved) - just more shots
+    added on top of the same two lineups.
 
-    Returns a fresh list[MatchEvent] for JUST this half (not merged into any
-    other event list - the caller decides how to post/track them), each
-    with event.minute positioned 0..EXTRA_TIME_HALF_LENGTH_MINUTES within
-    this half specifically.
+    The half's length is rolled here, per half, the same way
+    quarter_length_minutes rolls a quarter's - so extra time gets its own
+    "time on" rather than always ending on the same whole minute.
+
+    Returns (events, half_length_minutes):
+      - events: a fresh list[MatchEvent] for JUST this half (not merged into
+        any other event list - the caller decides how to post/track them),
+        each with event.minute positioned 0..half_length_minutes.
+      - half_length_minutes: this half's actual length, which the caller
+        needs for the siren clock and final pacing delay. Reading the module
+        constant instead would drift from where the events actually sit.
     """
+    half_length = extra_time_half_length_minutes(rng)
+
     home_strengths = _team_strengths(home_players)
     if home_ground_advantage:
         home_strengths = _apply_home_ground_advantage(home_strengths)
@@ -1713,7 +1841,10 @@ def simulate_extra_time_half(home_players, away_players, home_result, away_resul
     events = []
 
     def resolve_team_shots(team_players, opp_strengths, own_strengths, result, team_name):
-        total_shots = _extra_time_shot_count(own_strengths, opp_strengths, league_avg_ovr, variance, rng)
+        total_shots = _extra_time_shot_count(
+            own_strengths, opp_strengths, league_avg_ovr, variance, rng,
+            half_length_minutes=half_length,
+        )
         for _ in range(total_shots):
             shooter = _pick_shooter(team_players, rng)
             line = result.stat_lines[shooter.player_id]
@@ -1733,20 +1864,21 @@ def simulate_extra_time_half(home_players, away_players, home_result, away_resul
                     kind = "behind"
 
             if kind is not None:
-                minute = rng.uniform(0, EXTRA_TIME_HALF_LENGTH_MINUTES)
+                minute = rng.uniform(0, half_length)
                 events.append(MatchEvent(kind, 0, minute, minute, team_name, shooter, rushed=rushed))
 
     resolve_team_shots(home_players, away_strengths, home_strengths, home_result, home_team_name)
     resolve_team_shots(away_players, home_strengths, away_strengths, away_result, away_team_name)
 
     events.sort(key=lambda e: e.match_minute)
-    _enforce_minimum_event_gap_flat(events, EXTRA_TIME_HALF_LENGTH_MINUTES)
+    _enforce_minimum_event_gap_flat(events, half_length)
 
-    return events
+    return events, half_length
 
 
 def simulate_extra_time_after_siren_shot(home_players, away_players, home_result, away_result,
-                                          home_team_name, away_team_name, league_avg_ovr, rng):
+                                          home_team_name, away_team_name, league_avg_ovr, rng,
+                                          half_length_minutes=EXTRA_TIME_HALF_LENGTH_MINUTES):
     """After-siren shot for the end of an extra-time half - same mechanic
     and odds as the normal Q4 version (AFTER_SIREN_SHOT_CHANCE_TRAILING/
     _TIED, AFTER_SIREN_GOAL_CHANCE, AFTER_SIREN_MAX_DEFICIT eligibility),
@@ -1754,7 +1886,11 @@ def simulate_extra_time_after_siren_shot(home_players, away_players, home_result
     prior quarter AND every prior extra-time half) rather than only Q4's
     own total. Returns the MatchEvent if a shot happened, else None -
     caller is responsible for checking event.siren_beater_winner and
-    positioning/posting it."""
+    positioning/posting it.
+
+    half_length_minutes is that half's own rolled length (see
+    simulate_extra_time_half, which returns it) - the shot is placed just
+    after that siren."""
     home_score = home_result.score
     away_score = away_result.score
     is_tied = home_score == away_score
@@ -1782,7 +1918,9 @@ def simulate_extra_time_after_siren_shot(home_players, away_players, home_result
                 kind = "behind"
         if kind is None:
             continue
-        minute = EXTRA_TIME_HALF_LENGTH_MINUTES + AFTER_SIREN_OFFSET_MINUTES * (ordinal + 1)
+        # Positioned just PAST this half's siren, so it has to use the
+        # half's actual rolled length rather than the nominal constant.
+        minute = half_length_minutes + AFTER_SIREN_OFFSET_MINUTES * (ordinal + 1)
         event = MatchEvent(kind, 0, minute, minute, team_name, shooter, after_siren=True)
         was_already_ahead = (home_score > away_score) if team_name == home_team_name else (away_score > home_score)
         new_home_score, new_away_score = home_result.score, away_result.score

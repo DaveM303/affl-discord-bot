@@ -856,6 +856,70 @@ async def post_round_summaries(bot, db, season_id, season_number, current_round,
             bot.add_view(view)
             await channel.send(embed=embed, view=view)
 
+    await _post_bye_round_summaries(
+        bot, db, season_id, current_round, regular_rounds, total_rounds,
+        next_round_num, round_display, played_team_ids={
+            team_id
+            for _mid, home_id, away_id, *_rest in matches
+            for team_id in (home_id, away_id)
+        },
+    )
+
+
+async def _post_bye_round_summaries(bot, db, season_id, current_round, regular_rounds,
+                                    total_rounds, next_round_num, round_display,
+                                    played_team_ids):
+    """Round summary for teams that had a BYE - no match was played, so it
+    carries only their injury/suspension list, with no score, goalkickers,
+    best players or ladder position.
+
+    A bye is "no fixture this round, but still in the competition". Teams
+    whose season is OVER (missed the finals, or already knocked out - see
+    get_eliminated_finals_team_ids) also have no fixture, but they aren't on
+    a bye and get nothing: there is no next match for their injury list to
+    be about.
+
+    No _RoundSummaryView either - both its buttons are match-specific (a box
+    score, and a lineup for a match this team isn't playing).
+    """
+    # Deferred, same circular-import reason as post_round_summaries' own.
+    from commands.injury_commands import build_injury_suspension_list
+
+    cursor = await db.execute(
+        "SELECT team_id, channel_id, emoji_id FROM teams "
+        "WHERE team_name != 'Draft Pool' AND channel_id IS NOT NULL"
+    )
+    all_teams = await cursor.fetchall()
+
+    eliminated_team_ids = set()
+    if current_round > regular_rounds:
+        eliminated_team_ids = await get_eliminated_finals_team_ids(db, season_id)
+
+    for team_id, channel_id, emoji_id in all_teams:
+        if team_id in played_team_ids or team_id in eliminated_team_ids:
+            continue
+
+        channel = bot.get_channel(int(channel_id))
+        if not channel:
+            continue
+
+        injury_lines = await build_injury_suspension_list(
+            bot, db, next_round_num, total_rounds, filter_team_id=team_id,
+            season_id=season_id, regular_rounds=regular_rounds,
+            new_this_round=current_round,
+        )
+
+        description = "**BYE** - no match this round."
+        if injury_lines:
+            description += "\n\n" + "\n".join(injury_lines)
+
+        team_emoji_str = get_team_emoji_str(bot, emoji_id)
+        await channel.send(embed=discord.Embed(
+            title=f"{team_emoji_str}{round_display} Summary",
+            description=description,
+            color=discord.Color.greyple(),
+        ))
+
 
 class _RoundSummaryView(discord.ui.View):
     """Two buttons on each team's round-summary post: jump straight to
@@ -868,10 +932,12 @@ class _RoundSummaryView(discord.ui.View):
     Persistent (timeout=None + per-match/team custom_ids) since the round
     summary is a permanent public post people may revisit well after a
     1800s timeout would have expired - e.g. to set their lineup right
-    before next round locks. Requires SeasonCommands.cog_load to
-    re-register one instance per current-round match on every bot
-    restart (see register_persistent_round_summary_views), the same
-    pattern trade_commands.py uses for its own persistent views."""
+    before next round locks.
+
+    Requires SeasonCommands.register_persistent_round_summary_views (called
+    from cog_load) to re-register one instance per (match, team) on every
+    bot restart - without that, a restart leaves already-posted summaries'
+    buttons dead."""
     def __init__(self, bot, match_id, team_id):
         super().__init__(timeout=None)
         self.bot = bot
@@ -1239,45 +1305,77 @@ async def ensure_future_seasons_exist(db, current_season_number, num_future=2, d
     return created_seasons
 
 class SeasonCommands(commands.Cog):
+    # How many recent simulated rounds' summary views to re-register on
+    # startup. Round summaries stay in their channels forever, but only the
+    # most recent ones are realistically still being clicked, and every
+    # registered view costs memory for the life of the process - so this is
+    # a deliberate window, not "every summary ever posted".
+    ROUND_SUMMARY_ROUNDS_TO_REGISTER = 2
+
     def __init__(self, bot):
         self.bot = bot
 
     async def cog_load(self):
-        """Called when the cog is loaded - re-register persistent round
-        summary views (same pattern as TradeCommands.register_persistent_views
-        in trade_commands.py)."""
         await self.register_persistent_round_summary_views()
 
     async def register_persistent_round_summary_views(self):
-        """Re-registers a _RoundSummaryView for every match in the active
-        season's CURRENT round on bot startup - not every round summary
-        ever posted, since older rounds' "Set Lineup for Next Round"
-        button is no longer actionable (that round has already locked)
-        and re-registering every historical match would grow unbounded
-        for no benefit."""
+        """Re-registers _RoundSummaryView for recent rounds' summary posts so
+        their buttons keep working after a bot restart.
+
+        Without this, a restart leaves every previously-posted summary's
+        buttons dead (Discord reports "This interaction failed") until a new
+        summary is posted.
+
+        Registers the most recent SIMULATED rounds, NOT the season's
+        current_round: summaries are posted for a round once it's simulated
+        and the round counter then advances, so by the time the bot is
+        restarted current_round is usually the next, unsimulated round - a
+        round that has no summaries at all. (That was the bug in the previous
+        version of this function, which asked for
+        `round_number = current_round AND simulated = 1` and so matched
+        nothing basically always, silently registering 0 views.)
+        """
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
-                    "SELECT season_id, current_round FROM seasons WHERE status = 'active' LIMIT 1"
+                    "SELECT season_id FROM seasons WHERE status = 'active' LIMIT 1"
                 )
                 season_row = await cursor.fetchone()
                 if not season_row:
                     return
-                season_id, current_round = season_row
+                season_id = season_row[0]
 
+                # The most recent rounds that actually have simulated
+                # matches - these are the ones with live summary posts.
                 cursor = await db.execute(
-                    "SELECT match_id, home_team_id, away_team_id FROM matches WHERE season_id = ? AND round_number = ? AND simulated = 1",
-                    (season_id, current_round)
+                    """SELECT DISTINCT round_number FROM matches
+                       WHERE season_id = ? AND simulated = 1
+                       ORDER BY round_number DESC LIMIT ?""",
+                    (season_id, self.ROUND_SUMMARY_ROUNDS_TO_REGISTER)
+                )
+                rounds = [row[0] for row in await cursor.fetchall()]
+                if not rounds:
+                    return
+
+                placeholders = ",".join("?" * len(rounds))
+                cursor = await db.execute(
+                    f"""SELECT match_id, home_team_id, away_team_id FROM matches
+                        WHERE season_id = ? AND simulated = 1
+                        AND round_number IN ({placeholders})""",
+                    (season_id, *rounds)
                 )
                 matches = await cursor.fetchall()
 
                 count = 0
                 for match_id, home_team_id, away_team_id in matches:
+                    # One view per (match, team): each team's summary is its
+                    # own post, and the buttons are team-specific.
                     for team_id in (home_team_id, away_team_id):
                         self.bot.add_view(_RoundSummaryView(self.bot, match_id, team_id))
                         count += 1
 
-                print(f"Re-registered {count} round summary views")
+                print(f"Re-registered {count} round summary views "
+                      f"(round{'s' if len(rounds) > 1 else ''} {', '.join(map(str, sorted(rounds)))})")
         except Exception as e:
             print(f"Error registering round summary persistent views: {e}")
             import traceback

@@ -4,7 +4,7 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH
-from utils import get_team_emoji_str
+from utils import get_team_emoji_str, build_team_options, fetch_teams_for_dropdown
 
 class PlayerCommands(commands.Cog):
     def __init__(self, bot):
@@ -311,7 +311,7 @@ class PlayerCommands(commands.Cog):
     @app_commands.describe(team_name="Name of the team (leave empty for all teams)")
     @app_commands.autocomplete(team_name=team_name_autocomplete)
     async def injurylist(self, interaction: discord.Interaction, team_name: str = None):
-        from commands.season_commands import get_round_name, get_eliminated_finals_team_ids
+        from commands.season_commands import get_round_name
 
         await interaction.response.defer(ephemeral=True)
         async with aiosqlite.connect(DB_PATH) as db:
@@ -426,9 +426,14 @@ class PlayerCommands(commands.Cog):
                 await interaction.followup.send(embed=embed)
                 return
 
-            eliminated_team_ids = set()
-            if current_round > regular_rounds:
-                eliminated_team_ids = await get_eliminated_finals_team_ids(db, season_id)
+            # Deliberately NOT filtered by finals elimination. This is a
+            # public reference list people check for any player - an
+            # eliminated club's injuries still matter for trade/draft
+            # planning and next season, so /injurylist shows every team all
+            # year. The round-by-round list posted to the injury channel
+            # (build_injury_suspension_list in injury_commands.py) DOES
+            # exclude eliminated teams, since that one is about who is
+            # available for the matches still to be played.
 
             if team_id:
                 cursor = await db.execute(
@@ -449,7 +454,7 @@ class PlayerCommands(commands.Cog):
                        WHERE i.status = 'injured'
                        ORDER BY t.team_name ASC, i.return_round ASC, p.name ASC"""
                 )
-            injuries = [row for row in await cursor.fetchall() if row[6] not in eliminated_team_ids]
+            injuries = await cursor.fetchall()
 
             if team_id:
                 cursor = await db.execute(
@@ -470,7 +475,7 @@ class PlayerCommands(commands.Cog):
                        WHERE s.status = 'suspended'
                        ORDER BY t.team_name ASC, s.games_remaining ASC, p.name ASC"""
                 )
-            suspensions = [row for row in await cursor.fetchall() if row[6] not in eliminated_team_ids]
+            suspensions = await cursor.fetchall()
 
             lines = []
             if injuries:
@@ -508,10 +513,7 @@ class PlayerCommands(commands.Cog):
         the menu's own dropdowns/buttons rather than command parameters, so
         filters can be adjusted without re-running the command."""
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT team_id, team_name FROM teams WHERE team_name != 'Draft Pool' ORDER BY team_name"
-            )
-            teams = await cursor.fetchall()
+            teams = await fetch_teams_for_dropdown(db)
 
             view = FilterPlayersView(self, teams)
             await view.load(db)
@@ -654,10 +656,13 @@ def build_player_profile_embed(cog, data, season_number, per_game=False):
     title = f"{emoji} {data['name']}" if emoji else data['name']
 
     # The team is already carried by the title's emoji, so it isn't repeated
-    # as its own line.
+    # as its own line - except for a delisted player, who has no team and so
+    # no emoji to carry it.
     header_bits = [
         f"**{data['position']}** • {data['age']}yo • **{ovr_display}** OVR",
     ]
+    if data['team_name'] is None:
+        header_bits.append("*Delisted*")
 
     # Availability line, only when there's something to report.
     if data['suspension']:
@@ -841,6 +846,11 @@ class FilterState:
     def __init__(self):
         self.positions = []        # [] means all positions
         self.team_ids = []         # [] means all teams
+        # Delisted players (team_id IS NULL) are excluded by default - the
+        # common case is browsing listed players. Selecting "Delisted" in the
+        # team dropdown turns them on, either on their own or alongside real
+        # teams.
+        self.include_delisted = False
         self.min_age = None
         self.max_age = None
         self.min_ovr = None
@@ -853,23 +863,35 @@ class FilterState:
         # would silently truncate the list AND make the "(N found)" count in
         # the embed title wrong. A full league is comfortably small enough to
         # hold in memory.
+        # Draft Pool players are never listed here (their ratings are hidden
+        # until drafted - see /viewdraftpool).
         query = """SELECT p.player_id, p.name, p.position, p.overall_rating, p.age,
                           t.team_name, t.emoji_id
                    FROM players p
                    LEFT JOIN teams t ON p.team_id = t.team_id
-                   WHERE p.team_id IS NOT NULL
-                   AND (t.team_name IS NULL OR t.team_name != 'Draft Pool')"""
+                   WHERE (t.team_name IS NULL OR t.team_name != 'Draft Pool')"""
         params = []
+
+        # Team scoping. A delisted player has team_id IS NULL, so it can't be
+        # expressed as a team_id and needs its own OR branch.
+        if self.team_ids and self.include_delisted:
+            placeholders = ", ".join(["?"] * len(self.team_ids))
+            query += f" AND (p.team_id IN ({placeholders}) OR p.team_id IS NULL)"
+            params.extend(self.team_ids)
+        elif self.team_ids:
+            placeholders = ", ".join(["?"] * len(self.team_ids))
+            query += f" AND p.team_id IN ({placeholders})"
+            params.extend(self.team_ids)
+        elif self.include_delisted:
+            # Delisted only - no team selected alongside it.
+            query += " AND p.team_id IS NULL"
+        else:
+            query += " AND p.team_id IS NOT NULL"
 
         if self.positions:
             placeholders = ", ".join(["?"] * len(self.positions))
             query += f" AND p.position IN ({placeholders})"
             params.extend(self.positions)
-
-        if self.team_ids:
-            placeholders = ", ".join(["?"] * len(self.team_ids))
-            query += f" AND p.team_id IN ({placeholders})"
-            params.extend(self.team_ids)
 
         if self.min_age is not None:
             query += " AND p.age >= ?"
@@ -904,8 +926,10 @@ class FilterState:
         bits = []
         if self.positions:
             bits.append(f"Positions: {', '.join(self.positions)}")
-        if self.team_ids:
+        if self.team_ids or self.include_delisted:
             names = [team_names.get(tid, str(tid)) for tid in self.team_ids]
+            if self.include_delisted:
+                names.append("Delisted")
             bits.append(f"Teams: {', '.join(names)}")
         if self.min_ovr is not None:
             bits.append(f"OVR min {self.min_ovr}")
@@ -1017,17 +1041,23 @@ class PositionFilterSelect(discord.ui.Select):
 
 
 class TeamFilterSelect(discord.ui.Select):
+    # Sentinel value for the "Delisted" entry - delisted players have no
+    # team_id at all (it's NULL), so they can't be addressed by one.
+    DELISTED_VALUE = "delisted"
+
     def __init__(self, parent_view, teams, row):
-        # Discord caps a Select at 25 options; an 18-20 team league fits, but
-        # trim defensively so an oversized league degrades rather than
-        # erroring out.
-        options = [
-            discord.SelectOption(
-                label=team_name, value=str(team_id),
-                default=team_id in parent_view.state.team_ids
-            )
-            for team_id, team_name in teams[:25]
-        ]
+        # Discord caps a Select at 25 options; an 18-20 team league plus the
+        # Delisted entry fits, but trim the teams defensively so an oversized
+        # league degrades rather than erroring out.
+        options = build_team_options(
+            parent_view.cog.bot, teams,
+            selected=parent_view.state.team_ids,
+            extra_options=[discord.SelectOption(
+                label="Delisted", value=self.DELISTED_VALUE,
+                description="Players not on any list",
+                default=parent_view.state.include_delisted,
+            )],
+        )
         super().__init__(
             placeholder="Filter by team",
             options=options, min_values=0, max_values=len(options), row=row
@@ -1035,7 +1065,11 @@ class TeamFilterSelect(discord.ui.Select):
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction):
-        self.parent_view.state.team_ids = [int(v) for v in self.values]
+        values = list(self.values)
+        self.parent_view.state.include_delisted = self.DELISTED_VALUE in values
+        self.parent_view.state.team_ids = [
+            int(v) for v in values if v != self.DELISTED_VALUE
+        ]
         self.parent_view.current_page = 0
         await self.parent_view.refresh(interaction)
 
@@ -1077,8 +1111,8 @@ class FilterPlayersView(discord.ui.View):
     def __init__(self, cog, teams, state=None):
         super().__init__(timeout=300)
         self.cog = cog
-        self.teams = teams                                  # [(team_id, team_name)]
-        self.team_names = {tid: name for tid, name in teams}
+        self.teams = teams                                  # [(team_id, team_name, emoji_id)]
+        self.team_names = {row[0]: row[1] for row in teams}
         self.state = state or FilterState()
         self.players = []
         self.current_page = 0

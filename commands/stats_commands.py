@@ -3,7 +3,7 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH
-from utils import get_team_emoji_str
+from utils import get_team_emoji_str, build_team_options, fetch_teams_for_dropdown
 
 # Core box-score stats only - brownlow_votes/best_fairest_votes are
 # deliberately excluded from the leaderboard dropdown (those already have
@@ -40,7 +40,7 @@ class StatsCommands(commands.Cog):
             season_id, season_number = season
 
             cursor = await db.execute(
-                "SELECT team_id, team_name FROM teams WHERE team_name != 'Draft Pool' ORDER BY team_name"
+                "SELECT team_id, team_name, emoji_id FROM teams WHERE team_name != 'Draft Pool' ORDER BY team_name"
             )
             all_teams = await cursor.fetchall()
 
@@ -305,10 +305,15 @@ class _LeaderboardStatSelect(discord.ui.Select):
 class _LeaderboardTeamFilterSelect(discord.ui.Select):
     def __init__(self, parent_view: _StatLeaderboardView):
         self.parent_view = parent_view
-        options = [discord.SelectOption(label="All teams", value="all", default=(parent_view.team_id is None))]
-        for team_id, team_name in parent_view.parent_view.all_teams:
-            options.append(discord.SelectOption(label=team_name, value=str(team_id), default=(team_id == parent_view.team_id)))
-        super().__init__(placeholder="Filter by team...", options=options[:25])
+        options = build_team_options(
+            parent_view.parent_view.bot,
+            parent_view.parent_view.all_teams,
+            selected=parent_view.team_id,
+            extra_options=[discord.SelectOption(
+                label="All teams", value="all", default=(parent_view.team_id is None)
+            )],
+        )
+        super().__init__(placeholder="Filter by team...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
         selected = self.values[0]
@@ -319,7 +324,7 @@ class _LeaderboardTeamFilterSelect(discord.ui.Select):
             team_id = int(selected)
             self.parent_view.team_id = team_id
             self.parent_view.team_name = next(
-                (name for tid, name in self.parent_view.parent_view.all_teams if tid == team_id), None
+                (row[1] for row in self.parent_view.parent_view.all_teams if row[0] == team_id), None
             )
         self.parent_view.page = 0
 

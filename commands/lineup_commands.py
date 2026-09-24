@@ -49,7 +49,13 @@ def format_lineup_description(lineup):
     Shared by SeasonCommands._try_announce_lineups (season_commands.py,
     called from /matchsimulation's Announce Lineups button in
     match_commands.py) and, previously, the old submit-and-post flow here."""
-    lineup_dict = {pos_name: (name, pos, rating) for pos_name, player_id, name, pos, rating in lineup}
+    # OVRs shown are the ADJUSTED (effective) ones, matching the lineup
+    # editor - a player out of position shows the rating they'll actually
+    # play at, not their base rating. Interchange is never adjusted.
+    lineup_dict = {
+        pos_name: {'player_id': player_id, 'name': name, 'pos': pos, 'rating': rating}
+        for pos_name, player_id, name, pos, rating in lineup
+    }
     field_text = ""
 
     for line_name, positions in _LINEUP_DISPLAY_ROWS:
@@ -57,7 +63,7 @@ def format_lineup_description(lineup):
         for pos_name in positions:
             if pos_name in lineup_dict:
                 p = lineup_dict[pos_name]
-                row_text.append(f"{p[0]} ({p[2]})")
+                row_text.append(f"{p['name']} ({_display_ovr(pos_name, p)})")
             else:
                 row_text.append("*Empty*")
         field_text += f"**{line_name}:**  {', '.join(row_text)}\n"
@@ -68,7 +74,7 @@ def format_lineup_description(lineup):
     for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]:
         if pos_name in lineup_dict:
             p = lineup_dict[pos_name]
-            int_players.append(f"{p[0]} ({p[2]})")
+            int_players.append(f"{p['name']} ({_display_ovr(pos_name, p)})")
         else:
             int_players.append("*Empty*")
     field_text += f"**Int:**  {', '.join(int_players)}"
@@ -690,8 +696,10 @@ class LineupCommands(commands.Cog):
         
         # Get lineup
         async with aiosqlite.connect(DB_PATH) as db:
+            # player_id is selected too because format_lineup_description
+            # needs it to compute each slot's ADJUSTED (effective) OVR.
             cursor = await db.execute(
-                """SELECT l.position_name, p.name, p.position, p.overall_rating
+                """SELECT l.position_name, p.player_id, p.name, p.position, p.overall_rating
                    FROM lineups l
                    JOIN players p ON l.player_id = p.player_id AND p.team_id = l.team_id
                    WHERE l.team_id = ?
@@ -718,43 +726,9 @@ class LineupCommands(commands.Cog):
             color=discord.Color.blue()
         )
         
-        # Group by rows with line names
-        rows = [
-            ("FB", ["LBP", "FB", "RBP"]),
-            ("HB", ["LHB", "CHB", "RHB"]),
-            ("C", ["LW", "C", "RW"]),
-            ("HF", ["LHF", "CHF", "RHF"]),
-            ("FF", ["LFP", "FF", "RFP"]),
-            ("Fol", ["R", "RR", "RO"])
-        ]
-        
-        lineup_dict = {pos_name: (name, pos, rating) for pos_name, name, pos, rating in lineup}
-        
-        # Build field display
-        field_text = ""
-        for line_name, positions in rows:
-            row_text = []
-            for pos_name in positions:
-                if pos_name in lineup_dict:
-                    name, pos, rating = lineup_dict[pos_name]
-                    row_text.append(f"{name} ({rating})")
-                else:
-                    row_text.append("*Empty*")
-            field_text += f"**{line_name}:**  {', '.join(row_text)}\n"
-        
-        # Add spacing before interchange
-        field_text += "\n"
-        
-        # Interchange - all 5 on one line
-        int_players = []
-        for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]:
-            if pos_name in lineup_dict:
-                name, pos, rating = lineup_dict[pos_name]
-                int_players.append(f"{name} ({rating})")
-            else:
-                int_players.append("*Empty*")
-
-        field_text += f"**Int:**  {', '.join(int_players)}"
+        # Same renderer as the lineup channel post, so both show the
+        # adjusted (effective) OVR for anyone out of position.
+        field_text = format_lineup_description(lineup)
 
         embed.description = field_text
         embed.set_footer(text=f"{len(lineup)}/23 players selected")

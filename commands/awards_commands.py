@@ -3,7 +3,7 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH, ADMIN_ROLE_ID
-from utils import is_admin_user, get_team_emoji, get_team_emoji_str
+from utils import is_admin_user, get_team_emoji, get_team_emoji_str, build_team_options
 
 AWARDS_PLAYERS_PER_PAGE = 15
 
@@ -411,16 +411,10 @@ class _BestAndFairestTeamSelect(discord.ui.Select):
     def __init__(self, parent_view: _BestAndFairestView):
         self.parent_view = parent_view
         bot = parent_view.parent_view.bot
-        options = [
-            discord.SelectOption(
-                label=team_name,
-                value=str(team_id),
-                emoji=get_team_emoji(bot, emoji_id),
-                default=(team_id == parent_view.team_id)
-            )
-            for team_id, team_name, emoji_id in parent_view.parent_view.all_teams
-        ]
-        super().__init__(placeholder="Switch club...", options=options[:25])
+        options = build_team_options(
+            bot, parent_view.parent_view.all_teams, selected=parent_view.team_id
+        )
+        super().__init__(placeholder="Switch club...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
         team_id = int(self.values[0])

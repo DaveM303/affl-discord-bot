@@ -3,54 +3,12 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH
-from utils import is_admin_user, assign_drafted_player, get_team_emoji, get_team_emoji_str
+from utils import (is_admin_user, assign_drafted_player, get_team_emoji,
+                   get_team_emoji_str, build_team_options, fetch_teams_for_dropdown)
 
 class DraftCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-
-    async def cog_load(self):
-        """Called when the cog is loaded - re-register persistent views"""
-        await self.register_persistent_views()
-
-    async def register_persistent_views(self):
-        """Re-register all persistent draft pick views on bot startup"""
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                # Find any in-progress drafts
-                cursor = await db.execute(
-                    "SELECT draft_id, draft_name FROM drafts WHERE status = 'in_progress'"
-                )
-                active_drafts = await cursor.fetchall()
-
-                for draft_id, draft_name in active_drafts:
-                    # Get current pick number
-                    cursor = await db.execute(
-                        "SELECT current_pick_number FROM drafts WHERE draft_id = ?",
-                        (draft_id,)
-                    )
-                    current_pick = (await cursor.fetchone())[0]
-
-                    # Get the pick info for the current pick
-                    cursor = await db.execute(
-                        """SELECT dp.current_team_id, dp.pick_number
-                           FROM draft_picks dp
-                           WHERE dp.draft_id = ? AND dp.pick_number = ? AND dp.player_selected_id IS NULL""",
-                        (draft_id, current_pick)
-                    )
-                    pick_info = await cursor.fetchone()
-
-                    if pick_info:
-                        team_id, pick_number = pick_info
-                        view = DraftPickView(self.bot, draft_id, draft_name, team_id, pick_number)
-                        self.bot.add_view(view)
-
-                print(f"Re-registered draft pick views for {len(active_drafts)} active draft(s)")
-
-        except Exception as e:
-            print(f"Error registering draft persistent views: {e}")
-            import traceback
-            traceback.print_exc()
 
     async def draft_name_autocomplete(
         self,
@@ -327,60 +285,6 @@ class DraftCommands(commands.Cog):
         except Exception:
             return []
 
-    async def pick_identifier_autocomplete(
-        self,
-        interaction: discord.Interaction,
-        current: str,
-    ) -> list[app_commands.Choice[str]]:
-        """Autocomplete for pick identifiers in a draft (pick number for current, origin for future)"""
-        try:
-            # Get the draft_name from the current interaction namespace
-            draft_name = interaction.namespace.draft_name
-            if not draft_name:
-                return []
-
-            async with aiosqlite.connect(DB_PATH) as db:
-                cursor = await db.execute(
-                    """SELECT dp.pick_origin, dp.pick_number, dp.round_number, dp.current_team_id,
-                              t_orig.team_name as original_team
-                       FROM draft_picks dp
-                       JOIN teams t_orig ON dp.original_team_id = t_orig.team_id
-                       WHERE dp.draft_name = ?
-                       ORDER BY
-                         CASE WHEN dp.pick_number IS NULL THEN 1 ELSE 0 END,
-                         dp.pick_number,
-                         dp.round_number""",
-                    (draft_name,)
-                )
-                picks = await cursor.fetchall()
-
-                # Get team name for display
-                choices = []
-                for pick_origin, pick_number, round_number, current_team_id, original_team in picks:
-                    cursor = await db.execute(
-                        "SELECT team_name FROM teams WHERE team_id = ?",
-                        (current_team_id,)
-                    )
-                    team_result = await cursor.fetchone()
-                    current_team_name = team_result[0] if team_result else "Unknown"
-
-                    if pick_number is not None:
-                        # Current draft - use pick number as value
-                        display_name = f"Pick #{pick_number} (owned by {current_team_name})"
-                        value = str(pick_number)
-                    else:
-                        # Future draft - use pick origin as value, format with round suffix
-                        round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
-                        display_name = f"{original_team} {round_suffix} (owned by {current_team_name})"
-                        value = pick_origin
-
-                    if current.lower() in display_name.lower():
-                        choices.append(app_commands.Choice(name=display_name, value=value))
-
-                return choices[:25]
-        except Exception:
-            return []
-
     @app_commands.command(name="viewdraftpool", description="View the players available in the draft pool")
     @app_commands.describe(position="Optional: only show players of this position")
     @app_commands.autocomplete(position=draft_pool_position_autocomplete)
@@ -446,94 +350,41 @@ class DraftCommands(commands.Cog):
         view = DraftPoolView(players, normalized_position)
         await interaction.followup.send(embed=view.create_embed(), view=view, ephemeral=True)
 
-    @app_commands.command(name="transferpick", description="[ADMIN] Transfer a draft pick to another team")
-    @app_commands.describe(
-        draft_name="Name of the draft",
-        pick="The pick to transfer (pick number for current drafts, origin for future drafts)",
-        to_team="Team to transfer pick to"
-    )
-    @app_commands.autocomplete(draft_name=all_drafts_autocomplete, pick=pick_identifier_autocomplete, to_team=team_autocomplete)
-    async def transfer_pick(self, interaction: discord.Interaction, draft_name: str, pick: str, to_team: str):
+    @app_commands.command(name="editdraft", description="[ADMIN] Edit a draft - name, rounds, and its picks")
+    @app_commands.describe(draft_name="Draft to edit")
+    @app_commands.autocomplete(draft_name=all_drafts_autocomplete)
+    async def edit_draft(self, interaction: discord.Interaction, draft_name: str):
+        """Menu-driven editor for a draft, replacing the old one-shot
+        /addpick, /removepick and /transferpick commands - those each took
+        the draft and pick as typed parameters and gave no view of what they
+        were changing, so an admin had to run /draftorder alongside them to
+        see the effect. Here the pick list is shown and re-rendered after
+        every edit."""
         await interaction.response.defer(ephemeral=True)
 
-        # Check if user has admin role
         if not await is_admin_user(interaction):
             await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
             return
 
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                # Get target team
-                cursor = await db.execute("SELECT team_id, team_name FROM teams WHERE LOWER(team_name) = LOWER(?)", (to_team,))
-                team_data = await cursor.fetchone()
-                if not team_data:
-                    await interaction.followup.send(f"❌ Team '{to_team}' not found!", ephemeral=True)
-                    return
-
-                new_team_id, new_team_name = team_data
-
-                # Try to determine if this is a pick number or pick origin
-                # If it's all digits, treat as pick number, otherwise as pick origin
-                pick_data = None
-                if pick.isdigit():
-                    # Current draft - search by pick number
-                    cursor = await db.execute(
-                        """SELECT dp.pick_id, dp.pick_number, dp.round_number, dp.pick_origin,
-                                  ct.team_name, ot.team_name
-                           FROM draft_picks dp
-                           JOIN teams ct ON dp.current_team_id = ct.team_id
-                           JOIN teams ot ON dp.original_team_id = ot.team_id
-                           WHERE dp.draft_name = ? AND dp.pick_number = ?""",
-                        (draft_name, int(pick))
-                    )
-                    pick_data = await cursor.fetchone()
-                else:
-                    # Future draft - search by pick origin
-                    cursor = await db.execute(
-                        """SELECT dp.pick_id, dp.pick_number, dp.round_number, dp.pick_origin,
-                                  ct.team_name, ot.team_name
-                           FROM draft_picks dp
-                           JOIN teams ct ON dp.current_team_id = ct.team_id
-                           JOIN teams ot ON dp.original_team_id = ot.team_id
-                           WHERE dp.draft_name = ? AND dp.pick_origin = ?""",
-                        (draft_name, pick)
-                    )
-                    pick_data = await cursor.fetchone()
-
-                if not pick_data:
-                    await interaction.followup.send(
-                        f"❌ Pick '{pick}' not found in '{draft_name}'!",
-                        ephemeral=True
-                    )
-                    return
-
-                pick_id, pick_number, round_num, pick_origin, current_team, original_team = pick_data
-
-                # Transfer the pick
-                await db.execute(
-                    "UPDATE draft_picks SET current_team_id = ? WHERE pick_id = ?",
-                    (new_team_id, pick_id)
-                )
-                await db.commit()
-
-                # Format display message
-                if pick_number is not None:
-                    pick_display = f"Pick #{pick_number}"
-                else:
-                    round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_num, f"{round_num}th")
-                    pick_display = f"{original_team} {round_suffix}"
-
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """SELECT draft_id, draft_name, season_number, status, rounds, rookie_contract_years
+                   FROM drafts WHERE draft_name = ?""",
+                (draft_name,)
+            )
+            draft = await cursor.fetchone()
+            if not draft:
                 await interaction.followup.send(
-                    f"✅ **Pick Transferred!**\n\n"
-                    f"**Draft:** {draft_name}\n"
-                    f"**Pick:** {pick_display}\n"
-                    f"**From:** {current_team}\n"
-                    f"**To:** {new_team_name}",
-                    ephemeral=True
+                    f"❌ Draft '{draft_name}' not found!", ephemeral=True
                 )
+                return
 
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+            teams = await fetch_teams_for_dropdown(db)
+
+            view = EditDraftView(self.bot, draft, teams)
+            await view.refresh(db)
+
+        await interaction.followup.send(embed=view.create_embed(), view=view, ephemeral=True)
 
     @app_commands.command(name="drafthand", description="View a team's draft picks")
     @app_commands.describe(team="Team to view (defaults to your team)")
@@ -664,164 +515,6 @@ class DraftCommands(commands.Cog):
             embed.description = "\n".join(all_pick_lines) if all_pick_lines else "*No picks*"
 
             await interaction.followup.send(embed=embed, ephemeral=True)
-
-    @app_commands.command(name="addpick", description="[ADMIN] Insert a pick into the draft order")
-    @app_commands.describe(
-        draft_name="Name of the draft",
-        insert_at="Position to insert pick at (pushes others back)",
-        team="Team that owns the pick",
-        pick_origin="Origin description (e.g., 'Adelaide R1', 'Compensation Pick') - optional"
-    )
-    @app_commands.autocomplete(draft_name=draft_name_autocomplete, team=team_autocomplete)
-    async def add_pick(
-        self,
-        interaction: discord.Interaction,
-        draft_name: str,
-        insert_at: int,
-        team: str,
-        pick_origin: str = None
-    ):
-        await interaction.response.defer(ephemeral=True)
-
-        # Check if user has admin role
-        if not await is_admin_user(interaction):
-            await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
-            return
-
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                # Get team
-                cursor = await db.execute("SELECT team_id, team_name FROM teams WHERE LOWER(team_name) = LOWER(?)", (team,))
-                team_data = await cursor.fetchone()
-                if not team_data:
-                    await interaction.followup.send(f"❌ Team '{team}' not found!", ephemeral=True)
-                    return
-
-                team_id, team_name = team_data
-
-                # Determine round number based on the pick at insert_at position (or the one before)
-                cursor = await db.execute(
-                    """SELECT round_number FROM draft_picks
-                       WHERE draft_name = ? AND pick_number >= ?
-                       ORDER BY pick_number ASC LIMIT 1""",
-                    (draft_name, insert_at)
-                )
-                pick_at_position = await cursor.fetchone()
-
-                if pick_at_position:
-                    round_number = pick_at_position[0]
-                else:
-                    # If no pick at or after this position, check the last pick
-                    cursor = await db.execute(
-                        """SELECT round_number FROM draft_picks
-                           WHERE draft_name = ?
-                           ORDER BY pick_number DESC LIMIT 1""",
-                        (draft_name,)
-                    )
-                    last_pick = await cursor.fetchone()
-                    round_number = last_pick[0] if last_pick else 1
-
-                # Use pick_origin as-is (defaults to None/empty if not provided)
-                if pick_origin is None:
-                    pick_origin = ""
-
-                # Get all picks that need to be shifted (we need to update them in reverse order)
-                cursor = await db.execute(
-                    """SELECT pick_id FROM draft_picks
-                       WHERE draft_name = ? AND pick_number >= ?
-                       ORDER BY pick_number DESC""",
-                    (draft_name, insert_at)
-                )
-                picks_to_shift = await cursor.fetchall()
-
-                # Shift picks one by one in reverse order to avoid conflicts
-                for (pick_id,) in picks_to_shift:
-                    await db.execute(
-                        "UPDATE draft_picks SET pick_number = pick_number + 1 WHERE pick_id = ?",
-                        (pick_id,)
-                    )
-
-                # Insert the new pick
-                await db.execute(
-                    """INSERT INTO draft_picks (draft_name, round_number, pick_number, pick_origin, current_team_id)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (draft_name, round_number, insert_at, pick_origin, team_id)
-                )
-
-                await db.commit()
-
-                await interaction.followup.send(
-                    f"✅ **Pick Added!**\n\n"
-                    f"**Draft:** {draft_name}\n"
-                    f"**Position:** #{insert_at}\n"
-                    f"**Team:** {team_name}\n"
-                    f"**Round:** {round_number}\n"
-                    f"**Origin:** {pick_origin}\n\n"
-                    f"All picks after #{insert_at} have been shifted back.",
-                    ephemeral=True
-                )
-
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
-
-    @app_commands.command(name="removepick", description="[ADMIN] Remove a pick from the draft order")
-    @app_commands.describe(
-        draft_name="Name of the draft",
-        pick_number="Overall pick number to remove"
-    )
-    @app_commands.autocomplete(draft_name=draft_name_autocomplete)
-    async def remove_pick(self, interaction: discord.Interaction, draft_name: str, pick_number: int):
-        await interaction.response.defer(ephemeral=True)
-
-        # Check if user has admin role
-        if not await is_admin_user(interaction):
-            await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
-            return
-
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                # Get the pick info
-                cursor = await db.execute(
-                    """SELECT dp.pick_id, dp.pick_origin, dp.round_number
-                       FROM draft_picks dp
-                       WHERE dp.draft_name = ? AND dp.pick_number = ?""",
-                    (draft_name, pick_number)
-                )
-                pick_data = await cursor.fetchone()
-
-                if not pick_data:
-                    await interaction.followup.send(
-                        f"❌ Pick #{pick_number} not found in '{draft_name}'!",
-                        ephemeral=True
-                    )
-                    return
-
-                pick_id, pick_origin, round_num = pick_data
-
-                # Delete the pick
-                await db.execute("DELETE FROM draft_picks WHERE pick_id = ?", (pick_id,))
-
-                # Shift all picks after this one forward by 1
-                await db.execute(
-                    """UPDATE draft_picks
-                       SET pick_number = pick_number - 1
-                       WHERE draft_name = ? AND pick_number > ?""",
-                    (draft_name, pick_number)
-                )
-
-                await db.commit()
-
-                await interaction.followup.send(
-                    f"✅ **Pick Removed!**\n\n"
-                    f"**Draft:** {draft_name}\n"
-                    f"**Position:** #{pick_number}\n"
-                    f"**Description:** {pick_origin}\n\n"
-                    f"All picks after #{pick_number} have been shifted forward.",
-                    ephemeral=True
-                )
-
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
     @app_commands.command(name="draftpoints", description="View the points value for all draft pick numbers")
     async def draft_points(self, interaction: discord.Interaction):
@@ -1237,6 +930,23 @@ class DraftCommands(commands.Cog):
             traceback.print_exc()
 
 
+def format_draft_pick_line(emoji_source, pick_number, pick_origin, team_emoji_id, player_selected):
+    """One pick's line, in the format /draftorder uses:
+
+        **12.** <:team:1234>*(Adelaide R1)* → **Player Name**
+
+    Shared by DraftOrderView and /editdraft's own pick list so the two can't
+    drift apart. `emoji_source` is whatever get_team_emoji_str resolves
+    emojis against (a guild or the bot).
+    """
+    line = f"**{pick_number}.** {get_team_emoji_str(emoji_source, team_emoji_id)}"
+    if pick_origin:
+        line += f"*({pick_origin})*"
+    if player_selected:
+        line += f" → **{player_selected}**"
+    return line
+
+
 class DraftOrderView(discord.ui.View):
     def __init__(self, picks, draft_name, guild):
         super().__init__(timeout=180)
@@ -1272,25 +982,11 @@ class DraftOrderView(discord.ui.View):
             embed.description = "No picks in this round"
             return embed
 
-        description = ""
-        for pick_num, round_num, pick_origin, current_team, current_emoji, player_selected in round_picks:
-            # Get emoji for current team
-            current_emoji_str = self.get_emoji(current_emoji)
-
-            # Build pick - number, emoji, and origin
-            pick_desc = f"**{pick_num}.** {current_emoji_str}"
-
-            # Show pick origin (from pick_origin field)
-            if pick_origin:
-                pick_desc += f"*({pick_origin})*"
-
-            # Show if player selected
-            if player_selected:
-                pick_desc += f" → **{player_selected}**"
-
-            description += pick_desc + "\n"
-
-        embed.description = description
+        embed.description = "\n".join(
+            format_draft_pick_line(self.guild, pick_num, pick_origin, current_emoji, player_selected)
+            for pick_num, round_num, pick_origin, current_team, current_emoji, player_selected
+            in round_picks
+        )
         embed.set_footer(text=f"Round {self.current_round} of {self.max_rounds}")
 
         return embed
@@ -2538,6 +2234,900 @@ class DraftPoolView(discord.ui.View):
             await interaction.response.edit_message(embed=self.create_embed(), view=self)
         else:
             await interaction.response.defer()
+
+
+async def _draft_round_order(db, draft_id):
+    """The team order a new round should follow: this draft's own round 1
+    order, so an added round mirrors the ladder order the draft was built
+    from rather than an alphabetical or arbitrary one.
+
+    Uses original_team_id (who the pick was created FOR), not
+    current_team_id, so past trades don't reshuffle a brand new round.
+    Falls back to the earliest round present if there's no round 1.
+    """
+    cursor = await db.execute(
+        "SELECT MIN(round_number) FROM draft_picks WHERE draft_id = ?", (draft_id,)
+    )
+    row = await cursor.fetchone()
+    base_round = row[0] if row and row[0] is not None else None
+    if base_round is None:
+        return []
+
+    cursor = await db.execute(
+        """SELECT original_team_id FROM draft_picks
+           WHERE draft_id = ? AND round_number = ? AND original_team_id IS NOT NULL
+           ORDER BY pick_number""",
+        (draft_id, base_round)
+    )
+    order = []
+    for (team_id,) in await cursor.fetchall():
+        if team_id not in order:
+            order.append(team_id)
+    return order
+
+
+async def _picks_beyond_round(db, draft_id, rounds):
+    """Picks sitting in a round higher than `rounds` - what lowering a
+    draft's round count would orphan. Returns
+    [(pick_id, pick_number, round_number, team_name, is_traded, player_name)].
+    """
+    cursor = await db.execute(
+        """SELECT dp.pick_id, dp.pick_number, dp.round_number, ct.team_name,
+                  CASE WHEN dp.current_team_id != dp.original_team_id THEN 1 ELSE 0 END,
+                  p.name
+           FROM draft_picks dp
+           LEFT JOIN teams ct ON dp.current_team_id = ct.team_id
+           LEFT JOIN players p ON dp.player_selected_id = p.player_id
+           WHERE dp.draft_id = ? AND dp.round_number > ?
+           ORDER BY dp.pick_number""",
+        (draft_id, rounds)
+    )
+    return await cursor.fetchall()
+
+
+async def _add_draft_rounds(db, draft_id, draft_name, season_number, from_round, to_round):
+    """Appends full rounds of picks for every team, in the draft's own order.
+    Returns the number of picks created."""
+    order = await _draft_round_order(db, draft_id)
+    if not order:
+        return 0
+
+    cursor = await db.execute(
+        "SELECT COALESCE(MAX(pick_number), 0) FROM draft_picks WHERE draft_id = ?", (draft_id,)
+    )
+    next_number = (await cursor.fetchone())[0] + 1
+
+    team_names = {}
+    cursor = await db.execute("SELECT team_id, team_name FROM teams")
+    for team_id, team_name in await cursor.fetchall():
+        team_names[team_id] = team_name
+
+    created = 0
+    for round_num in range(from_round + 1, to_round + 1):
+        for team_id in order:
+            origin = f"{team_names.get(team_id, 'Unknown')} R{round_num}"
+            await db.execute(
+                """INSERT INTO draft_picks
+                   (draft_id, draft_name, season_number, round_number, pick_number,
+                    pick_origin, original_team_id, current_team_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (draft_id, draft_name, season_number or 0, round_num, next_number,
+                 origin, team_id, team_id)
+            )
+            next_number += 1
+            created += 1
+    return created
+
+
+async def _renumber_draft_picks(db, draft_id):
+    """Rewrites pick_number 1..N in the draft's existing order, closing any
+    gaps left by a removal and making room after an insert. Ordered by the
+    CURRENT pick_number so relative order is preserved; picks with no number
+    yet (a freshly inserted one is given a fractional number by the caller)
+    sort naturally into place."""
+    cursor = await db.execute(
+        """SELECT pick_id FROM draft_picks
+           WHERE draft_id = ?
+           ORDER BY pick_number IS NULL, pick_number, pick_id""",
+        (draft_id,)
+    )
+    for new_number, (pick_id,) in enumerate((await cursor.fetchall()), start=1):
+        await db.execute(
+            "UPDATE draft_picks SET pick_number = ? WHERE pick_id = ?",
+            (new_number, pick_id)
+        )
+
+
+class EditDraftView(discord.ui.View):
+    """Main /editdraft menu: shows the draft's settings and its picks, with
+    buttons for each kind of edit. Every edit re-queries and re-renders this
+    same message, so the admin always sees the current state."""
+
+    def __init__(self, bot, draft, teams):
+        super().__init__(timeout=600)
+        self.bot = bot
+        (self.draft_id, self.draft_name, self.season_number,
+         self.status, self.rounds, self.rookie_contract_years) = draft
+        self.teams = teams                                  # [(team_id, team_name, emoji_id)]
+        self.team_name_by_id = {row[0]: row[1] for row in teams}
+        self.picks = []
+        self.page = 0
+
+    async def refresh(self, db):
+        """Re-reads the draft row and its picks."""
+        cursor = await db.execute(
+            """SELECT draft_name, season_number, status, rounds, rookie_contract_years
+               FROM drafts WHERE draft_id = ?""",
+            (self.draft_id,)
+        )
+        row = await cursor.fetchone()
+        if row:
+            (self.draft_name, self.season_number, self.status,
+             self.rounds, self.rookie_contract_years) = row
+
+        # emoji_id and the selected player's name are fetched so the pick
+        # list can render through format_draft_pick_line, the same formatter
+        # /draftorder uses.
+        cursor = await db.execute(
+            """SELECT dp.pick_id, dp.pick_number, dp.round_number, dp.pick_origin,
+                      ct.team_name, ct.emoji_id, p.name
+               FROM draft_picks dp
+               LEFT JOIN teams ct ON dp.current_team_id = ct.team_id
+               LEFT JOIN players p ON dp.player_selected_id = p.player_id
+               WHERE dp.draft_id = ?
+               ORDER BY dp.pick_number""",
+            (self.draft_id,)
+        )
+        self.picks = await cursor.fetchall()
+        if self.page >= self.total_pages:
+            self.page = max(self.total_pages - 1, 0)
+        self.update_components()
+
+    @property
+    def total_pick_pages(self):
+        """Pages needed to list every pick in a Select (Discord caps one at
+        25 options) - drives the Prev/Next buttons in the edit and remove
+        windows."""
+        if not self.picks:
+            return 1
+        return (len(self.picks) + PICK_SELECT_OPTIONS_PER_PAGE - 1) // PICK_SELECT_OPTIONS_PER_PAGE
+
+    @property
+    def rounds_present(self):
+        """Round numbers this draft's picks actually span, in order - the
+        list is paged one round at a time, the same way /draftorder does."""
+        return sorted({p[2] for p in self.picks})
+
+    @property
+    def total_pages(self):
+        return max(1, len(self.rounds_present))
+
+    @property
+    def current_round_number(self):
+        rounds = self.rounds_present
+        if not rounds:
+            return None
+        return rounds[min(self.page, len(rounds) - 1)]
+
+    def page_picks(self):
+        current = self.current_round_number
+        if current is None:
+            return []
+        return [p for p in self.picks if p[2] == current]
+
+    def update_components(self):
+        self.clear_items()
+
+        settings = discord.ui.Button(label="Edit Settings", style=discord.ButtonStyle.primary, row=0)
+        settings.callback = self._edit_settings
+        self.add_item(settings)
+
+        add = discord.ui.Button(label="Add Pick", style=discord.ButtonStyle.success, row=0)
+        add.callback = self._add_pick
+        self.add_item(add)
+
+        # Nothing to remove or transfer in an empty draft.
+        if self.picks:
+            edit_pick = discord.ui.Button(label="Edit Pick", style=discord.ButtonStyle.secondary, row=0)
+            edit_pick.callback = self._edit_pick
+            self.add_item(edit_pick)
+
+            remove = discord.ui.Button(label="Remove Pick", style=discord.ButtonStyle.danger, row=0)
+            remove.callback = self._remove_pick
+            self.add_item(remove)
+
+        if self.total_pages > 1:
+            prev_button = discord.ui.Button(
+                label="◀ Previous Round", style=discord.ButtonStyle.secondary,
+                disabled=(self.page == 0), row=1
+            )
+            prev_button.callback = self._previous_page
+            self.add_item(prev_button)
+
+            next_button = discord.ui.Button(
+                label="Next Round ▶", style=discord.ButtonStyle.secondary,
+                disabled=(self.page >= self.total_pages - 1), row=1
+            )
+            next_button.callback = self._next_page
+            self.add_item(next_button)
+
+    def create_embed(self):
+        embed = discord.Embed(
+            title=f"Editing: {self.draft_name}",
+            color=discord.Color.orange(),
+        )
+        season_text = "Custom (not season-linked)" if not self.season_number else f"Season {self.season_number}"
+        header = (
+            f"**Status:** {self.status}  •  **Season:** {season_text}\n"
+            f"**Rounds:** {self.rounds}  •  **Rookie contract:** "
+            f"{self.rookie_contract_years} years"
+        )
+
+        if not self.picks:
+            embed.description = header + "\n\nThis draft has no picks."
+            return embed
+
+        # Same line format as /draftorder, via the shared formatter.
+        lines = [
+            format_draft_pick_line(self.bot, pick_number, pick_origin, emoji_id, player_name)
+            for _pick_id, pick_number, _round, pick_origin, _team, emoji_id, player_name
+            in self.page_picks()
+        ]
+
+        # The pick list goes in the DESCRIPTION, not a field: a field caps at
+        # 1024 characters, and one round of 20+ picks exceeds that once real
+        # team emojis (~26 chars each) are rendered. The description's limit
+        # is 4096. /draftorder does the same for the same reason.
+        # Picks can legitimately sit above the stored round count - lowering
+        # it offers to delete them but never forces it. Surface the mismatch
+        # so the header's "Rounds: N" isn't quietly contradicted by the list.
+        beyond = [p for p in self.picks if p[2] > self.rounds]
+        if beyond:
+            header += (f"\n⚠️ {len(beyond)} pick(s) sit in rounds above "
+                       f"{self.rounds}.")
+
+        body = header + f"\n\n**Round {self.current_round_number}**\n" + "\n".join(lines)
+        if len(body) > 4096:
+            # Far beyond any realistic draft, but truncate rather than let
+            # Discord reject the whole embed.
+            body = body[:4080].rsplit("\n", 1)[0] + "\n…"
+        embed.description = body
+
+        embed.set_footer(
+            text=f"Round {self.current_round_number} of {self.rounds_present[-1]} "
+                 f"• {len(self.picks)} picks total"
+        )
+        return embed
+
+    async def rerender(self, interaction: discord.Interaction):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await self.refresh(db)
+        await interaction.response.edit_message(
+            content=None, embed=self.create_embed(), view=self
+        )
+
+    async def refresh_and_report(self, interaction: discord.Interaction, note):
+        """Re-reads the draft and returns to the main menu, with a one-line
+        note about what just changed carried above the embed."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await self.refresh(db)
+        await interaction.response.edit_message(
+            content=note, embed=self.create_embed(), view=self
+        )
+
+    async def _previous_page(self, interaction: discord.Interaction):
+        self.page = max(0, self.page - 1)
+        self.update_components()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    async def _next_page(self, interaction: discord.Interaction):
+        self.page = min(self.total_pages - 1, self.page + 1)
+        self.update_components()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    async def _edit_settings(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(EditDraftSettingsModal(self))
+
+    async def _add_pick(self, interaction: discord.Interaction):
+        view = _AddPickView(self)
+        await interaction.response.edit_message(
+            content="**Add a pick** - choose the team that will own it.",
+            embed=None, view=view
+        )
+
+    async def _edit_pick(self, interaction: discord.Interaction):
+        view = _EditPickView(self)
+        await interaction.response.edit_message(
+            content=view.status_text(), embed=None, view=view
+        )
+
+    async def _remove_pick(self, interaction: discord.Interaction):
+        view = _RemovePickView(self)
+        await interaction.response.edit_message(
+            content="**Remove a pick** - choose the pick to delete.",
+            embed=None, view=view
+        )
+
+
+class EditDraftSettingsModal(discord.ui.Modal, title="Edit Draft Settings"):
+    """Name, rounds and rookie contract length in one form.
+
+    Changing `rounds` only changes the stored number - it does NOT add or
+    delete picks, since regenerating them would silently undo any pick trade
+    made against this draft (the same reasoning
+    update_indicative_draft_order documents in season_commands.py). Use the
+    Add/Remove Pick buttons for the picks themselves.
+    """
+
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+
+        self.name_input = discord.ui.TextInput(
+            label="Draft name", default=parent_view.draft_name, max_length=100
+        )
+        self.rounds_input = discord.ui.TextInput(
+            label="Rounds", default=str(parent_view.rounds), max_length=2
+        )
+        self.contract_input = discord.ui.TextInput(
+            label="Rookie contract (years)",
+            default=str(parent_view.rookie_contract_years), max_length=2
+        )
+        self.add_item(self.name_input)
+        self.add_item(self.rounds_input)
+        self.add_item(self.contract_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_name = self.name_input.value.strip()
+        if not new_name:
+            await interaction.response.send_message("❌ Draft name can't be empty.", ephemeral=True)
+            return
+
+        try:
+            new_rounds = int(self.rounds_input.value.strip())
+            new_contract = int(self.contract_input.value.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Rounds and rookie contract must be whole numbers.", ephemeral=True
+            )
+            return
+
+        if not 1 <= new_rounds <= 10:
+            await interaction.response.send_message(
+                "❌ Rounds must be between 1 and 10.", ephemeral=True
+            )
+            return
+        if not 1 <= new_contract <= 10:
+            await interaction.response.send_message(
+                "❌ Rookie contract must be between 1 and 10 years.", ephemeral=True
+            )
+            return
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            if new_name != self.parent_view.draft_name:
+                cursor = await db.execute(
+                    "SELECT draft_id FROM drafts WHERE draft_name = ? AND draft_id != ?",
+                    (new_name, self.parent_view.draft_id)
+                )
+                if await cursor.fetchone():
+                    await interaction.response.send_message(
+                        f"❌ A draft named '{new_name}' already exists.", ephemeral=True
+                    )
+                    return
+
+            old_rounds = self.parent_view.rounds
+
+            # LOWERING the round count would orphan every pick above the new
+            # number. Those picks may have been traded, so they are never
+            # deleted silently - the admin is shown exactly what would go and
+            # has to confirm. The name/contract changes still apply now.
+            doomed = []
+            if new_rounds < old_rounds:
+                doomed = await _picks_beyond_round(db, self.parent_view.draft_id, new_rounds)
+
+            await db.execute(
+                "UPDATE drafts SET draft_name = ?, rounds = ?, rookie_contract_years = ? WHERE draft_id = ?",
+                (new_name, new_rounds, new_contract, self.parent_view.draft_id)
+            )
+            # draft_picks carries a denormalised draft_name, so a rename has
+            # to update both or the picks stop matching their draft.
+            await db.execute(
+                "UPDATE draft_picks SET draft_name = ? WHERE draft_id = ?",
+                (new_name, self.parent_view.draft_id)
+            )
+
+            # RAISING it fills in the new rounds, so the draft actually has
+            # the picks its round count claims.
+            added = 0
+            if new_rounds > old_rounds:
+                added = await _add_draft_rounds(
+                    db, self.parent_view.draft_id, new_name,
+                    self.parent_view.season_number, old_rounds, new_rounds
+                )
+            await db.commit()
+
+        if doomed:
+            confirm_view = _ConfirmRoundCullView(self.parent_view, new_rounds, doomed)
+            await interaction.response.edit_message(
+                content=confirm_view.prompt_text(), embed=None, view=confirm_view
+            )
+            return
+
+        note = None
+        if added:
+            note = (f"✅ Added {added} pick(s) across "
+                    f"round{'s' if new_rounds - old_rounds > 1 else ''} "
+                    f"{old_rounds + 1}-{new_rounds}.")
+        if note:
+            await self.parent_view.refresh_and_report(interaction, note)
+        else:
+            await self.parent_view.rerender(interaction)
+
+
+class _ConfirmRoundCullView(discord.ui.View):
+    """Lowering a draft's round count leaves picks stranded above it. This
+    asks before deleting them, and calls out any that have been TRADED -
+    deleting one of those silently would erase a trade with no undo."""
+
+    def __init__(self, parent_view, new_rounds, doomed):
+        super().__init__(timeout=300)
+        self.parent_view = parent_view
+        self.new_rounds = new_rounds
+        self.doomed = doomed
+
+    def prompt_text(self):
+        traded = [d for d in self.doomed if d[4]]
+        used = [d for d in self.doomed if d[5]]
+        lines = [
+            f"⚠️ **{len(self.doomed)} pick(s)** sit in rounds above {self.new_rounds}.",
+            "",
+            "The round count has been updated. Do you also want to **delete** those picks?",
+        ]
+        if traded:
+            lines += [
+                "",
+                f"🔁 **{len(traded)} of them have been traded** - deleting them "
+                f"undoes those trades:",
+            ]
+            lines += [f"• #{d[1]} (R{d[2]}) → {d[3] or 'Unknown'}" for d in traded[:10]]
+            if len(traded) > 10:
+                lines.append(f"• …and {len(traded) - 10} more")
+        if used:
+            lines += ["", f"✅ **{len(used)} have already been used** on a player."]
+        lines += ["", "Keeping them is safe - they simply stay in the draft."]
+        return "\n".join(lines)
+
+    @discord.ui.button(label="Delete those picks", style=discord.ButtonStyle.danger)
+    async def delete_them(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "DELETE FROM draft_picks WHERE draft_id = ? AND round_number > ?",
+                (self.parent_view.draft_id, self.new_rounds)
+            )
+            await _renumber_draft_picks(db, self.parent_view.draft_id)
+            await db.commit()
+        await self.parent_view.refresh_and_report(
+            interaction, f"🗑️ Deleted {len(self.doomed)} pick(s) above round {self.new_rounds}."
+        )
+
+    @discord.ui.button(label="Keep them", style=discord.ButtonStyle.secondary)
+    async def keep_them(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.parent_view.refresh_and_report(
+            interaction,
+            f"✅ Round count updated. {len(self.doomed)} pick(s) above "
+            f"round {self.new_rounds} were kept."
+        )
+
+
+class _BackToEditDraftButton(discord.ui.Button):
+    def __init__(self, parent_view, row=4):
+        super().__init__(label="◀ Back", style=discord.ButtonStyle.secondary, row=row)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await self.parent_view.refresh(db)
+        await interaction.response.edit_message(
+            content=None, embed=self.parent_view.create_embed(), view=self.parent_view
+        )
+
+
+class _AddPickView(discord.ui.View):
+    """Pick a team, then a position to insert at."""
+
+    def __init__(self, parent_view):
+        super().__init__(timeout=300)
+        self.parent_view = parent_view
+        self.add_item(_AddPickTeamSelect(parent_view))
+        self.add_item(_BackToEditDraftButton(parent_view, row=1))
+
+
+class _AddPickTeamSelect(discord.ui.Select):
+    def __init__(self, parent_view):
+        # Discord caps a Select at 25 options.
+        options = build_team_options(parent_view.bot, parent_view.teams)
+        super().__init__(placeholder="Team that owns the new pick...", options=options, row=0)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        team_id = int(self.values[0])
+        await interaction.response.send_modal(_AddPickModal(self.parent_view, team_id))
+
+
+class _AddPickModal(discord.ui.Modal, title="Add Pick"):
+    def __init__(self, parent_view, team_id):
+        super().__init__()
+        self.parent_view = parent_view
+        self.team_id = team_id
+
+        next_number = len(parent_view.picks) + 1
+        self.position_input = discord.ui.TextInput(
+            label="Insert at pick number",
+            default=str(next_number),
+            placeholder=f"1 to {next_number}",
+            max_length=4,
+        )
+        self.round_input = discord.ui.TextInput(
+            label="Round", default="1", max_length=2
+        )
+        self.origin_input = discord.ui.TextInput(
+            label="Origin (optional)",
+            placeholder="e.g. Compensation Pick",
+            required=False, max_length=100,
+        )
+        self.add_item(self.position_input)
+        self.add_item(self.round_input)
+        self.add_item(self.origin_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            insert_at = int(self.position_input.value.strip())
+            round_number = int(self.round_input.value.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Pick number and round must be whole numbers.", ephemeral=True
+            )
+            return
+
+        max_position = len(self.parent_view.picks) + 1
+        if not 1 <= insert_at <= max_position:
+            await interaction.response.send_message(
+                f"❌ Insert position must be between 1 and {max_position}.", ephemeral=True
+            )
+            return
+        if round_number < 1:
+            await interaction.response.send_message("❌ Round must be 1 or higher.", ephemeral=True)
+            return
+
+        team_name = self.parent_view.team_name_by_id.get(self.team_id, "Unknown")
+        origin = self.origin_input.value.strip()
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Insert just BEFORE the pick currently at that number by giving
+            # the new row a fractional pick_number, then renumbering 1..N.
+            # (The old /addpick shifted every later pick one at a time.)
+            await db.execute(
+                """INSERT INTO draft_picks
+                   (draft_id, draft_name, season_number, round_number, pick_number,
+                    pick_origin, original_team_id, current_team_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (self.parent_view.draft_id, self.parent_view.draft_name,
+                 self.parent_view.season_number or 0, round_number, insert_at - 0.5,
+                 origin, self.team_id, self.team_id)
+            )
+            await _renumber_draft_picks(db, self.parent_view.draft_id)
+            await db.commit()
+
+        await self.parent_view.refresh_and_report(
+            interaction, f"✅ Added a pick for **{team_name}** at #{insert_at}."
+        )
+
+
+PICK_SELECT_OPTIONS_PER_PAGE = 25
+
+
+class _EditPickView(discord.ui.View):
+    """One window for everything about a single pick: choose the pick, choose
+    a new owner, and confirm - plus a button for editing the pick's own
+    details (its number and origin).
+
+    Both dropdowns are shown together rather than one leading to the other,
+    so the admin can see and change either before committing. Nothing is
+    written until Confirm is pressed.
+    """
+
+    def __init__(self, parent_view):
+        super().__init__(timeout=300)
+        self.parent_view = parent_view
+        self.pick_id = None
+        self.new_team_id = None
+        self.page = 0
+        self.update_components()
+
+    @property
+    def selected_pick(self):
+        if self.pick_id is None:
+            return None
+        return next((p for p in self.parent_view.picks if p[0] == self.pick_id), None)
+
+    def update_components(self):
+        self.clear_items()
+        # Rows 0-1: pick chooser (+ its pagination), row 2: new owner,
+        # rows 3-4: actions.
+        self.add_item(_PickSelect(self.parent_view, self, "Pick to edit...", row=0,
+                                  page=self.page, selected_id=self.pick_id))
+
+        if self.parent_view.total_pick_pages > 1:
+            prev_button = discord.ui.Button(
+                label="◀ Prev picks", style=discord.ButtonStyle.secondary,
+                disabled=(self.page == 0), row=1
+            )
+            prev_button.callback = self._previous_page
+            self.add_item(prev_button)
+
+            page_label = discord.ui.Button(
+                label=f"{self.page + 1}/{self.parent_view.total_pick_pages}",
+                style=discord.ButtonStyle.secondary, disabled=True, row=1
+            )
+            self.add_item(page_label)
+
+            next_button = discord.ui.Button(
+                label="Next picks ▶", style=discord.ButtonStyle.secondary,
+                disabled=(self.page >= self.parent_view.total_pick_pages - 1), row=1
+            )
+            next_button.callback = self._next_page
+            self.add_item(next_button)
+
+        self.add_item(_EditPickTeamSelect(self.parent_view, self, row=2))
+
+        confirm = discord.ui.Button(
+            label="Confirm Transfer", style=discord.ButtonStyle.success, row=3,
+            disabled=(self.pick_id is None or self.new_team_id is None),
+        )
+        confirm.callback = self._confirm
+        self.add_item(confirm)
+
+        details = discord.ui.Button(
+            label="Edit Pick Details", style=discord.ButtonStyle.primary, row=3,
+            disabled=(self.pick_id is None),
+        )
+        details.callback = self._edit_details
+        self.add_item(details)
+
+        self.add_item(_BackToEditDraftButton(self.parent_view, row=4))
+
+    def status_text(self):
+        pick = self.selected_pick
+        if pick is None:
+            return "**Edit a pick** - choose a pick to begin."
+        label = f"#{pick[1]} ({pick[4] or 'Unknown'})"
+        if self.new_team_id is None:
+            return (f"**Editing {label}** - choose a new owner to transfer it, "
+                    f"or use Edit Pick Details.")
+        new_owner = self.parent_view.team_name_by_id.get(self.new_team_id, "Unknown")
+        return f"**Editing {label}** - transfer to **{new_owner}**? Press Confirm Transfer."
+
+    async def rerender(self, interaction: discord.Interaction):
+        self.update_components()
+        await interaction.response.edit_message(content=self.status_text(), view=self)
+
+    async def _previous_page(self, interaction: discord.Interaction):
+        self.page = max(0, self.page - 1)
+        await self.rerender(interaction)
+
+    async def _next_page(self, interaction: discord.Interaction):
+        self.page = min(self.parent_view.total_pick_pages - 1, self.page + 1)
+        await self.rerender(interaction)
+
+    async def _edit_details(self, interaction: discord.Interaction):
+        pick = self.selected_pick
+        if pick is None:
+            await interaction.response.send_message("❌ Choose a pick first.", ephemeral=True)
+            return
+        await interaction.response.send_modal(_EditPickDetailsModal(self.parent_view, self, pick))
+
+    async def _confirm(self, interaction: discord.Interaction):
+        if self.pick_id is None or self.new_team_id is None:
+            await interaction.response.send_message(
+                "❌ Choose both a pick and a new owner first.", ephemeral=True
+            )
+            return
+
+        team_name = self.parent_view.team_name_by_id.get(self.new_team_id, "Unknown")
+        async with aiosqlite.connect(DB_PATH) as db:
+            # current_team_id only - original_team_id records who EARNED the
+            # pick and must survive any number of trades.
+            await db.execute(
+                "UPDATE draft_picks SET current_team_id = ? WHERE pick_id = ?",
+                (self.new_team_id, self.pick_id)
+            )
+            await db.commit()
+
+        await self.parent_view.refresh_and_report(
+            interaction, f"✅ Pick transferred to **{team_name}**."
+        )
+
+
+class _EditPickTeamSelect(discord.ui.Select):
+    def __init__(self, parent_view, edit_view, row):
+        options = build_team_options(
+            parent_view.bot, parent_view.teams, selected=edit_view.new_team_id
+        )
+        super().__init__(placeholder="Transfer to...", options=options, row=row)
+        self.parent_view = parent_view
+        self.edit_view = edit_view
+
+    async def callback(self, interaction: discord.Interaction):
+        self.edit_view.new_team_id = int(self.values[0])
+        await self.edit_view.rerender(interaction)
+
+
+class _EditPickDetailsModal(discord.ui.Modal, title="Edit Pick Details"):
+    """The pick's own number and origin text. Changing the number moves the
+    pick in the order; everything is renumbered 1..N afterwards so there are
+    never gaps or duplicates."""
+
+    def __init__(self, parent_view, edit_view, pick):
+        super().__init__()
+        self.parent_view = parent_view
+        self.edit_view = edit_view
+        self.pick_id = pick[0]
+        self.current_number = pick[1]
+
+        self.number_input = discord.ui.TextInput(
+            label="Pick number", default=str(pick[1]), max_length=4
+        )
+        self.origin_input = discord.ui.TextInput(
+            label="Origin (optional)", default=pick[3] or "",
+            placeholder="e.g. Adelaide R1", required=False, max_length=100,
+        )
+        self.add_item(self.number_input)
+        self.add_item(self.origin_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            new_number = int(self.number_input.value.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Pick number must be a whole number.", ephemeral=True
+            )
+            return
+
+        total = len(self.parent_view.picks)
+        if not 1 <= new_number <= total:
+            await interaction.response.send_message(
+                f"❌ Pick number must be between 1 and {total}.", ephemeral=True
+            )
+            return
+
+        origin = self.origin_input.value.strip()
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            if new_number != self.current_number:
+                # Nudge just past (or before) the target so the renumber pass
+                # lands this pick on exactly that number, then close the gaps.
+                nudge = new_number + (0.5 if new_number > self.current_number else -0.5)
+                await db.execute(
+                    "UPDATE draft_picks SET pick_number = ?, pick_origin = ? WHERE pick_id = ?",
+                    (nudge, origin, self.pick_id)
+                )
+                await _renumber_draft_picks(db, self.parent_view.draft_id)
+            else:
+                await db.execute(
+                    "UPDATE draft_picks SET pick_origin = ? WHERE pick_id = ?",
+                    (origin, self.pick_id)
+                )
+            await db.commit()
+
+        await self.parent_view.refresh_and_report(
+            interaction, f"✅ Pick updated (now #{new_number})."
+        )
+
+
+class _RemovePickView(discord.ui.View):
+    """Choose a pick to delete, with pagination when the draft has more picks
+    than Discord's 25-option Select cap."""
+
+    def __init__(self, parent_view):
+        super().__init__(timeout=300)
+        self.parent_view = parent_view
+        self.page = 0
+        self.update_components()
+
+    def update_components(self):
+        self.clear_items()
+        self.add_item(_PickSelect(self.parent_view, self, "Pick to remove...",
+                                  row=0, page=self.page))
+
+        if self.parent_view.total_pick_pages > 1:
+            prev_button = discord.ui.Button(
+                label="◀ Prev picks", style=discord.ButtonStyle.secondary,
+                disabled=(self.page == 0), row=1
+            )
+            prev_button.callback = self._previous_page
+            self.add_item(prev_button)
+
+            page_label = discord.ui.Button(
+                label=f"{self.page + 1}/{self.parent_view.total_pick_pages}",
+                style=discord.ButtonStyle.secondary, disabled=True, row=1
+            )
+            self.add_item(page_label)
+
+            next_button = discord.ui.Button(
+                label="Next picks ▶", style=discord.ButtonStyle.secondary,
+                disabled=(self.page >= self.parent_view.total_pick_pages - 1), row=1
+            )
+            next_button.callback = self._next_page
+            self.add_item(next_button)
+
+        self.add_item(_BackToEditDraftButton(self.parent_view, row=2))
+
+    async def _previous_page(self, interaction: discord.Interaction):
+        self.page = max(0, self.page - 1)
+        self.update_components()
+        await interaction.response.edit_message(view=self)
+
+    async def _next_page(self, interaction: discord.Interaction):
+        self.page = min(self.parent_view.total_pick_pages - 1, self.page + 1)
+        self.update_components()
+        await interaction.response.edit_message(view=self)
+
+
+class _PickSelect(discord.ui.Select):
+    """One page of the draft's picks. Discord caps a Select at 25 options, so
+    a long draft is paged by the owning view's Prev/Next buttons rather than
+    silently showing only the first 25."""
+
+    def __init__(self, parent_view, owner_view, placeholder, row, page=0, selected_id=None):
+        picks = parent_view.picks
+        start = page * PICK_SELECT_OPTIONS_PER_PAGE
+        page_picks = picks[start:start + PICK_SELECT_OPTIONS_PER_PAGE]
+
+        options = []
+        for pick_id, pick_number, round_number, pick_origin, team_name, _emoji_id, player_name in page_picks:
+            label = f"#{pick_number} - {team_name or 'Unknown'}"
+            description = f"Round {round_number}"
+            if pick_origin:
+                description += f" • {pick_origin}"
+            if player_name:
+                description += f" • used on {player_name}"
+            options.append(discord.SelectOption(
+                label=label[:100], value=str(pick_id),
+                description=description[:100],
+                default=(pick_id == selected_id),
+            ))
+
+        # A Select with no options is rejected by Discord; an empty page can
+        # only happen if every pick was removed while the view was open.
+        if not options:
+            options = [discord.SelectOption(label="No picks available", value="none")]
+
+        super().__init__(placeholder=placeholder, options=options, row=row)
+        self.parent_view = parent_view
+        self.owner_view = owner_view
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "none":
+            await interaction.response.send_message("❌ No picks available.", ephemeral=True)
+            return
+
+        pick_id = int(self.values[0])
+
+        if isinstance(self.owner_view, _EditPickView):
+            self.owner_view.pick_id = pick_id
+            await self.owner_view.rerender(interaction)
+            return
+
+        # Remove.
+        chosen = next((p for p in self.parent_view.picks if p[0] == pick_id), None)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM draft_picks WHERE pick_id = ?", (pick_id,))
+            # Close the gap so pick numbers stay 1..N with no hole.
+            await _renumber_draft_picks(db, self.parent_view.draft_id)
+            await db.commit()
+
+        label = f"#{chosen[1]} ({chosen[4]})" if chosen else "Pick"
+        await self.parent_view.refresh_and_report(interaction, f"✅ Removed {label}.")
 
 
 async def setup(bot):

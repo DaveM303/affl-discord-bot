@@ -7,11 +7,10 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH
-from utils import is_admin_user, get_team_emoji_str
+from utils import is_admin_user, get_team_emoji_str, build_team_options, fetch_teams_for_dropdown
 from match_sim import (
     simulate_match, simulate_match_with_events, format_score, DEFAULT_VARIANCE,
     Player, MatchEvent, simulate_extra_time_half, simulate_extra_time_after_siren_shot,
-    EXTRA_TIME_HALF_LENGTH_MINUTES,
 )
 
 # Pacing (Live Match Feed design doc, §04) - the baseline/floor delay is
@@ -121,6 +120,26 @@ def _event_message(event, team_emoji, home_emoji, away_emoji, running_home_goals
         return f"{clock} - :rotating_light: REPORTED - {team_emoji}**{p.name}** - {event.report_category}"
     # injury - category only, diagnosis/recovery withheld per design doc §03
     return f"{clock} - :ambulance: INJURY - {team_emoji}**{p.name}** - {event.injury_category}"
+
+
+def _extra_time_info_embed():
+    """The extra-time rules, posted to the feed the first time a match goes
+    to extra time.
+
+    "3 minute halves + time on" is PLAYING time, the same way a normal AFL
+    quarter is nominally 20 minutes: the clock stops at every stoppage and
+    that time is added back on, so a half actually elapses ~4-5.5 minutes
+    (EXTRA_TIME_HALF_LENGTH_* in match_sim). The two figures describe the
+    same period - don't "fix" this by wiring the constants in here."""
+    return discord.Embed(
+        title="EXTRA TIME RULES",
+        description="\n".join([
+            "1. Additional time of 2 x 3 minute halves + time on.",
+            "2. At the end of the 2nd period, the team with the highest score wins.",
+            "3. If scores remain tied, steps 1 and 2 are repeated until a winner is determined.",
+        ]),
+        color=discord.Color.gold(),
+    )
 
 
 def _clock(minute):
@@ -291,6 +310,20 @@ class LiveMatchState:
         self.extra_time_requested = False  # admin pressed "Start Extra Time"
         self.draw_accepted = False  # admin pressed "End Match as Draw"
 
+    @property
+    def displayed_extra_time_period(self):
+        """The extra-time period number people see: one per HALF played, so
+        Period 1, 2, 3, 4... run consecutively.
+
+        extra_time_period internally counts PAIRS of halves (it drives the
+        "is it still a draw?" check in finish_extra_time_half), and
+        extra_time_half is 1 or 2 within that pair - useful internally,
+        confusing on screen, since "Period 1, Half 1" reads as though the
+        two numbers mean different things when the first half of the first
+        pair is simply period 1.
+        """
+        return (self.extra_time_period - 1) * 2 + self.extra_time_half
+
     def score_through_quarter(self, quarter):
         events_so_far = [e for q in range(1, quarter + 1) for e in self.events_by_quarter[q]]
         return _quarter_score_summary(events_so_far, self.home_name, self.away_name, self.home_emoji, self.away_emoji)
@@ -302,12 +335,18 @@ class LiveMatchState:
             return "Match abandoned."
         if self.status == "draw_pending":
             return "Scores level at full time — extra time?"
-        if self.status == "extra_time_idle":
-            return f"Extra Time — Period {self.extra_time_period}, Half {self.extra_time_half} — not started"
-        if self.status == "extra_time_running":
-            return f"Extra Time — Period {self.extra_time_period}, Half {self.extra_time_half} — in progress"
-        if self.status == "extra_time_paused":
-            return f"Extra Time — Period {self.extra_time_period}, Half {self.extra_time_half} — paused"
+        # One flat period number per half played, matching the feed's own
+        # "EXTRA TIME — PERIOD N" headers (see run_extra_time_half). The raw
+        # extra_time_period/extra_time_half pair is internal bookkeeping -
+        # period counts PAIRS of halves - and showing both read as
+        # redundant ("Period 1, Half 1").
+        if self.status in ("extra_time_idle", "extra_time_running", "extra_time_paused"):
+            phase = {
+                "extra_time_idle": "not started",
+                "extra_time_running": "in progress",
+                "extra_time_paused": "paused",
+            }[self.status]
+            return f"Extra Time — Period {self.displayed_extra_time_period} — {phase}"
         if self.status == "idle":
             return f"Q{self.quarter} — not started"
         if self.status == "paused":
@@ -494,10 +533,20 @@ class LiveMatchControlView(discord.ui.View):
         if self.state.status != "draw_pending":
             await interaction.response.defer()
             return
+        first_period = self.state.extra_time_period == 0
         self.state.extra_time_requested = True
         self.state.extra_time_period += 1
         self.state.extra_time_half = 1
         self.state.status = "extra_time_idle"
+
+        # Explain the format once, the first time extra time is entered -
+        # it's a finals-only situation most people in the channel will
+        # rarely have seen, and the period/half structure isn't obvious
+        # from the feed alone. Not repeated when a later period is offered,
+        # since the rules haven't changed.
+        if first_period and self.feed_channel is not None:
+            await self.feed_channel.send(embed=_extra_time_info_embed())
+
         await self._refresh_panel_message(interaction)
 
     @discord.ui.button(label="End Match as Draw", style=discord.ButtonStyle.secondary, row=2)
@@ -1136,12 +1185,7 @@ class MatchCommands(commands.Cog):
         home_players = [Player(*row) for row in state.home_lineup]
         away_players = [Player(*row) for row in state.away_lineup]
 
-        # Displayed period number increments once per half played (Period 1
-        # = first half of extra_time_period 1, Period 2 = its second half,
-        # Period 3 = first half of extra_time_period 2, etc.) - distinct
-        # from state.extra_time_period, which counts PAIRS of halves and
-        # drives the actual "check for a result" logic in finish_extra_time_half.
-        displayed_period = (state.extra_time_period - 1) * 2 + state.extra_time_half
+        displayed_period = state.displayed_extra_time_period
         # Suppressed when skipping straight from extra_time_idle (Skip to
         # End of Half pressed before Start Half) - same as a skipped
         # never-started regular quarter posting no QUARTER N header either,
@@ -1161,7 +1205,10 @@ class MatchCommands(commands.Cog):
         away_goals = state.result.away.goals
         away_behinds = state.result.away.behinds
 
-        events = simulate_extra_time_half(
+        # Each half rolls its own length (extra time has time on too), so
+        # the siren clock and the final wait below come from THIS half's
+        # length, not the module's nominal constant.
+        events, half_length = simulate_extra_time_half(
             home_players, away_players, state.result.home, state.result.away,
             state.home_name, state.away_name, state.league_avg_ovr, state.variance, random.Random(),
             home_ground_advantage=state.home_ground_advantage,
@@ -1215,16 +1262,25 @@ class MatchCommands(commands.Cog):
 
         if not state.skip_quarter_requested and not state.skip_match_requested:
             last_event_minute = events[-1].minute if events else 0.0
-            await self._wait_with_controls(state, _paced_delay(EXTRA_TIME_HALF_LENGTH_MINUTES - last_event_minute, state.speed_seconds))
+            await self._wait_with_controls(state, _paced_delay(half_length - last_event_minute, state.speed_seconds))
             if state.abandon_requested:
                 return
             if feed_channel is not None:
-                await feed_channel.send(f"{_clock(EXTRA_TIME_HALF_LENGTH_MINUTES)} - 📢 SIREN")
+                await feed_channel.send(f"{_clock(half_length)} - 📢 SIREN")
 
-            after_siren_event = simulate_extra_time_after_siren_shot(
-                home_players, away_players, state.result.home, state.result.away,
-                state.home_name, state.away_name, state.league_avg_ovr, random.Random(),
-            )
+            # Only at a siren that can actually END the match - the end of
+            # the SECOND half of a period, the extra-time equivalent of the
+            # final siren. The first half's siren is just a break for
+            # swapping ends (the result isn't checked until both halves are
+            # done, see finish_extra_time_half), so a desperate shot after
+            # it means nothing and previously fired there too.
+            after_siren_event = None
+            if state.extra_time_half == 2:
+                after_siren_event = simulate_extra_time_after_siren_shot(
+                    home_players, away_players, state.result.home, state.result.away,
+                    state.home_name, state.away_name, state.league_avg_ovr, random.Random(),
+                    half_length_minutes=half_length,
+                )
             if after_siren_event is not None:
                 is_home = after_siren_event.team_name == state.home_name
                 if after_siren_event.siren_beater_winner and SAM_LLOYD_AUDIO_PATH is not None:
@@ -1270,27 +1326,30 @@ class MatchCommands(commands.Cog):
             await view._refresh_panel_message()
             return
 
+        # Captured before the flag is cleared - a half the admin SKIPPED
+        # shouldn't then sit through the pause below.
+        was_skipped = state.skip_quarter_requested
         state.skip_quarter_requested = False
 
-        # Matches run_extra_time_half's own "PERIOD N" header numbering -
-        # Period 1 = first half of extra_time_period 1, Period 2 = its
-        # second half, etc - so the half that just ended and the summary
-        # labeling it always agree.
-        displayed_period = (state.extra_time_period - 1) * 2 + state.extra_time_half
+        displayed_period = state.displayed_extra_time_period
 
+        # The break between the two halves of a period gets NO summary embed
+        # and no pause. There is no real break in AFL extra time - sides
+        # swap ends and play restarts immediately - and a score embed there
+        # made it read like an interval. The score is unchanged from the
+        # SIREN line just posted anyway; the period summary comes after the
+        # SECOND half, which is where the result is actually decided.
         if state.extra_time_half == 1:
-            if view.feed_channel is not None:
-                await view.feed_channel.send(embed=discord.Embed(
-                    title=f"END OF EXTRA TIME — PERIOD {displayed_period}",
-                    description=(
-                        f"{state.home_emoji}**{state.home_name}**  {format_score(state.result.home.goals, state.result.home.behinds)}\n"
-                        f"{state.away_emoji}**{state.away_name}**  {format_score(state.result.away.goals, state.result.away.behinds)}"
-                    ),
-                    color=discord.Color.blurple(),
-                ))
             state.extra_time_half = 2
             state.status = "extra_time_idle"
         else:
+            # Same beat of pause a normal quarter gets between its siren (or
+            # an after-siren shot's own message) and the score embed.
+            if not was_skipped and not state.abandon_requested:
+                await self._wait_with_controls(state, FULL_TIME_SUMMARY_DELAY_SECONDS)
+            if state.abandon_requested:
+                return
+
             # Both halves of this period are done - a score-summary posts
             # either way, then either the match is decided or another
             # period is offered.
@@ -2532,10 +2591,7 @@ class MatchCentreView(discord.ui.View):
 
     async def _open_team_filter(self, interaction: discord.Interaction):
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT team_id, team_name FROM teams WHERE team_name != 'Draft Pool' ORDER BY team_name"
-            )
-            all_teams = await cursor.fetchall()
+            all_teams = await fetch_teams_for_dropdown(db)
         team_view = _TeamMatchesView(self, all_teams)
         team_view.update_components()
         await interaction.response.edit_message(
@@ -2595,7 +2651,7 @@ class _TeamMatchesView(discord.ui.View):
     def __init__(self, round_view: MatchCentreView, all_teams, team_id=None, team_name=None):
         super().__init__(timeout=1800)
         self.round_view = round_view
-        self.all_teams = all_teams  # [(team_id, team_name), ...] - fetched once
+        self.all_teams = all_teams  # [(team_id, team_name, emoji_id), ...] - fetched once
         self.team_id = team_id
         self.team_name = team_name
         self.season_id = round_view.season_id
@@ -2674,11 +2730,13 @@ class _TeamMatchesView(discord.ui.View):
 class _TeamPickSelect(discord.ui.Select):
     def __init__(self, parent_view: _TeamMatchesView):
         self.parent_view = parent_view
-        options = [
-            discord.SelectOption(label=team_name, value=str(team_id), default=(team_id == parent_view.team_id))
-            for team_id, team_name in parent_view.all_teams
-        ]
-        super().__init__(placeholder="Select a team...", options=options[:25])
+        # _TeamMatchesView has no cog of its own - it reaches the bot through
+        # the MatchCentreView it was opened from.
+        options = build_team_options(
+            parent_view.round_view.cog.bot, parent_view.all_teams,
+            selected=parent_view.team_id,
+        )
+        super().__init__(placeholder="Select a team...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
         self.parent_view.team_id = int(self.values[0])

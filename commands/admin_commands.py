@@ -1084,8 +1084,12 @@ class AdminCommands(commands.Cog):
                 draft_column_names = [col[1] for col in draft_columns]
 
                 # Build SELECT query based on available columns
-                draft_select = "draft_id as Draft_ID, draft_name as Draft_Name, season_number as Season_Number, status as Status, rounds as Rounds, rookie_contract_years as Rookie_Contract_Years, created_at as Created_At, ladder_set_at as Ladder_Set_At"
-                draft_col_list = ['Draft_ID', 'Draft_Name', 'Season_Number', 'Status', 'Rounds', 'Rookie_Contract_Years', 'Created_At', 'Ladder_Set_At']
+                # Ladder_Set_At is deliberately NOT exported - it's an internal
+                # bookkeeping timestamp (when a draft's order was first set from
+                # the ladder), not something an admin edits. It's still read on
+                # import when an older file happens to carry the column.
+                draft_select = "draft_id as Draft_ID, draft_name as Draft_Name, season_number as Season_Number, status as Status, rounds as Rounds, rookie_contract_years as Rookie_Contract_Years, created_at as Created_At"
+                draft_col_list = ['Draft_ID', 'Draft_Name', 'Season_Number', 'Status', 'Rounds', 'Rookie_Contract_Years', 'Created_At']
 
                 if 'started_at' in draft_column_names:
                     draft_select += ", started_at as Started_At"
@@ -2001,7 +2005,10 @@ class AdminCommands(commands.Cog):
                         rounds = int(row['Rounds']) if pd.notna(row['Rounds']) else 4
                         rookie_contract_years = int(row['Rookie_Contract_Years']) if pd.notna(row['Rookie_Contract_Years']) else 3
                         created_at = str(row['Created_At']) if pd.notna(row['Created_At']) and row['Created_At'] else None
-                        ladder_set_at = str(row['Ladder_Set_At']) if pd.notna(row['Ladder_Set_At']) and row['Ladder_Set_At'] else None
+                        # No longer exported, so guard with 'in row' the way the
+                        # other optional columns below do - a current export file
+                        # simply has no Ladder_Set_At column at all.
+                        ladder_set_at = str(row['Ladder_Set_At']) if 'Ladder_Set_At' in row and pd.notna(row['Ladder_Set_At']) and row['Ladder_Set_At'] else None
                         started_at = str(row['Started_At']) if 'Started_At' in row and pd.notna(row['Started_At']) and row['Started_At'] else None
                         completed_at = str(row['Completed_At']) if 'Completed_At' in row and pd.notna(row['Completed_At']) and row['Completed_At'] else None
                         current_pick_number = int(row['Current_Pick_Number']) if 'Current_Pick_Number' in row and pd.notna(row['Current_Pick_Number']) else 0
