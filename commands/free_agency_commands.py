@@ -3,7 +3,10 @@ from discord import app_commands
 from discord.ext import commands
 import aiosqlite
 from config import DB_PATH
-from utils import get_current_season, is_admin_user, calculate_contract_expiry, get_team_emoji, get_team_emoji_str, get_user_team
+from utils import (
+    get_current_season, is_admin_user, calculate_contract_expiry, get_team_emoji, get_team_emoji_str, get_user_team,
+    fetch_teams_for_dropdown, build_team_options,
+)
 from commands.lineup_commands import clear_departed_players_from_lineups
 from compensation_image import render_compensation_chart_image
 
@@ -97,65 +100,36 @@ class FreeAgencyCommands(commands.Cog):
                 # Check for active free agency period
                 status, _ = await get_fa_period_for_season(db, current_season)
 
-                if status:
-                    # Re-register free re-sign button views
-                    if status == 'resign':
-                        cursor = await db.execute(
-                            """SELECT DISTINCT t.team_id
-                               FROM teams t
-                               JOIN players p ON t.team_id = p.team_id
-                               WHERE p.contract_expiry = ?""",
-                            (current_season,)
-                        )
-                        teams_with_free_agents = await cursor.fetchall()
+                if status in ('resign', 'matching'):
+                    # The resign and matching phase-start notifications
+                    # carry a persistent FreeAgencyNotificationView (one
+                    # "Open Free Agency Hub" button, custom_id
+                    # "fa_notification_open_hub") - re-register one
+                    # instance per team that has a free agent this season,
+                    # so already-posted notification messages keep working
+                    # after a bot restart. The bidding-phase notification
+                    # is a single buttonless post to the shared auctions
+                    # channel (see send_bidding_notifications), so there's
+                    # nothing to re-register during that phase.
+                    cursor = await db.execute(
+                        """SELECT DISTINCT t.team_id
+                           FROM teams t
+                           JOIN players p ON t.team_id = p.team_id
+                           WHERE p.contract_expiry = ?""",
+                        (current_season,)
+                    )
+                    teams_with_fas = await cursor.fetchall()
 
-                        for (team_id,) in teams_with_free_agents:
-                            allowance = await self.calculate_free_resign_allowance(db, team_id, current_season)
-                            if allowance > 0:
-                                view = FreeResignButtonView(self.bot, current_season, team_id, allowance)
-                                self.bot.add_view(view)
+                    for (team_id,) in teams_with_fas:
+                        view = FreeAgencyNotificationView(self.bot, current_season, team_id)
+                        self.bot.add_view(view)
 
-                        print(f"Re-registered {len(teams_with_free_agents)} free re-sign button views")
-
-                    # Re-register matching notification views
-                    elif status == 'matching':
-                        cursor = await db.execute(
-                            """SELECT DISTINCT t.team_id
-                               FROM free_agency_results r
-                               JOIN teams t ON r.original_team_id = t.team_id
-                               WHERE r.season_number = ? AND r.winning_team_id IS NOT NULL""",
-                            (current_season,)
-                        )
-                        teams_with_losses = await cursor.fetchall()
-
-                        for (team_id,) in teams_with_losses:
-                            view = MatchingNotificationView(self.bot, current_season, team_id)
-                            self.bot.add_view(view)
-
-                        print(f"Re-registered {len(teams_with_losses)} matching notification views")
+                    print(f"Re-registered {len(teams_with_fas)} free agency notification views")
 
         except Exception as e:
             print(f"Error registering persistent views: {e}")
             import traceback
             traceback.print_exc()
-
-    async def team_autocomplete(
-        self,
-        interaction: discord.Interaction,
-        current: str,
-    ) -> list[app_commands.Choice[str]]:
-        """Autocomplete for team names"""
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                cursor = await db.execute("SELECT team_name FROM teams ORDER BY team_name")
-                teams = await cursor.fetchall()
-                return [
-                    app_commands.Choice(name=team[0], value=team[0])
-                    for team in teams
-                    if current.lower() in team[0].lower()
-                ][:25]
-        except Exception:
-            return []
 
     async def free_agent_autocomplete(
         self,
@@ -620,78 +594,69 @@ class FreeAgencyCommands(commands.Cog):
 
         return chunks
 
-    @app_commands.command(name="viewfreeagents", description="View players whose contracts expire this season")
-    @app_commands.describe(team="Filter by team (optional)")
-    @app_commands.autocomplete(team=team_autocomplete)
-    async def view_free_agents(self, interaction: discord.Interaction, team: str = None):
-        await interaction.response.defer(ephemeral=True)
+    async def fetch_free_agents_grouped(self, db, current_season, team_id=None):
+        """Free agents (players.contract_expiry == current_season), optionally
+        filtered to one team_id, grouped into {team_name: {emoji_id, players:
+        [(name, pos, age, ovr), ...]}} - shared by /freeagencyhub's "View Free
+        Agents" button (was previously the standalone /viewfreeagents command)."""
+        if team_id is not None:
+            cursor = await db.execute(
+                """SELECT p.player_id, p.name, p.position, p.overall_rating, p.age, t.team_name, t.emoji_id
+                   FROM players p
+                   JOIN teams t ON p.team_id = t.team_id
+                   WHERE p.contract_expiry = ? AND t.team_id = ?
+                   ORDER BY p.overall_rating DESC, p.name""",
+                (current_season, team_id)
+            )
+        else:
+            cursor = await db.execute(
+                """SELECT p.player_id, p.name, p.position, p.overall_rating, p.age, t.team_name, t.emoji_id
+                   FROM players p
+                   JOIN teams t ON p.team_id = t.team_id
+                   WHERE p.contract_expiry = ?
+                   ORDER BY t.team_name, p.overall_rating DESC, p.name""",
+                (current_season,)
+            )
+        free_agents = await cursor.fetchall()
+
+        teams_dict = {}
+        for _, name, pos, ovr, age, team_name, emoji_id in free_agents:
+            if team_name not in teams_dict:
+                teams_dict[team_name] = {'emoji_id': emoji_id, 'players': []}
+            teams_dict[team_name]['players'].append((name, pos, age, ovr))
+        return teams_dict, len(free_agents)
+
+    async def send_bidding_notifications(self, db, current_season):
+        """Posts the live-bidding-phase announcement ONCE to the shared
+        auctions channel (settings key 'auctions_log_channel_id'), not
+        per-team channels like resign/matching - bidding is a league-wide
+        event (every club can bid on every other club's free agents), so
+        one shared post fits better than N near-identical per-team ones.
+        No button on this one (unlike the resign/matching notifications) -
+        a persistent view registered without a message_id is dispatched
+        by custom_id alone, so multiple registered instances collide; the
+        per-team notifications get away with it because each is
+        functionally identical from any team's perspective once resolved,
+        but a single shared message has no "the" team to default to, so
+        it's simpler to just leave the button off and let teams use
+        /freeagencyhub or /placebid directly. Shared by both
+        start_bidding_period paths (transitioning from 'resign', and
+        starting bidding directly with no resign phase). Returns
+        (notifications_sent, skipped_teams) to match the existing
+        resign/matching helpers' return shape - notifications_sent is 0
+        or 1, skipped_teams explains why if 0."""
+        log_channel = await self.get_auctions_log_channel(db)
+        if not log_channel:
+            return 0, ["No auctions channel configured (use /config to set one)"]
+
+        embed = FreeAgencyNotificationView.create_bidding_embed(current_season)
 
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                # Get current season (active or offseason)
-                current_season = await get_current_season(db)
-                if current_season is None:
-                    await interaction.followup.send("❌ No active season found!")
-                    return
-
-                # Build query based on team filter
-                if team:
-                    # Verify team exists
-                    cursor = await db.execute(
-                        "SELECT team_id FROM teams WHERE LOWER(team_name) = LOWER(?)",
-                        (team,)
-                    )
-                    team_result = await cursor.fetchone()
-                    if not team_result:
-                        await interaction.followup.send(f"❌ Team '{team}' not found!")
-                        return
-
-                    # Get free agents for specific team
-                    cursor = await db.execute(
-                        """SELECT p.player_id, p.name, p.position, p.overall_rating, p.age, t.team_name, t.emoji_id
-                           FROM players p
-                           JOIN teams t ON p.team_id = t.team_id
-                           WHERE p.contract_expiry = ? AND LOWER(t.team_name) = LOWER(?)
-                           ORDER BY p.overall_rating DESC, p.name""",
-                        (current_season, team)
-                    )
-                else:
-                    # Get all free agents
-                    cursor = await db.execute(
-                        """SELECT p.player_id, p.name, p.position, p.overall_rating, p.age, t.team_name, t.emoji_id
-                           FROM players p
-                           JOIN teams t ON p.team_id = t.team_id
-                           WHERE p.contract_expiry = ?
-                           ORDER BY t.team_name, p.overall_rating DESC, p.name""",
-                        (current_season,)
-                    )
-
-                free_agents = await cursor.fetchall()
-
-                if not free_agents:
-                    if team:
-                        await interaction.followup.send(f"No free agents found for {team} in Season {current_season}.")
-                    else:
-                        await interaction.followup.send(f"No free agents found for Season {current_season}.")
-                    return
-
-                # Group by team
-                teams_dict = {}
-                for _, name, pos, ovr, age, team_name, emoji_id in free_agents:
-                    if team_name not in teams_dict:
-                        teams_dict[team_name] = {
-                            'emoji_id': emoji_id,
-                            'players': []
-                        }
-                    teams_dict[team_name]['players'].append((name, pos, age, ovr))
-
-                # Create paginated view
-                view = FreeAgentsView(self.bot, teams_dict, current_season, len(free_agents))
-                embed = view.create_embed()
-                await interaction.followup.send(embed=embed, view=view)
-
+            await log_channel.send(embed=embed)
+            return 1, []
         except Exception as e:
-            await interaction.followup.send(f"❌ Error: {e}")
+            print(f"Error posting bidding notification to auctions channel: {e}")
+            return 0, [f"Failed to post to auctions channel: {e}"]
 
     @app_commands.command(name="placebid", description="Place a bid on an opposition free agent")
     @app_commands.describe(
@@ -779,7 +744,7 @@ class FreeAgencyCommands(commands.Cog):
                         f"❌ Insufficient points!\n\n"
                         f"**Available:** {remaining_points} points\n"
                         f"**Bid Amount:** {amount} points\n\n"
-                        f"Use `/auctionsmenu` to view your bids."
+                        f"Use `/freeagencyhub` to view your bids."
                     )
                     return
 
@@ -835,7 +800,7 @@ class FreeAgencyCommands(commands.Cog):
                 )
                 embed.add_field(
                     name="Player",
-                    value=f"{emoji_str}**{player_name}** ({pos}, {age}, {ovr}) - {team_name}",
+                    value=f"{emoji_str}**{player_name}** ({pos}, {age}, {ovr})",
                     inline=False
                 )
                 embed.add_field(
@@ -848,7 +813,7 @@ class FreeAgencyCommands(commands.Cog):
                     value=f"{new_remaining} points",
                     inline=True
                 )
-                embed.set_footer(text="View all bids: /auctionsmenu")
+                embed.set_footer(text="View all bids: /freeagencyhub")
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
@@ -857,68 +822,27 @@ class FreeAgencyCommands(commands.Cog):
         # Sent outside the try block so a failure here can't be mistaken for the bid itself failing
         await interaction.followup.send(embed=embed)
 
-    @app_commands.command(name="auctionsmenu", description="View your bids and remaining auction points")
-    async def auctions_menu(self, interaction: discord.Interaction):
+    @app_commands.command(name="freeagencyhub", description="Your free agency dashboard - re-signs, bids, matching, and league info")
+    async def free_agency_hub(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Get current season (active or offseason)
                 current_season = await get_current_season(db)
                 if current_season is None:
                     await interaction.followup.send("❌ No active season found!")
                     return
 
-                # Check if there's an active bidding period
-                period_status, max_points = await get_fa_period_for_season(db, current_season)
-                if not period_status:
-                    await interaction.followup.send("❌ No free agency period active!")
-                    return
-
-                if period_status not in ('bidding', 'matching'):
-                    await interaction.followup.send(f"❌ No active free agency period! Current status: {period_status}")
-                    return
-
-                # Get user's team
                 user_team_id, user_team_name = await get_user_team(db, interaction.user)
 
-                if not user_team_id:
-                    await interaction.followup.send("❌ You don't have a team role!")
-                    return
+                user_team_emoji_id = None
+                if user_team_id is not None:
+                    cursor = await db.execute("SELECT emoji_id FROM teams WHERE team_id = ?", (user_team_id,))
+                    row = await cursor.fetchone()
+                    user_team_emoji_id = row[0] if row else None
 
-                # Get user's bids
-                # During matching period, include 'winning' bids; during bidding, only 'active' bids
-                if period_status == 'matching':
-                    cursor = await db.execute(
-                        """SELECT b.bid_id, b.player_id, b.bid_amount, p.name, p.position, p.age, p.overall_rating,
-                                  t.team_name, t.emoji_id
-                           FROM free_agency_bids b
-                           JOIN players p ON b.player_id = p.player_id
-                           JOIN teams t ON p.team_id = t.team_id
-                           WHERE b.season_number = ? AND b.team_id = ? AND b.status IN ('active', 'winning')
-                           ORDER BY b.bid_amount DESC, p.name""",
-                        (current_season, user_team_id)
-                    )
-                else:
-                    cursor = await db.execute(
-                        """SELECT b.bid_id, b.player_id, b.bid_amount, p.name, p.position, p.age, p.overall_rating,
-                                  t.team_name, t.emoji_id
-                           FROM free_agency_bids b
-                           JOIN players p ON b.player_id = p.player_id
-                           JOIN teams t ON p.team_id = t.team_id
-                           WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'active'
-                           ORDER BY b.bid_amount DESC, p.name""",
-                        (current_season, user_team_id)
-                    )
-                bids = await cursor.fetchall()
-
-                # Calculate remaining points
-                total_spent = sum(bid[2] for bid in bids)
-                remaining_points = max_points - total_spent
-
-                # Create view
-                view = AuctionsMenuView(self.bot, user_team_id, user_team_name, bids, remaining_points, max_points, current_season, period_status)
-                embed = view.create_embed()
+                view = FreeAgencyHubView(self.bot, user_team_id, user_team_name, current_season, emoji_id=user_team_emoji_id)
+                embed = await view.build(db)
                 await interaction.followup.send(embed=embed, view=view)
 
         except Exception as e:
@@ -1128,7 +1052,7 @@ class FreeAgencyCommands(commands.Cog):
 
                 # Get all teams with free agents and calculate their allowances
                 cursor = await db.execute(
-                    """SELECT DISTINCT t.team_id, t.team_name, t.channel_id
+                    """SELECT DISTINCT t.team_id, t.team_name, t.channel_id, t.emoji_id
                        FROM teams t
                        JOIN players p ON t.team_id = p.team_id
                        WHERE p.contract_expiry = ?""",
@@ -1136,50 +1060,42 @@ class FreeAgencyCommands(commands.Cog):
                 )
                 teams_with_fas = await cursor.fetchall()
 
-                # Resend notifications to eligible teams
+                # Resend to EVERY team with a free agent, not just ones with
+                # a nonzero re-sign allowance - same reasoning as
+                # start_resign_period's initial notification.
                 notifications_sent = 0
 
-                for team_id, team_name, channel_id in teams_with_fas:
-                    # Calculate how many free re-signs this team gets
+                for team_id, team_name, channel_id, emoji_id in teams_with_fas:
                     allowance = await self.calculate_free_resign_allowance(db, team_id, current_season)
 
-                    if allowance > 0 and channel_id:
-                        # Get the team's free agents
-                        cursor = await db.execute(
-                            """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating
-                               FROM players p
-                               WHERE p.team_id = ? AND p.contract_expiry = ?
-                               ORDER BY p.overall_rating DESC, p.name""",
-                            (team_id, current_season)
-                        )
-                        free_agents = await cursor.fetchall()
+                    if not channel_id:
+                        continue
 
-                        # Build embed
-                        embed = discord.Embed(
-                            title=f"🔄 Free Re-Signs Available - {team_name}",
-                            description=f"You have **{allowance}** free re-sign(s) available based on your free agents.",
-                            color=discord.Color.blue()
-                        )
+                    cursor = await db.execute(
+                        """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating
+                           FROM players p
+                           WHERE p.team_id = ? AND p.contract_expiry = ?
+                           ORDER BY p.overall_rating DESC, p.name""",
+                        (team_id, current_season)
+                    )
+                    free_agents = await cursor.fetchall()
 
-                        fa_list = [f"{name} ({pos}, {age}, {ovr})" for _, name, pos, age, ovr in free_agents]
-                        embed.add_field(
-                            name=f"Your Free Agents ({len(free_agents)})",
-                            value="\n".join(fa_list) if fa_list else "None",
-                            inline=False
-                        )
+                    band_by_player_id = {}
+                    for player_id, name, pos, age, ovr in free_agents:
+                        band_by_player_id[player_id] = await self.get_compensation_band(db, age, ovr)
 
-                        embed.set_footer(text="Use the button below to select which players to re-sign for free.")
+                    embed = FreeAgencyNotificationView.create_resign_embed(
+                        self.bot, emoji_id, allowance, free_agents, band_by_player_id
+                    )
 
-                        # Create view with button to open selection UI
-                        view = FreeResignButtonView(self.bot, current_season, team_id, allowance)
-
-                        try:
-                            channel = self.bot.get_channel(int(channel_id))
-                            if channel:
-                                await channel.send(embed=embed, view=view)
-                                notifications_sent += 1
-                        except Exception as e:
-                            print(f"Error resending notification to {team_name}: {e}")
+                    try:
+                        channel = self.bot.get_channel(int(channel_id))
+                        if channel:
+                            view = FreeAgencyNotificationView(self.bot, current_season, team_id)
+                            await channel.send(embed=embed, view=view)
+                            notifications_sent += 1
+                    except Exception as e:
+                        print(f"Error resending notification to {team_name}: {e}")
 
                 await interaction.followup.send(f"✅ Resent free re-sign notifications to {notifications_sent} teams.")
 
@@ -1220,7 +1136,7 @@ class FreeAgencyCommands(commands.Cog):
 
                 # Get all teams with free agents and calculate their allowances
                 cursor = await db.execute(
-                    """SELECT DISTINCT t.team_id, t.team_name, t.channel_id
+                    """SELECT DISTINCT t.team_id, t.team_name, t.channel_id, t.emoji_id
                        FROM teams t
                        JOIN players p ON t.team_id = p.team_id
                        WHERE p.contract_expiry = ?""",
@@ -1228,71 +1144,56 @@ class FreeAgencyCommands(commands.Cog):
                 )
                 teams_with_fas = await cursor.fetchall()
 
-                # Send notifications to eligible teams
+                # Send notifications to EVERY team with a free agent, not
+                # just ones with a nonzero re-sign allowance - a team with
+                # 0 allowance still needs to know it's the resign phase and
+                # which of its players are free agents (they're about to
+                # become bid targets for opposition clubs either way).
                 notifications_sent = 0
                 skipped_teams = []  # Teams eligible but not notified, with a reason
 
-                for team_id, team_name, channel_id in teams_with_fas:
-                    # Calculate how many free re-signs this team gets
+                for team_id, team_name, channel_id, emoji_id in teams_with_fas:
                     allowance = await self.calculate_free_resign_allowance(db, team_id, current_season)
 
-                    if allowance > 0:
-                        if not channel_id:
-                            skipped_teams.append(f"{team_name}: no channel configured")
-                            continue
+                    if not channel_id:
+                        skipped_teams.append(f"{team_name}: no channel configured")
+                        continue
 
-                        # Get the team's free agents
-                        cursor = await db.execute(
-                            """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating
-                               FROM players p
-                               WHERE p.team_id = ? AND p.contract_expiry = ?
-                               ORDER BY p.overall_rating DESC, p.name""",
-                            (team_id, current_season)
-                        )
-                        free_agents = await cursor.fetchall()
+                    cursor = await db.execute(
+                        """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating
+                           FROM players p
+                           WHERE p.team_id = ? AND p.contract_expiry = ?
+                           ORDER BY p.overall_rating DESC, p.name""",
+                        (team_id, current_season)
+                    )
+                    free_agents = await cursor.fetchall()
 
-                        # Build embed
-                        embed = discord.Embed(
-                            title="🔄 Free Re-Sign Period Started!",
-                            description=f"You have **{allowance}** free re-sign{'s' if allowance != 1 else ''} available.",
-                            color=discord.Color.blue()
-                        )
+                    band_by_player_id = {}
+                    for player_id, name, pos, age, ovr in free_agents:
+                        band_by_player_id[player_id] = await self.get_compensation_band(db, age, ovr)
 
-                        # Add free agents list
-                        fa_list = []
-                        for player_id, name, pos, age, ovr in free_agents:
-                            band = await self.get_compensation_band(db, age, ovr)
-                            band_text = f"Band {band}" if band else "No comp"
-                            fa_list.append(f"**{name}** ({pos}, {age}, {ovr}) - {band_text}")
+                    embed = FreeAgencyNotificationView.create_resign_embed(
+                        self.bot, emoji_id, allowance, free_agents, band_by_player_id
+                    )
 
-                        embed.add_field(
-                            name=f"Your Free Agents ({len(free_agents)})",
-                            value="\n".join(fa_list) if fa_list else "None",
-                            inline=False
-                        )
-
-                        embed.set_footer(text="Use the button below to select which players to re-sign for free.")
-
-                        # Create view with button to open selection UI
-                        view = FreeResignButtonView(self.bot, current_season, team_id, allowance)
-
-                        try:
-                            channel = self.bot.get_channel(int(channel_id))
-                            if channel:
-                                await channel.send(embed=embed, view=view)
-                                notifications_sent += 1
-                            else:
-                                skipped_teams.append(f"{team_name}: channel not found (ID: {channel_id})")
-                        except Exception as e:
-                            skipped_teams.append(f"{team_name}: {e}")
-                            print(f"Error sending notification to {team_name}: {e}")
+                    try:
+                        channel = self.bot.get_channel(int(channel_id))
+                        if channel:
+                            view = FreeAgencyNotificationView(self.bot, current_season, team_id)
+                            await channel.send(embed=embed, view=view)
+                            notifications_sent += 1
+                        else:
+                            skipped_teams.append(f"{team_name}: channel not found (ID: {channel_id})")
+                    except Exception as e:
+                        skipped_teams.append(f"{team_name}: {e}")
+                        print(f"Error sending notification to {team_name}: {e}")
 
                 # Build response
                 response = (
                     f"✅ **Free Re-Sign Period Started!**\n\n"
                     f"Season: {current_season}\n"
                     f"Free Agents: {fa_count}\n"
-                    f"Notifications sent: {notifications_sent} teams with free re-sign allowances\n\n"
+                    f"Notifications sent: {notifications_sent} teams with free agents\n\n"
                 )
                 if skipped_teams:
                     response += f"⚠️ **Not notified:**\n" + "\n".join(skipped_teams[:20]) + "\n\n"
@@ -1365,12 +1266,19 @@ class FreeAgencyCommands(commands.Cog):
                         await set_fa_period_status(db, 'bidding')
                         await db.commit()
 
-                        await interaction.followup.send(
+                        bidding_notifications_sent, bidding_skipped = await self.send_bidding_notifications(db, current_season)
+
+                        response = (
                             f"✅ **Free Agency Bidding Period Started!**\n\n"
                             f"Season: {current_season}\n"
-                            f"Free re-signs processed successfully!\n\n"
-                            f"Teams can now use `/placebid` to bid on opposition free agents."
+                            f"Free re-signs processed successfully!\n"
+                            f"Auctions channel announcement: {'posted' if bidding_notifications_sent else 'FAILED'}\n\n"
                         )
+                        if bidding_skipped:
+                            response += "⚠️ **Issue:**\n" + "\n".join(bidding_skipped[:20]) + "\n\n"
+                        response += "Teams can now use `/placebid` to bid on opposition free agents."
+
+                        await interaction.followup.send(response)
                         return
                     else:
                         await interaction.followup.send(f"❌ Free agency period already exists for Season {current_season} (status: {status})")
@@ -1394,12 +1302,19 @@ class FreeAgencyCommands(commands.Cog):
                 await set_fa_period(db, 'bidding', current_season, DEFAULT_AUCTION_POINTS)
                 await db.commit()
 
-                await interaction.followup.send(
+                bidding_notifications_sent, bidding_skipped = await self.send_bidding_notifications(db, current_season)
+
+                response = (
                     f"✅ **Free Agency Bidding Period Started!**\n\n"
                     f"Season: {current_season}\n"
-                    f"Free Agents: {fa_count}\n\n"
-                    f"Teams can now use `/placebid` to bid on opposition free agents."
+                    f"Free Agents: {fa_count}\n"
+                    f"Auctions channel announcement: {'posted' if bidding_notifications_sent else 'FAILED'}\n\n"
                 )
+                if bidding_skipped:
+                    response += "⚠️ **Issue:**\n" + "\n".join(bidding_skipped[:20]) + "\n\n"
+                response += "Teams can now use `/placebid` to bid on opposition free agents."
+
+                await interaction.followup.send(response)
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
@@ -1495,21 +1410,25 @@ class FreeAgencyCommands(commands.Cog):
                 # Log winning bids
                 await self.log_winning_bids(db, current_season)
 
-                # Send matching interface to teams with winning bids on their players
+                # Send a matching notification to EVERY team with a free
+                # agent this season, not just teams who got a bid - a team
+                # with no bids still gets told "none of your free agents
+                # received a bid" rather than nothing at all.
                 cursor = await db.execute(
-                    """SELECT DISTINCT t.team_id, t.team_name, t.channel_id
+                    """SELECT DISTINCT t.team_id, t.team_name, t.channel_id, t.emoji_id
                        FROM free_agency_results r
                        JOIN teams t ON r.original_team_id = t.team_id
-                       WHERE r.season_number = ? AND r.winning_team_id IS NOT NULL
+                       WHERE r.season_number = ?
                        AND t.channel_id IS NOT NULL""",
                     (current_season,)
                 )
-                teams_with_losses = await cursor.fetchall()
+                teams_with_fas = await cursor.fetchall()
 
                 matching_messages_sent = 0
-                for team_id, team_name, channel_id in teams_with_losses:
+                for team_id, team_name, channel_id, emoji_id in teams_with_fas:
                     try:
-                        # Get this team's players with bids
+                        # Get this team's players with bids (empty if none
+                        # of their free agents received one)
                         cursor = await db.execute(
                             """SELECT r.player_id, p.name, p.position, p.age, p.overall_rating,
                                       r.winning_team_id, t.team_name, t.emoji_id, r.winning_bid
@@ -1521,35 +1440,56 @@ class FreeAgencyCommands(commands.Cog):
                         )
                         player_bids = await cursor.fetchall()
 
-                        if player_bids:
-                            # Calculate remaining points for this team (auction_points - winning bids on other teams' players)
-                            cursor = await db.execute(
-                                """SELECT COALESCE(SUM(b.bid_amount), 0)
-                                   FROM free_agency_bids b
-                                   JOIN players p ON b.player_id = p.player_id
-                                   WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'winning'
-                                   AND p.team_id != ?""",
-                                (current_season, team_id, team_id)
-                            )
-                            winning_bid_total = (await cursor.fetchone())[0]
-                            remaining_points = auction_points - winning_bid_total
+                        # Calculate remaining points for this team (auction_points - winning bids on other teams' players)
+                        cursor = await db.execute(
+                            """SELECT COALESCE(SUM(b.bid_amount), 0)
+                               FROM free_agency_bids b
+                               JOIN players p ON b.player_id = p.player_id
+                               WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'winning'
+                               AND p.team_id != ?""",
+                            (current_season, team_id, team_id)
+                        )
+                        winning_bid_total = (await cursor.fetchone())[0]
+                        remaining_points = auction_points - winning_bid_total
 
-                            channel = self.bot.get_channel(int(channel_id))
-                            if channel:
-                                # Create static notification view with button
-                                view = MatchingNotificationView(self.bot, current_season, team_id)
-                                embed = await MatchingNotificationView.create_notification_embed(
-                                    self.bot, current_season, team_id, team_name, player_bids, remaining_points
-                                )
-                                await channel.send(embed=embed, view=view)
-                                matching_messages_sent += 1
+                        band_by_player_id = {}
+                        for player_id, name, pos, age, ovr, *_ in player_bids:
+                            band_by_player_id[player_id] = await self.get_compensation_band(db, age, ovr)
+
+                        # This team's OWN bids placed on opposition free
+                        # agents this period (won or lost) - r.original_team_id
+                        # is the player's team AT THE TIME the bid was
+                        # resolved, so this stays correct even once
+                        # winning bids move players between teams.
+                        cursor = await db.execute(
+                            """SELECT r.player_id, p.name, p.position, p.age, p.overall_rating,
+                                      r.original_team_id, ot.team_name, ot.emoji_id, b.bid_amount, b.status
+                               FROM free_agency_bids b
+                               JOIN players p ON b.player_id = p.player_id
+                               JOIN free_agency_results r ON r.season_number = b.season_number AND r.player_id = b.player_id
+                               JOIN teams ot ON r.original_team_id = ot.team_id
+                               WHERE b.season_number = ? AND b.team_id = ? AND b.status IN ('winning', 'outbid')
+                               ORDER BY b.status, p.name""",
+                            (current_season, team_id)
+                        )
+                        placed_bids = await cursor.fetchall()
+
+                        channel = self.bot.get_channel(int(channel_id))
+                        if channel:
+                            view = FreeAgencyNotificationView(self.bot, current_season, team_id)
+                            embed = await FreeAgencyNotificationView.create_matching_embed(
+                                self.bot, current_season, team_id, team_name, emoji_id, player_bids, remaining_points,
+                                band_by_player_id, placed_bids
+                            )
+                            await channel.send(embed=embed, view=view)
+                            matching_messages_sent += 1
                     except Exception as e:
                         print(f"Error sending matching message to {team_name}: {e}")
 
                 await interaction.followup.send(
                     f"✅ **Matching Period Started!**\n\n"
                     f"Winning bids calculated: {results_created}\n"
-                    f"Matching interfaces sent: {matching_messages_sent} teams\n\n"
+                    f"Notifications sent: {matching_messages_sent} teams with free agents\n\n"
                     f"Teams can now match bids on their players."
                 )
 
@@ -1604,21 +1544,23 @@ class FreeAgencyCommands(commands.Cog):
                     await interaction.followup.send(f"❌ Period is not in matching status (current: {status})")
                     return
 
-                # Get teams with winning bids on their players
+                # Resend to EVERY team with a free agent this season, not
+                # just teams who got a bid - same reasoning as
+                # start_matching_period's initial notification.
                 cursor = await db.execute(
-                    """SELECT DISTINCT t.team_id, t.team_name, t.channel_id
+                    """SELECT DISTINCT t.team_id, t.team_name, t.channel_id, t.emoji_id
                        FROM free_agency_results r
                        JOIN teams t ON r.original_team_id = t.team_id
-                       WHERE r.season_number = ? AND r.winning_team_id IS NOT NULL
+                       WHERE r.season_number = ?
                        AND t.channel_id IS NOT NULL""",
                     (current_season,)
                 )
-                teams_with_losses = await cursor.fetchall()
+                teams_with_fas = await cursor.fetchall()
 
                 matching_messages_sent = 0
-                for team_id, team_name, channel_id in teams_with_losses:
+                for team_id, team_name, channel_id, emoji_id in teams_with_fas:
                     try:
-                        # Get this team's players with bids
+                        # Get this team's players with bids (empty if none)
                         cursor = await db.execute(
                             """SELECT r.player_id, p.name, p.position, p.age, p.overall_rating,
                                       r.winning_team_id, t.team_name, t.emoji_id, r.winning_bid
@@ -1630,28 +1572,49 @@ class FreeAgencyCommands(commands.Cog):
                         )
                         player_bids = await cursor.fetchall()
 
-                        if player_bids:
-                            # Calculate remaining points for this team (auction_points - winning bids on other teams' players)
-                            cursor = await db.execute(
-                                """SELECT COALESCE(SUM(b.bid_amount), 0)
-                                   FROM free_agency_bids b
-                                   JOIN players p ON b.player_id = p.player_id
-                                   WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'winning'
-                                   AND p.team_id != ?""",
-                                (current_season, team_id, team_id)
-                            )
-                            winning_bid_total = (await cursor.fetchone())[0]
-                            remaining_points = auction_points - winning_bid_total
+                        # Calculate remaining points for this team (auction_points - winning bids on other teams' players)
+                        cursor = await db.execute(
+                            """SELECT COALESCE(SUM(b.bid_amount), 0)
+                               FROM free_agency_bids b
+                               JOIN players p ON b.player_id = p.player_id
+                               WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'winning'
+                               AND p.team_id != ?""",
+                            (current_season, team_id, team_id)
+                        )
+                        winning_bid_total = (await cursor.fetchone())[0]
+                        remaining_points = auction_points - winning_bid_total
 
-                            channel = self.bot.get_channel(int(channel_id))
-                            if channel:
-                                # Create static notification view with button
-                                view = MatchingNotificationView(self.bot, current_season, team_id)
-                                embed = await MatchingNotificationView.create_notification_embed(
-                                    self.bot, current_season, team_id, team_name, player_bids, remaining_points
-                                )
-                                await channel.send(embed=embed, view=view)
-                                matching_messages_sent += 1
+                        band_by_player_id = {}
+                        for player_id, name, pos, age, ovr, *_ in player_bids:
+                            band_by_player_id[player_id] = await self.get_compensation_band(db, age, ovr)
+
+                        # This team's OWN bids placed on opposition free
+                        # agents this period (won or lost) - r.original_team_id
+                        # is the player's team AT THE TIME the bid was
+                        # resolved, so this stays correct even once
+                        # winning bids move players between teams.
+                        cursor = await db.execute(
+                            """SELECT r.player_id, p.name, p.position, p.age, p.overall_rating,
+                                      r.original_team_id, ot.team_name, ot.emoji_id, b.bid_amount, b.status
+                               FROM free_agency_bids b
+                               JOIN players p ON b.player_id = p.player_id
+                               JOIN free_agency_results r ON r.season_number = b.season_number AND r.player_id = b.player_id
+                               JOIN teams ot ON r.original_team_id = ot.team_id
+                               WHERE b.season_number = ? AND b.team_id = ? AND b.status IN ('winning', 'outbid')
+                               ORDER BY b.status, p.name""",
+                            (current_season, team_id)
+                        )
+                        placed_bids = await cursor.fetchall()
+
+                        channel = self.bot.get_channel(int(channel_id))
+                        if channel:
+                            view = FreeAgencyNotificationView(self.bot, current_season, team_id)
+                            embed = await FreeAgencyNotificationView.create_matching_embed(
+                                self.bot, current_season, team_id, team_name, emoji_id, player_bids, remaining_points,
+                                band_by_player_id, placed_bids
+                            )
+                            await channel.send(embed=embed, view=view)
+                            matching_messages_sent += 1
                     except Exception as e:
                         print(f"Error sending matching message to {team_name}: {e}")
 
@@ -1723,7 +1686,7 @@ class FreeAgencyCommands(commands.Cog):
 
                 # Build summary embed
                 embed = discord.Embed(
-                    title=f"Free Agency Period Summary - {team_emoji}{team_name}",
+                    title=f"{team_emoji}Free Agency Period Summary",
                     color=discord.Color.blue()
                 )
 
@@ -2107,155 +2070,520 @@ class FreeAgencyCommands(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}")
 
-    @app_commands.command(name="contractstatus", description="View contract expiry years for all players on a team")
-    @app_commands.describe(team="The team to view contracts for (defaults to your team)")
-    @app_commands.autocomplete(team=team_autocomplete)
-    async def contract_status(self, interaction: discord.Interaction, team: str = None):
-        """Display contract expiry years for all players on a team"""
-        await interaction.response.defer(ephemeral=True)
+    async def build_contract_status_embed(self, db, team_id, team_name, emoji_id=None):
+        """The contract-status embed for one team, grouped by contract
+        expiry year with 1024-char field auto-splitting - shared by
+        /freeagencyhub's "Contract Status" button (was previously the
+        standalone /contractstatus command). Returns None if the team has
+        no players."""
+        cursor = await db.execute(
+            """SELECT contract_expiry, name, position, age, overall_rating
+               FROM players
+               WHERE team_id = ?
+               ORDER BY contract_expiry ASC, overall_rating DESC, name""",
+            (team_id,)
+        )
+        players = await cursor.fetchall()
+        if not players:
+            return None
 
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                # If no team specified, get user's team
-                if team is None:
-                    # Get user's team from roles
-                    user_team_id, user_team_name = await get_user_team(db, interaction.user)
+        players_by_year = {}
+        for contract_expiry, name, pos, age, ovr in players:
+            players_by_year.setdefault(contract_expiry, []).append(f"{name} ({pos}, {age}, {ovr})")
 
-                    if not user_team_id:
-                        await interaction.followup.send("❌ You don't have a team role! Please specify a team.")
-                        return
+        emoji_str = get_team_emoji_str(self.bot, emoji_id)
+        embed = discord.Embed(
+            title=f"{emoji_str}📋 Contract Status",
+            description="Players grouped by contract expiry year",
+            color=discord.Color.blue()
+        )
 
-                    team_id, team_name = user_team_id, user_team_name
-                else:
-                    # Get specified team info
-                    cursor = await db.execute(
-                        "SELECT team_id, team_name FROM teams WHERE team_name = ?",
-                        (team,)
-                    )
-                    team_result = await cursor.fetchone()
-                    if not team_result:
-                        await interaction.followup.send(f"❌ Team '{team}' not found!")
-                        return
-
-                    team_id, team_name = team_result
-
-                # Get all players grouped by contract expiry year
-                cursor = await db.execute(
-                    """SELECT contract_expiry, name, position, age, overall_rating
-                       FROM players
-                       WHERE team_id = ?
-                       ORDER BY contract_expiry ASC, overall_rating DESC, name""",
-                    (team_id,)
-                )
-                players = await cursor.fetchall()
-
-                if not players:
-                    await interaction.followup.send(f"❌ No players found for {team_name}!")
-                    return
-
-                # Group players by contract expiry year
-                players_by_year = {}
-                for contract_expiry, name, pos, age, ovr in players:
-                    if contract_expiry not in players_by_year:
-                        players_by_year[contract_expiry] = []
-                    players_by_year[contract_expiry].append(f"{name} ({pos}, {age}, {ovr})")
-
-                # Build response
-                embed = discord.Embed(
-                    title=f"📋 Contract Status - {team_name}",
-                    description=f"Players grouped by contract expiry year",
-                    color=discord.Color.blue()
-                )
-
-                for year in sorted(players_by_year.keys()):
-                    player_list = players_by_year[year]
-                    # Add field for each year
-                    field_value = "\n".join(player_list)
-                    # Discord has a 1024 character limit per field
-                    if len(field_value) > 1024:
-                        # Split into multiple fields if needed
-                        chunks = []
-                        current_chunk = []
-                        current_length = 0
-                        for player in player_list:
-                            if current_length + len(player) + 1 > 1024:
-                                chunks.append("\n".join(current_chunk))
-                                current_chunk = [player]
-                                current_length = len(player)
-                            else:
-                                current_chunk.append(player)
-                                current_length += len(player) + 1
-                        if current_chunk:
-                            chunks.append("\n".join(current_chunk))
-
-                        for i, chunk in enumerate(chunks):
-                            field_name = f"Season {year}" if i == 0 else f"Season {year} (cont.)"
-                            embed.add_field(name=field_name, value=chunk, inline=False)
+        for year in sorted(players_by_year.keys()):
+            player_list = players_by_year[year]
+            field_value = "\n".join(player_list)
+            if len(field_value) > 1024:
+                chunks = []
+                current_chunk = []
+                current_length = 0
+                for player in player_list:
+                    if current_length + len(player) + 1 > 1024:
+                        chunks.append("\n".join(current_chunk))
+                        current_chunk = [player]
+                        current_length = len(player)
                     else:
-                        embed.add_field(name=f"Season {year}", value=field_value, inline=False)
+                        current_chunk.append(player)
+                        current_length += len(player) + 1
+                if current_chunk:
+                    chunks.append("\n".join(current_chunk))
 
-                await interaction.followup.send(embed=embed)
+                for i, chunk in enumerate(chunks):
+                    field_name = f"Season {year}" if i == 0 else f"Season {year} (cont.)"
+                    embed.add_field(name=field_name, value=chunk, inline=False)
+            else:
+                embed.add_field(name=f"Season {year}", value=field_value, inline=False)
 
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error: {e}")
+        return embed
 
-    @app_commands.command(name="compensationtable", description="View the compensation chart for free agency")
-    async def compensation_table(self, interaction: discord.Interaction):
-        """Display the compensation chart as a color-coded Age x OVR grid
-        image - band 1 (best/most valuable free agent) through band 5
-        (least), gray for any (age, ovr) combination outside the chart
-        entirely (no compensation applies). Replaced the old text output,
-        which split the same data into three separate ASCII code-block
-        tables (70-79/80-89/90-99 OVR) that were hard to read as one
-        picture."""
-        await interaction.response.defer(ephemeral=True)
+    async def build_compensation_chart_file(self, db):
+        """The compensation chart as a color-coded Age x OVR grid image -
+        band 1 (best/most valuable free agent) through band 5 (least),
+        gray for any (age, ovr) combination outside the chart entirely (no
+        compensation applies). Shared by /freeagencyhub's "Compensation
+        Table" button (was previously the standalone /compensationtable
+        command). Returns None if the chart has no data."""
+        cursor = await db.execute(
+            """SELECT min_age, max_age, min_ovr, max_ovr, compensation_band
+               FROM compensation_chart
+               ORDER BY compensation_band, min_age, min_ovr"""
+        )
+        compensation_data = await cursor.fetchall()
+        if not compensation_data:
+            return None
 
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                cursor = await db.execute(
-                    """SELECT min_age, max_age, min_ovr, max_ovr, compensation_band
-                       FROM compensation_chart
-                       ORDER BY compensation_band, min_age, min_ovr"""
+        # Build map of (age, ovr) -> band by expanding ranges, and track
+        # the real min/max seen so the grid always covers exactly what's
+        # in the chart, not a hardcoded guess.
+        band_by_age_ovr = {}
+        min_age = min_ovr = None
+        max_age = max_ovr = None
+        for chart_min_age, chart_max_age, chart_min_ovr, chart_max_ovr, band in compensation_data:
+            age_end = chart_max_age if chart_max_age is not None else chart_min_age
+            ovr_end = chart_max_ovr if chart_max_ovr is not None else chart_min_ovr
+
+            min_age = chart_min_age if min_age is None else min(min_age, chart_min_age)
+            max_age = age_end if max_age is None else max(max_age, age_end)
+            min_ovr = chart_min_ovr if min_ovr is None else min(min_ovr, chart_min_ovr)
+            max_ovr = ovr_end if max_ovr is None else max(max_ovr, ovr_end)
+
+            for age in range(chart_min_age, age_end + 1):
+                for ovr in range(chart_min_ovr, ovr_end + 1):
+                    band_by_age_ovr[(age, ovr)] = band
+
+        ages = list(range(min_age, max_age + 1))
+        ovrs = list(range(min_ovr, max_ovr + 1))
+
+        buffer = render_compensation_chart_image(band_by_age_ovr, ages, ovrs)
+        return discord.File(buffer, filename="compensation_chart.png")
+
+
+class FreeAgencyHubView(discord.ui.View):
+    """/freeagencyhub's main menu - always available regardless of free
+    agency phase (unlike the old /auctionsmenu, gated to bidding/matching
+    only). Shows a phase-specific section (free re-signs / live bidding /
+    bid matching, or nothing if no period is active) plus three
+    always-available buttons (View Free Agents, View Team Contract Status,
+    View Compensation Table) that replace the old standalone
+    /viewfreeagents, /contractstatus, /compensationtable commands. Each of
+    those three posts its own separate ephemeral message rather than
+    editing the hub in place, so the hub itself stays put underneath.
+
+    team_id/team_name may be None (user has no team role) - the
+    phase-specific section is simply omitted in that case, since every
+    phase action requires a team; the always-available buttons still work
+    (Contract Status then requires picking a team explicitly)."""
+    def __init__(self, bot, team_id, team_name, season_number, emoji_id=None):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.team_id = team_id
+        self.team_name = team_name
+        self.emoji_id = emoji_id
+        self.season_number = season_number
+        self.period_status = None
+        self.max_points = DEFAULT_AUCTION_POINTS
+        # Populated by build() - whichever of these apply to the current
+        # phase stay at their defaults (None/[]) otherwise.
+        self.resign_allowance = None
+        self.free_agents = []
+        self.bids = []
+        self.remaining_points = None
+        self.winning_bids = []
+
+    async def build(self, db):
+        """(Re)loads phase state and this team's data for it, then
+        rebuilds components. Called on open and every time control returns
+        to the hub (so it always reflects the current phase, even if it
+        changed while a sub-view was open)."""
+        self.period_status, self.max_points = await get_fa_period_for_season(db, self.season_number)
+
+        if self.team_id is not None and self.period_status == 'resign':
+            cog = self.bot.get_cog('FreeAgencyCommands')
+            self.resign_allowance = await cog.calculate_free_resign_allowance(db, self.team_id, self.season_number)
+            cursor = await db.execute(
+                """SELECT player_id, name, position, age, overall_rating
+                   FROM players WHERE team_id = ? AND contract_expiry = ?
+                   ORDER BY overall_rating DESC, name""",
+                (self.team_id, self.season_number)
+            )
+            self.free_agents = await cursor.fetchall()
+
+        elif self.team_id is not None and self.period_status == 'bidding':
+            cursor = await db.execute(
+                """SELECT b.bid_id, b.player_id, b.bid_amount, p.name, p.position, p.age, p.overall_rating,
+                          t.team_name, t.emoji_id
+                   FROM free_agency_bids b
+                   JOIN players p ON b.player_id = p.player_id
+                   JOIN teams t ON p.team_id = t.team_id
+                   WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'active'
+                   ORDER BY b.bid_amount DESC, p.name""",
+                (self.season_number, self.team_id)
+            )
+            self.bids = await cursor.fetchall()
+            self.remaining_points = self.max_points - sum(bid[2] for bid in self.bids)
+
+        elif self.team_id is not None and self.period_status == 'matching':
+            cursor = await db.execute(
+                """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating,
+                          t.team_id, t.team_name, t.emoji_id, b.bid_amount
+                   FROM players p
+                   JOIN free_agency_bids b ON p.player_id = b.player_id
+                   JOIN teams t ON b.team_id = t.team_id
+                   WHERE p.team_id = ? AND b.season_number = ? AND b.status = 'winning'
+                   ORDER BY b.bid_amount DESC""",
+                (self.team_id, self.season_number)
+            )
+            self.winning_bids = await cursor.fetchall()
+            cursor = await db.execute(
+                """SELECT COALESCE(SUM(b.bid_amount), 0)
+                   FROM free_agency_bids b
+                   JOIN players p ON b.player_id = p.player_id
+                   WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'winning'
+                   AND p.team_id != ?""",
+                (self.season_number, self.team_id, self.team_id)
+            )
+            winning_bid_total = (await cursor.fetchone())[0]
+            self.remaining_points = self.max_points - winning_bid_total
+
+        elif self.team_id is not None:
+            # No free agency period active (or a phase this hub doesn't
+            # otherwise show data for) - still worth showing the team's
+            # free agents, since "who's out of contract" is useful
+            # information year-round, not just during the resign phase.
+            cursor = await db.execute(
+                """SELECT player_id, name, position, age, overall_rating
+                   FROM players WHERE team_id = ? AND contract_expiry = ?
+                   ORDER BY overall_rating DESC, name""",
+                (self.team_id, self.season_number)
+            )
+            self.free_agents = await cursor.fetchall()
+
+        self.update_buttons()
+        return self.create_embed()
+
+    def update_buttons(self):
+        self.clear_items()
+
+        if self.team_id is not None:
+            if self.period_status == 'resign':
+                btn = discord.ui.Button(
+                    label="🔄 Select Free Re-Signs",
+                    style=discord.ButtonStyle.primary, row=0
                 )
-                compensation_data = await cursor.fetchall()
+                btn.callback = self.open_resigns_callback
+                self.add_item(btn)
+            elif self.period_status == 'bidding':
+                btn = discord.ui.Button(label="💰 Withdraw Bids", style=discord.ButtonStyle.primary, row=0)
+                btn.callback = self.open_bids_callback
+                self.add_item(btn)
+            elif self.period_status == 'matching':
+                btn = discord.ui.Button(
+                    label=f"🤝 Choose Bids to Match ({len(self.winning_bids)})",
+                    style=discord.ButtonStyle.primary, row=0,
+                    disabled=not self.winning_bids
+                )
+                btn.callback = self.open_matching_callback
+                self.add_item(btn)
 
-                if not compensation_data:
-                    await interaction.followup.send("❌ No compensation chart data found! Use `/migratedb` to initialize.")
-                    return
+        fa_btn = discord.ui.Button(label="View Free Agents", style=discord.ButtonStyle.secondary, row=1)
+        fa_btn.callback = self.view_free_agents_callback
+        self.add_item(fa_btn)
 
-                # Build map of (age, ovr) -> band by expanding ranges, and
-                # track the real min/max seen so the grid always covers
-                # exactly what's in the chart, not a hardcoded guess.
-                band_by_age_ovr = {}
-                min_age = min_ovr = None
-                max_age = max_ovr = None
-                for chart_min_age, chart_max_age, chart_min_ovr, chart_max_ovr, band in compensation_data:
-                    age_end = chart_max_age if chart_max_age is not None else chart_min_age
-                    ovr_end = chart_max_ovr if chart_max_ovr is not None else chart_min_ovr
+        cs_btn = discord.ui.Button(label="View Team Contract Status", style=discord.ButtonStyle.secondary, row=1)
+        cs_btn.callback = self.contract_status_callback
+        self.add_item(cs_btn)
 
-                    min_age = chart_min_age if min_age is None else min(min_age, chart_min_age)
-                    max_age = age_end if max_age is None else max(max_age, age_end)
-                    min_ovr = chart_min_ovr if min_ovr is None else min(min_ovr, chart_min_ovr)
-                    max_ovr = ovr_end if max_ovr is None else max(max_ovr, ovr_end)
+        comp_btn = discord.ui.Button(label="View Compensation Table", style=discord.ButtonStyle.secondary, row=1)
+        comp_btn.callback = self.compensation_table_callback
+        self.add_item(comp_btn)
 
-                    for age in range(chart_min_age, age_end + 1):
-                        for ovr in range(chart_min_ovr, ovr_end + 1):
-                            band_by_age_ovr[(age, ovr)] = band
+        refresh_btn = discord.ui.Button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=2)
+        refresh_btn.callback = self.refresh_callback
+        self.add_item(refresh_btn)
 
-                ages = list(range(min_age, max_age + 1))
-                ovrs = list(range(min_ovr, max_ovr + 1))
+    def create_embed(self):
+        if self.period_status == 'resign':
+            status_line = "**Status:** Free Re-Signs Phase"
+        elif self.period_status == 'bidding':
+            status_line = "**Status:** Live Bidding Phase"
+        elif self.period_status == 'matching':
+            status_line = "**Status:** Bid Matching Phase"
+        elif self.period_status:
+            status_line = f"**Status:** {self.period_status.title()}"
+        else:
+            status_line = "**Status:** No free agency period active"
 
-                buffer = render_compensation_chart_image(band_by_age_ovr, ages, ovrs)
-                file = discord.File(buffer, filename="compensation_chart.png")
-                await interaction.followup.send(file=file)
+        if self.team_id is not None:
+            emoji_str = get_team_emoji_str(self.bot, self.emoji_id)
+            title = f"{emoji_str}Free Agency Hub"
+            description = status_line
+        else:
+            title = "Free Agency Hub"
+            description = f"*You don't have a team role.*\n{status_line}"
 
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error: {e}")
+        embed = discord.Embed(title=title, description=description, color=discord.Color.blue())
+
+        if self.team_id is None:
+            return embed
+
+        if self.period_status == 'resign':
+            fa_lines = [f"• {name} ({pos}, {age}, {ovr})" for _, name, pos, age, ovr in self.free_agents]
+            embed.add_field(
+                name=f"Your Free Agents ({len(self.free_agents)})",
+                value="\n".join(fa_lines) if fa_lines else "*None*",
+                inline=False
+            )
+            embed.add_field(name="​", value=f"Free Re-Signs Available: **{self.resign_allowance}**", inline=False)
+            embed.set_footer(text="Click 'Select Free Re-Signs' to choose who to re-sign for free.")
+
+        elif self.period_status == 'bidding':
+            embed.add_field(
+                name="Auction Points",
+                value=f"**Remaining:** {self.remaining_points} / {self.max_points}",
+                inline=False
+            )
+            if self.bids:
+                bid_lines = [
+                    f"• {get_team_emoji_str(self.bot, emoji_id)}**{name}** ({pos}, {age}, {ovr}) - **{amount} pts**"
+                    for _, _, amount, name, pos, age, ovr, opp_team, emoji_id in self.bids
+                ]
+                embed.add_field(name=f"Your Active Bids ({len(self.bids)})", value="\n".join(bid_lines), inline=False)
+            else:
+                embed.add_field(name="Your Active Bids", value="*No active bids*", inline=False)
+            embed.set_footer(text="Use /placebid to bid on opposition players.")
+
+        elif self.period_status == 'matching':
+            embed.add_field(
+                name="Auction Points",
+                value=f"**Remaining:** {self.remaining_points} / {self.max_points}",
+                inline=False
+            )
+            if self.winning_bids:
+                bid_lines = [
+                    f"• {get_team_emoji_str(self.bot, emoji_id)}**{name}** ({pos}, {age}, {ovr}) - {bidding_team} bid **{amount} pts**"
+                    for _, name, pos, age, ovr, _, bidding_team, emoji_id, amount in self.winning_bids
+                ]
+                embed.add_field(name=f"Winning Bids on Your Players ({len(self.winning_bids)})", value="\n".join(bid_lines), inline=False)
+            else:
+                embed.add_field(name="Winning Bids on Your Players", value="*None*", inline=False)
+            embed.set_footer(text="Click 'Choose Bids to Match' to decide which players to keep.")
+
+        else:
+            fa_lines = [f"• {name} ({pos}, {age}, {ovr})" for _, name, pos, age, ovr in self.free_agents]
+            embed.add_field(
+                name=f"Your Free Agents ({len(self.free_agents)})",
+                value="\n".join(fa_lines) if fa_lines else "*None*",
+                inline=False
+            )
+
+        return embed
+
+    async def open_resigns_callback(self, interaction: discord.Interaction):
+        if self.resign_allowance == 0:
+            await interaction.response.send_message(
+                "❌ Your team has no free re-signs",
+                ephemeral=True
+            )
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """SELECT player_id, confirmed FROM free_agency_resigns
+                   WHERE season_number = ? AND team_id = ?""",
+                (self.season_number, self.team_id)
+            )
+            existing_selections = await cursor.fetchall()
+        selected_players = [p[0] for p in existing_selections]
+        is_confirmed = any(p[1] for p in existing_selections) if existing_selections else False
+
+        view = FreeResignSelectionView(
+            self.bot, self.team_id, self.resign_allowance,
+            self.free_agents, selected_players, is_confirmed, self.season_number, hub=self
+        )
+        embed = view.create_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def open_bids_callback(self, interaction: discord.Interaction):
+        view = AuctionsMenuView(
+            self.bot, self.team_id, self.team_name, self.bids, self.remaining_points,
+            self.max_points, self.season_number, self.period_status, hub=self, emoji_id=self.emoji_id
+        )
+        embed = view.create_embed()
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def open_matching_callback(self, interaction: discord.Interaction):
+        async with aiosqlite.connect(DB_PATH) as db:
+            # free_agency_results (not self.winning_bids, which comes from
+            # free_agency_bids and carries no confirmation info) is the
+            # source of truth for whether this team already confirmed its
+            # matches this matching period - start_matching_period inserts
+            # one row per player here with matched=0 and confirmed_at NULL,
+            # then MatchingView.confirm_callback sets both once the team
+            # locks in their decisions. If already confirmed, show the
+            # confirmed summary instead of the live decision UI, exactly
+            # like re-opening a submitted form should.
+            #
+            # Scoped to self.winning_bids' player_ids only - free_agency_results
+            # also has a row for every free agent who got NO bid at all
+            # (start_matching_period's "will be auto re-signed" branch),
+            # and those rows' confirmed_at never gets touched by
+            # confirm_callback (which only ever updates the bid-on players
+            # in self.matches). Pulling in every result row for the team
+            # both double-counted "Let Go" against players that were never
+            # actually up for matching, and made has_confirmed depend on
+            # which row happened to come back first.
+            winning_bid_player_ids = [row[0] for row in self.winning_bids]
+            result_rows = []
+            if winning_bid_player_ids:
+                placeholders = ",".join("?" * len(winning_bid_player_ids))
+                cursor = await db.execute(
+                    f"""SELECT r.player_id, r.matched, r.confirmed_at
+                        FROM free_agency_results r
+                        WHERE r.season_number = ? AND r.original_team_id = ?
+                        AND r.player_id IN ({placeholders})""",
+                    (self.season_number, self.team_id, *winning_bid_player_ids)
+                )
+                result_rows = await cursor.fetchall()
+            has_confirmed = bool(result_rows) and all(row[2] is not None for row in result_rows)
+
+            matching_view = MatchingView(
+                self.bot, self.team_id, self.team_name, self.winning_bids,
+                self.season_number, self.remaining_points, hub=self, emoji_id=self.emoji_id
+            )
+
+            if has_confirmed:
+                matches = {player_id: bool(matched) for player_id, matched, _ in result_rows}
+                matching_view.matches = matches
+                matching_view.confirmed = True
+                matching_view.update_buttons()
+
+                total_cost = 0
+                for player_id, _, _, age, _, _, _, _, bid in self.winning_bids:
+                    if matches.get(player_id, False):
+                        total_cost += round(bid * 0.8) if age <= 25 else bid
+
+                matched_count = sum(1 for m in matches.values() if m)
+                let_go_count = len(matches) - matched_count
+
+                emoji_str = get_team_emoji_str(self.bot, self.emoji_id)
+                embed = discord.Embed(
+                    title=f"{emoji_str}Matches Confirmed",
+                    description="Your matching decisions have been recorded.",
+                    color=discord.Color.green()
+                )
+                embed.add_field(
+                    name="Summary",
+                    value=f"**Matched:** {matched_count} player{'s' if matched_count != 1 else ''} ({total_cost} pts)\n"
+                          f"**Let Go:** {let_go_count} player{'s' if let_go_count != 1 else ''}",
+                    inline=False
+                )
+                embed.set_footer(text="Click 'Edit Matches' to make changes • Waiting for admin to end matching period...")
+            else:
+                embed = await matching_view.create_embed()
+
+        await interaction.response.edit_message(embed=embed, view=matching_view)
+
+    async def view_free_agents_callback(self, interaction: discord.Interaction):
+        async with aiosqlite.connect(DB_PATH) as db:
+            cog = self.bot.get_cog('FreeAgencyCommands')
+            teams_dict, total_count = await cog.fetch_free_agents_grouped(db, self.season_number)
+            all_teams = await fetch_teams_for_dropdown(db)
+        view = FreeAgentsView(self.bot, teams_dict, self.season_number, total_count, all_teams=all_teams)
+        embed = view.create_embed()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    async def contract_status_callback(self, interaction: discord.Interaction):
+        async with aiosqlite.connect(DB_PATH) as db:
+            all_teams = await fetch_teams_for_dropdown(db)
+            if self.team_id is not None:
+                cog = self.bot.get_cog('FreeAgencyCommands')
+                embed = await cog.build_contract_status_embed(db, self.team_id, self.team_name, self.emoji_id)
+            else:
+                embed = None
+        view = _ContractStatusView(self.bot, self.season_number, all_teams=all_teams,
+                                    team_id=self.team_id, team_name=self.team_name)
+        if embed is None:
+            embed = view.no_team_embed()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    async def compensation_table_callback(self, interaction: discord.Interaction):
+        async with aiosqlite.connect(DB_PATH) as db:
+            cog = self.bot.get_cog('FreeAgencyCommands')
+            file = await cog.build_compensation_chart_file(db)
+        if file is None:
+            await interaction.response.send_message(
+                "❌ No compensation chart data found! Use `/migratedb` to initialize.", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(file=file, ephemeral=True)
+
+    async def refresh_callback(self, interaction: discord.Interaction):
+        async with aiosqlite.connect(DB_PATH) as db:
+            embed = await self.build(db)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+class _ContractStatusView(discord.ui.View):
+    """Team-filtered Contract Status. Posted as its own standalone
+    (ephemeral) message from /freeagencyhub's "View Team Contract Status"
+    button - the hub message underneath is left untouched. Defaults to the
+    user's own team if they have one; anyone can pick another team from
+    the dropdown."""
+    def __init__(self, bot, season_number, all_teams, team_id=None, team_name=None):
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.season_number = season_number
+        self.all_teams = all_teams
+        self.team_id = team_id
+        self.team_name = team_name
+        self.update_components()
+
+    def update_components(self):
+        self.clear_items()
+        self.add_item(_ContractStatusTeamSelect(self))
+
+    def no_team_embed(self):
+        return discord.Embed(
+            title="📋 Contract Status",
+            description="You don't have a team role - pick a team from the dropdown to view its contracts.",
+            color=discord.Color.blue()
+        )
+
+
+class _ContractStatusTeamSelect(discord.ui.Select):
+    def __init__(self, parent_view):
+        self.parent_view = parent_view
+        options = build_team_options(parent_view.bot, parent_view.all_teams, selected=parent_view.team_id)
+        super().__init__(placeholder="Select a team...", options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        team_id = int(self.values[0])
+        team_row = next((t for t in self.parent_view.all_teams if t[0] == team_id), None)
+        team_name = team_row[1] if team_row else "Unknown"
+        emoji_id = team_row[2] if team_row and len(team_row) > 2 else None
+        self.parent_view.team_id = team_id
+        self.parent_view.team_name = team_name
+        self.parent_view.update_components()
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            cog = self.parent_view.bot.get_cog('FreeAgencyCommands')
+            embed = await cog.build_contract_status_embed(db, team_id, team_name, emoji_id)
+        await interaction.response.edit_message(embed=embed, view=self.parent_view)
 
 
 class FreeAgentsView(discord.ui.View):
-    """Paginated view for free agents list"""
-    def __init__(self, bot, teams_dict, season_number, total_fa_count):
+    """Paginated view for free agents list, with a team filter dropdown.
+    Posted as its own standalone (ephemeral) message from
+    /freeagencyhub's "View Free Agents" button - the hub message
+    underneath is left untouched, so there's no "Back to Hub" to wire up."""
+    def __init__(self, bot, teams_dict, season_number, total_fa_count, team_filter_id=None, all_teams=None):
         super().__init__(timeout=180)
         self.bot = bot
         self.teams_dict = teams_dict
@@ -2264,6 +2592,12 @@ class FreeAgentsView(discord.ui.View):
         self.teams_list = sorted(teams_dict.keys())
         self.current_page = 0
         self.teams_per_page = 5
+        self.team_filter_id = team_filter_id
+        # (team_id, team_name, emoji_id) rows for the filter dropdown -
+        # fetched once by whoever opens this view (fetch_teams_for_dropdown
+        # is async, so it can't be called from inside a Select's own
+        # synchronous __init__).
+        self.all_teams = all_teams or []
 
         self.update_buttons()
 
@@ -2271,14 +2605,17 @@ class FreeAgentsView(discord.ui.View):
         """Update navigation buttons"""
         self.clear_items()
 
-        total_pages = (len(self.teams_list) + self.teams_per_page - 1) // self.teams_per_page
+        self.add_item(_FreeAgentsTeamFilterSelect(self))
+
+        total_pages = max(1, (len(self.teams_list) + self.teams_per_page - 1) // self.teams_per_page)
 
         # Previous button
         prev_button = discord.ui.Button(
             label="◀ Previous",
             style=discord.ButtonStyle.secondary,
             disabled=self.current_page == 0,
-            custom_id="prev"
+            custom_id="prev",
+            row=1
         )
         prev_button.callback = self.prev_callback
         self.add_item(prev_button)
@@ -2288,7 +2625,8 @@ class FreeAgentsView(discord.ui.View):
             label=f"Page {self.current_page + 1}/{total_pages}",
             style=discord.ButtonStyle.secondary,
             disabled=True,
-            custom_id="page"
+            custom_id="page",
+            row=1
         )
         self.add_item(page_button)
 
@@ -2297,7 +2635,8 @@ class FreeAgentsView(discord.ui.View):
             label="Next ▶",
             style=discord.ButtonStyle.secondary,
             disabled=self.current_page >= total_pages - 1,
-            custom_id="next"
+            custom_id="next",
+            row=1
         )
         next_button.callback = self.next_callback
         self.add_item(next_button)
@@ -2353,187 +2692,251 @@ class FreeAgentsView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=self)
 
 
-class MatchingNotificationView(discord.ui.View):
-    """Static notification view with button to open matching interface"""
+class _FreeAgentsTeamFilterSelect(discord.ui.Select):
+    """Filters FreeAgentsView to one team, or clears back to all teams -
+    the dropdown-based replacement for the old /viewfreeagents team:
+    autocomplete parameter."""
+    def __init__(self, parent_view):
+        self.parent_view = parent_view
+        options = build_team_options(
+            parent_view.bot, parent_view.all_teams,
+            selected=parent_view.team_filter_id,
+            extra_options=[discord.SelectOption(
+                label="All teams", value="all",
+                default=parent_view.team_filter_id is None,
+            )],
+        )
+        super().__init__(placeholder="Filter by team...", options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+        team_filter_id = None if value == "all" else int(value)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            cog = self.parent_view.bot.get_cog('FreeAgencyCommands')
+            teams_dict, total_count = await cog.fetch_free_agents_grouped(
+                db, self.parent_view.season_number, team_filter_id
+            )
+
+        self.parent_view.teams_dict = teams_dict
+        self.parent_view.teams_list = sorted(teams_dict.keys())
+        self.parent_view.total_fa_count = total_count
+        self.parent_view.team_filter_id = team_filter_id
+        self.parent_view.current_page = 0
+        self.parent_view.update_buttons()
+        embed = self.parent_view.create_embed()
+        await interaction.response.edit_message(embed=embed, view=self.parent_view)
+
+
+class FreeAgencyNotificationView(discord.ui.View):
+    """Persistent notification view with a single "Open Free Agency Hub"
+    button - sent to each team's own channel for the resign and matching
+    phase-start notifications (one instance per team, team_id fixed at
+    construction). The bidding-phase notification is posted once to the
+    shared auctions channel instead and carries no button at all (see
+    send_bidding_notifications) - there's no single "the" team for a
+    persistent view's button to resolve to on a shared message. Always
+    routes into /freeagencyhub rather than jumping straight into a
+    phase-specific sub-view, so there's one consistent, always-navigable
+    entry point regardless of which notification was clicked."""
     def __init__(self, bot, season_number, team_id):
         super().__init__(timeout=None)  # Persistent view
         self.bot = bot
         self.season_number = season_number
         self.team_id = team_id
 
-    @discord.ui.button(label="Choose which bids to match", style=discord.ButtonStyle.primary, custom_id="matching_button")
-    async def open_matching(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Open the matching interface"""
+    @discord.ui.button(label="Open Free Agency Hub", style=discord.ButtonStyle.primary, custom_id="fa_notification_open_hub")
+    async def open_hub(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Get current season
                 current_season = await get_current_season(db)
 
-                # Check if period is still active
-                status, auction_points = await get_fa_period_for_season(db, self.season_number)
-                if status != 'matching':
-                    await interaction.response.send_message(
-                        "❌ The matching period has ended! Matches are no longer editable.",
-                        ephemeral=True
-                    )
-                    return
-
-                # Get team info
+                # Resolve the team from the CHANNEL the button was clicked
+                # in, not self.team_id - every team's notification view
+                # shares the same custom_id ("fa_notification_open_hub"),
+                # and bot.add_view() without a message_id only keeps the
+                # LAST-registered instance's dispatch after a restart, so
+                # self.team_id can silently belong to a different team than
+                # the one this specific message was posted for. The
+                # notification channel is fixed per-team (teams.channel_id),
+                # so it's an unambiguous way to find the right team
+                # regardless of which instance actually handled the click.
                 cursor = await db.execute(
-                    "SELECT team_name FROM teams WHERE team_id = ?",
-                    (self.team_id,)
+                    "SELECT team_id, team_name, emoji_id FROM teams WHERE channel_id = ?",
+                    (str(interaction.channel_id),)
                 )
                 team_result = await cursor.fetchone()
                 if not team_result:
+                    # Fallback for a channel that isn't a registered team
+                    # channel (shouldn't normally happen for this button).
+                    cursor = await db.execute(
+                        "SELECT team_id, team_name, emoji_id FROM teams WHERE team_id = ?", (self.team_id,)
+                    )
+                    team_result = await cursor.fetchone()
+                if not team_result:
                     await interaction.response.send_message("❌ Team not found!", ephemeral=True)
                     return
-                team_name = team_result[0]
+                team_id, team_name, emoji_id = team_result
 
-                # Get winning bids on this team's players
-                cursor = await db.execute(
-                    """SELECT r.player_id, p.name, p.position, p.age, p.overall_rating,
-                              r.winning_team_id, t.team_name, t.emoji_id, r.winning_bid, r.matched, r.confirmed_at
-                       FROM free_agency_results r
-                       JOIN players p ON r.player_id = p.player_id
-                       JOIN teams t ON r.winning_team_id = t.team_id
-                       WHERE r.season_number = ? AND r.original_team_id = ?""",
-                    (self.season_number, self.team_id)
-                )
-                player_bids = await cursor.fetchall()
-
-                if not player_bids:
-                    await interaction.response.send_message(
-                        "❌ No winning bids on your players to match!",
-                        ephemeral=True
-                    )
-                    return
-
-                # Check if team has already confirmed matches
-                has_confirmed = player_bids[0][10] is not None  # confirmed_at from first row
-
-                if has_confirmed:
-                    # Show confirmed embed instead of matching interface
-                    matches = {player_id: bool(matched) for player_id, _, _, _, _, _, _, _, _, matched, _ in player_bids}
-
-                    # Calculate remaining points
-                    cursor = await db.execute(
-                        """SELECT COALESCE(SUM(b.bid_amount), 0)
-                           FROM free_agency_bids b
-                           JOIN players p ON b.player_id = p.player_id
-                           WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'winning'
-                           AND p.team_id != ?""",
-                        (self.season_number, self.team_id, self.team_id)
-                    )
-                    winning_bid_total = (await cursor.fetchone())[0]
-                    remaining_points = auction_points - winning_bid_total
-
-                    # Create matching view and set it to confirmed state
-                    # Remove the extra fields from player_bids tuples (matched and confirmed_at)
-                    cleaned_player_bids = [(pid, name, pos, age, ovr, wtid, tname, emoji, bid)
-                                          for pid, name, pos, age, ovr, wtid, tname, emoji, bid, _, _ in player_bids]
-                    matching_view = MatchingView(self.bot, self.team_id, team_name, cleaned_player_bids, current_season, remaining_points)
-                    matching_view.matches = matches
-                    matching_view.confirmed = True
-                    matching_view.update_buttons()
-
-                    # Calculate total cost
-                    total_cost = sum(bid for player_id, _, _, _, _, _, _, _, bid, matched, _ in player_bids if matches.get(player_id, False))
-
-                    # Create confirmed embed
-                    embed = discord.Embed(
-                        title=f"✅ Matches Confirmed - {team_name}",
-                        description="Your matching decisions have been recorded.",
-                        color=discord.Color.green()
-                    )
-
-                    matched_count = sum(1 for m in matches.values() if m)
-                    let_go_count = len(matches) - matched_count
-
-                    embed.add_field(
-                        name="Summary",
-                        value=f"**Matched:** {matched_count} player{'s' if matched_count != 1 else ''} ({total_cost} pts)\n"
-                              f"**Let Go:** {let_go_count} player{'s' if let_go_count != 1 else ''}",
-                        inline=False
-                    )
-                    embed.set_footer(text="Click 'Edit Matches' to make changes • Waiting for admin to end matching period...")
-
-                    await interaction.response.send_message(embed=embed, view=matching_view, ephemeral=True)
-                else:
-                    # Show normal matching interface
-                    # Calculate remaining points
-                    cursor = await db.execute(
-                        """SELECT COALESCE(SUM(b.bid_amount), 0)
-                           FROM free_agency_bids b
-                           JOIN players p ON b.player_id = p.player_id
-                           WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'winning'
-                           AND p.team_id != ?""",
-                        (self.season_number, self.team_id, self.team_id)
-                    )
-                    winning_bid_total = (await cursor.fetchone())[0]
-                    remaining_points = auction_points - winning_bid_total
-
-                    # Remove the extra fields from player_bids tuples (matched and confirmed_at)
-                    cleaned_player_bids = [(pid, name, pos, age, ovr, wtid, tname, emoji, bid)
-                                          for pid, name, pos, age, ovr, wtid, tname, emoji, bid, _, _ in player_bids]
-
-                    # Create matching view
-                    matching_view = MatchingView(self.bot, self.team_id, team_name, cleaned_player_bids, current_season, remaining_points)
-                    embed = await matching_view.create_embed()
-                    await interaction.response.send_message(embed=embed, view=matching_view, ephemeral=True)
+                hub = FreeAgencyHubView(self.bot, team_id, team_name, current_season, emoji_id=emoji_id)
+                embed = await hub.build(db)
+                await interaction.response.send_message(embed=embed, view=hub, ephemeral=True)
 
         except Exception as e:
             await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
     @staticmethod
-    async def create_notification_embed(bot, season_number, team_id, team_name, player_bids, max_points):
-        """Create static notification embed"""
+    def notification_title(bot, emoji_id, phase_label):
+        """"{emoji}Free Agency - {Phase Name}" - the shared header format
+        for all three phase notifications, no team name (the channel
+        itself already belongs to one team)."""
+        emoji_str = get_team_emoji_str(bot, emoji_id)
+        return f"{emoji_str}Free Agency - {phase_label}"
+
+    @staticmethod
+    async def create_matching_embed(bot, season_number, team_id, team_name, emoji_id, player_bids, max_points,
+                                     band_by_player_id=None, placed_bids=None):
+        """The matching-phase notification embed. band_by_player_id maps
+        player_id -> compensation band (or None) - now sent to EVERY team
+        with a free agent this season, not just ones who got a bid, so
+        player_bids may be empty (shown as "No bids on your players").
+        placed_bids (optional) is this team's OWN bids placed on
+        opposition free agents this period - (player_id, name, pos, age,
+        ovr, original_team_id, original_team_name, original_emoji_id,
+        bid_amount, status) rows with status 'winning' or 'outbid' -
+        shown as a separate "Your Bids" section so a team can see which
+        of their own bids succeeded, not just what's happening to their
+        own free agents."""
+        band_by_player_id = band_by_player_id or {}
         embed = discord.Embed(
-            title=f"🤝 Free Agency Matching - {team_name}",
-            description="Your free agents have received bids. Choose which to match:",
+            title=FreeAgencyNotificationView.notification_title(bot, emoji_id, "Bid Matching Phase"),
+            description=("Your free agents have received bids. Choose which to match:"
+                          if player_bids else "None of your free agents received a bid."),
             color=discord.Color.orange()
         )
 
+        # Section order: bids received on your own players, then your
+        # remaining points, then bids you placed elsewhere. Remaining
+        # Points is appended into the SAME field as "Bids on Your
+        # Players" (one more line, not a separate embed field) so there's
+        # no gap between them - Discord spaces separate fields apart
+        # regardless of content, so merging is the only way to close it.
+        # Falls back to its own field when there's no bids-received
+        # section to attach to.
+        remaining_points_line = f"Remaining Points: **{max_points}**"
+
+        divider = "⎯" * 22
+
+        if player_bids:
+            player_lines = []
+            for player_id, name, pos, age, ovr, winning_team_id, bidding_team, bidding_emoji_id, bid in player_bids:
+                bidding_emoji_str = get_team_emoji_str(bot, bidding_emoji_id)
+
+                # Check if RFA (age <= 25) and calculate match cost
+                is_rfa = age <= 25
+                if is_rfa:
+                    match_cost = round(bid * 0.8)  # 20% discount
+                    rfa_label = " [RFA]"
+                    cost_display = f"**{match_cost} pts** (20% discount from {bid} pts)"
+                else:
+                    match_cost = bid
+                    rfa_label = ""
+                    cost_display = f"**{bid} pts**"
+
+                band = band_by_player_id.get(player_id)
+                band_text = f"Band {band}" if band else "No comp"
+
+                player_lines.append(
+                    f"**{name}**{rfa_label} ({pos}, {age}, {ovr}) - {band_text}\n"
+                    f"    └ {bidding_emoji_str}bid {cost_display}"
+                )
+            player_bids_body = "\n\n".join(player_lines)
+        else:
+            player_bids_body = "*None*"
+
         embed.add_field(
-            name="Remaining Points:",
-            value=f"**{max_points} pts**",
+            name="Bids on Your Players",
+            value=f"{player_bids_body}\n\n{divider}\n{remaining_points_line}\n{divider}",
             inline=False
         )
 
-        # List each player with bid info (no status or compensation)
-        player_lines = []
-        for player_id, name, pos, age, ovr, winning_team_id, bidding_team, emoji_id, bid in player_bids:
-            # Get emoji
-            emoji_str = get_team_emoji_str(bot, emoji_id)
-
-            # Check if RFA (age <= 25) and calculate match cost
-            is_rfa = age <= 25
-            if is_rfa:
-                match_cost = round(bid * 0.8)  # 20% discount
-                rfa_label = " [RFA]"
-                cost_display = f"**{match_cost} pts** (20% discount from {bid} pts)"
-            else:
-                match_cost = bid
-                rfa_label = ""
-                cost_display = f"**{bid} pts**"
-
-            player_lines.append(
-                f"**{name}**{rfa_label} ({pos}, {age}, {ovr})\n"
-                f"    └─ {emoji_str}{bidding_team} bid {cost_display}"
-            )
+        if placed_bids:
+            bid_lines = []
+            any_winning = False
+            for player_id, name, pos, age, ovr, original_team_id, original_team_name, original_emoji_id, bid_amount, status in placed_bids:
+                original_emoji_str = get_team_emoji_str(bot, original_emoji_id)
+                if status == 'winning':
+                    status_text = f"✅ **WON** - **{bid_amount} pts**"
+                    any_winning = True
+                else:
+                    status_text = f"❌ **LOST** ({bid_amount} pts refunded)"
+                bid_lines.append(
+                    f"{original_emoji_str}**{name}** ({pos}, {age}, {ovr}) - {status_text}"
+                )
+            your_bids_body = "\n".join(bid_lines)
+        else:
+            your_bids_body = "*None*"
+            any_winning = False
 
         embed.add_field(
-            name="\u200b",  # Zero-width space
-            value="\n\n".join(player_lines),
+            name="Your Bids",
+            value=your_bids_body,
             inline=False
         )
+        if any_winning:
+            embed.add_field(name="​", value="*Winning bids pending matches", inline=False)
 
-        embed.set_footer(text="Use /auctionsmenu if the below button doesn't work")
+        embed.set_footer(text="Use /freeagencyhub to choose which bids to match.")
         return embed
 
+    @staticmethod
+    def create_resign_embed(bot, emoji_id, allowance, free_agents, band_by_player_id):
+        """The free-resign-phase notification embed. free_agents rows are
+        (player_id, name, pos, age, ovr); band_by_player_id maps player_id
+        -> compensation band (or None)."""
+        embed = discord.Embed(
+            title=FreeAgencyNotificationView.notification_title(bot, emoji_id, "Free Re-Signs Phase"),
+            description=f"You have **{allowance}** free re-sign{'s' if allowance != 1 else ''} available.",
+            color=discord.Color.blue()
+        )
+
+        fa_list = []
+        for player_id, name, pos, age, ovr in free_agents:
+            band = band_by_player_id.get(player_id)
+            band_text = f"Band {band}" if band else "No comp"
+            fa_list.append(f"**{name}** ({pos}, {age}, {ovr}) - {band_text}")
+
+        embed.add_field(
+            name=f"Your Free Agents ({len(free_agents)})",
+            value="\n".join(fa_list) if fa_list else "None",
+            inline=False
+        )
+        embed.set_footer(text="Use /freeagencyhub to select which players to re-sign for free.")
+        return embed
+
+    @staticmethod
+    def create_bidding_embed(season_number):
+        """The live-bidding-phase notification - posted ONCE to the shared
+        auctions channel (not per-team channel like resign/matching),
+        since bidding is inherently a league-wide event, not a per-team
+        one - every club can see every other club's free agents and place
+        bids regardless of their own roster. No team emoji/free-agents
+        list here (there's no single "your team" for a shared message);
+        FreeAgencyNotificationView's button resolves the clicking user's
+        own team instead."""
+        return discord.Embed(
+            title=f"Season {season_number} Free Agency Auctions are LIVE",
+            description=(
+                "Use /placebid to bid on opposition free agents.\n\n"
+                "Use /freeagencyhub to view and withdraw your bids."
+            ),
+            color=discord.Color.gold()
+        )
 
 class MatchingView(discord.ui.View):
-    """Interactive UI for teams to match winning bids on their players"""
-    def __init__(self, bot, team_id, team_name, player_bids, season_number, max_points=300):
+    """Interactive UI for teams to match winning bids on their players -
+    reached from FreeAgencyHubView's "Choose Bids to Match" button."""
+    def __init__(self, bot, team_id, team_name, player_bids, season_number, max_points=300, hub=None, emoji_id=None):
         super().__init__(timeout=180)  # 3 minute timeout for ephemeral view
         self.bot = bot
         self.team_id = team_id
@@ -2542,6 +2945,9 @@ class MatchingView(discord.ui.View):
         self.season_number = season_number
         self.matches = {}  # player_id -> bool (True = match, False = don't match)
         self.confirmed = False  # Track if matches have been confirmed
+        self.hub = hub
+        self.emoji_id = emoji_id  # this team's OWN emoji, for embed titles - distinct
+        # from the per-player emoji_id in player_bids, which is the bidding team's
 
         # Store max points (remaining after winning bids on other teams' players)
         self.max_points = max_points
@@ -2556,7 +2962,7 @@ class MatchingView(discord.ui.View):
         """Update all buttons based on current state"""
         self.clear_items()
 
-        # If confirmed, only show "Edit Matches" button
+        # If confirmed, only show "Edit Matches" (+ Back to Hub) button
         if self.confirmed:
             edit_button = discord.ui.Button(
                 label="Edit Matches",
@@ -2566,6 +2972,10 @@ class MatchingView(discord.ui.View):
             )
             edit_button.callback = self.edit_matches_callback
             self.add_item(edit_button)
+            if self.hub is not None:
+                back_button = discord.ui.Button(label="← Back to Hub", style=discord.ButtonStyle.secondary, row=0)
+                back_button.callback = self.back_to_hub_callback
+                self.add_item(back_button)
             return
 
         # Add dropdown to select players to match (limit to 25)
@@ -2611,10 +3021,21 @@ class MatchingView(discord.ui.View):
         confirm_button.callback = self.confirm_callback
         self.add_item(confirm_button)
 
+        if self.hub is not None:
+            back_button = discord.ui.Button(label="← Back to Hub", style=discord.ButtonStyle.secondary, row=1)
+            back_button.callback = self.back_to_hub_callback
+            self.add_item(back_button)
+
+    async def back_to_hub_callback(self, interaction: discord.Interaction):
+        async with aiosqlite.connect(DB_PATH) as db:
+            embed = await self.hub.build(db)
+        await interaction.response.edit_message(embed=embed, view=self.hub)
+
     async def create_embed(self):
         """Create the embed showing current matching status"""
+        emoji_str = get_team_emoji_str(self.bot, self.emoji_id)
         embed = discord.Embed(
-            title=f"🤝 Free Agency Matching - {self.team_name}",
+            title=f"{emoji_str}Free Agency Matching",
             description="Your free agents have received bids. Choose which to match:",
             color=discord.Color.orange()
         )
@@ -2688,7 +3109,7 @@ class MatchingView(discord.ui.View):
 
             player_lines.append(
                 f"{status} **{name}**{rfa_label} ({pos}, {age}, {ovr})\n"
-                f"    └─ {emoji_str}{bidding_team} bid {cost_display}{comp_label}"
+                f"    └ {emoji_str}bid {cost_display}{comp_label}"
             )
 
         embed.add_field(
@@ -2697,7 +3118,6 @@ class MatchingView(discord.ui.View):
             inline=False
         )
 
-        embed.set_footer(text="Use /auctionsmenu if the below button doesn't work")
         return embed
 
     async def select_callback(self, interaction: discord.Interaction):
@@ -2794,8 +3214,9 @@ class MatchingView(discord.ui.View):
             self.confirmed = True
             self.update_buttons()
 
+            confirmed_emoji_str = get_team_emoji_str(self.bot, self.emoji_id)
             embed = discord.Embed(
-                title=f"✅ Matches Confirmed - {self.team_name}",
+                title=f"{confirmed_emoji_str}Matches Confirmed",
                 description="Your matching decisions have been recorded.",
                 color=discord.Color.green()
             )
@@ -2838,7 +3259,14 @@ class MatchingView(discord.ui.View):
 
 
 class AuctionsMenuView(discord.ui.View):
-    def __init__(self, bot, team_id, team_name, bids, remaining_points, max_points, season_number, period_status):
+    """The "Manage Bids" sub-view, reached from FreeAgencyHubView (only
+    ever shown during the 'bidding' phase now - the hub itself handles
+    displaying bids/points and decides when to open this, so the
+    resign/matching launch buttons this view used to carry (back when it
+    doubled as its own phase-aware home screen under the old /auctionsmenu)
+    are gone; a Back to Hub button replaces them)."""
+    def __init__(self, bot, team_id, team_name, bids, remaining_points, max_points, season_number, period_status,
+                 hub=None, emoji_id=None):
         super().__init__(timeout=180)
         self.bot = bot
         self.team_id = team_id
@@ -2848,6 +3276,8 @@ class AuctionsMenuView(discord.ui.View):
         self.max_points = max_points
         self.season_number = season_number
         self.period_status = period_status
+        self.hub = hub
+        self.emoji_id = emoji_id
         self.selected_bid_ids = []  # Store selected bids for withdrawal
 
         self.update_buttons()
@@ -2864,7 +3294,14 @@ class AuctionsMenuView(discord.ui.View):
                     discord.SelectOption(
                         label=f"{player_name} ({pos}, {age}, {ovr})",
                         description=f"Bid: {amount}pts",
-                        value=str(bid_id)
+                        value=str(bid_id),
+                        # Without this, rebuilding the dropdown after a
+                        # selection (see select_bids_callback) resets every
+                        # option back to unselected, so the picked names
+                        # visibly vanish from the dropdown the moment it's
+                        # re-rendered - mark whichever bids are already in
+                        # selected_bid_ids so they stay showing as chosen.
+                        default=(bid_id in self.selected_bid_ids)
                     )
                 )
 
@@ -2890,66 +3327,32 @@ class AuctionsMenuView(discord.ui.View):
             withdraw_button.callback = self.withdraw_callback
             self.add_item(withdraw_button)
 
-        # Add free re-signs button (only during resign period)
-        # Adjust row based on whether we have withdraw button
-        resign_row = 2 if self.period_status == 'bidding' and self.bids else 1
-        if self.period_status == 'resign':
-            resign_button = discord.ui.Button(
-                label="Free Re-Signs",
-                style=discord.ButtonStyle.primary,
-                custom_id="free_resigns",
-                row=resign_row
-            )
-            resign_button.callback = self.free_resigns_callback
-            self.add_item(resign_button)
-        elif self.period_status in ['bidding', 'matching']:
-            # Greyed out during other periods
-            resign_button = discord.ui.Button(
-                label="Free Re-Signs",
-                style=discord.ButtonStyle.secondary,
-                custom_id="free_resigns_disabled",
-                disabled=True,
-                row=resign_row
-            )
-            self.add_item(resign_button)
-
-        # Add matching button (only during matching period)
-        matching_row = 3 if self.period_status == 'bidding' and self.bids else 2
-        if self.period_status == 'matching':
-            matching_button = discord.ui.Button(
-                label="Manage Bid Matches",
-                style=discord.ButtonStyle.primary,
-                custom_id="manage_matches",
-                row=matching_row
-            )
-            matching_button.callback = self.manage_matches_callback
-            self.add_item(matching_button)
-        elif self.period_status in ['bidding', 'resign']:
-            # Greyed out matching button during bidding/resign
-            matching_button = discord.ui.Button(
-                label="Manage Bid Matches",
-                style=discord.ButtonStyle.secondary,
-                custom_id="manage_matches_disabled",
-                disabled=True,
-                row=matching_row
-            )
-            self.add_item(matching_button)
-
-        # Add refresh button on last row
-        refresh_row = 4 if self.period_status == 'bidding' and self.bids else 3
+        # Add refresh + back-to-hub buttons on the next free row
+        button_row = 2 if self.period_status == 'bidding' and self.bids else 1
         refresh_button = discord.ui.Button(
             label="Refresh",
             style=discord.ButtonStyle.secondary,
             custom_id="refresh",
-            row=refresh_row
+            row=button_row
         )
         refresh_button.callback = self.refresh_callback
         self.add_item(refresh_button)
 
+        if self.hub is not None:
+            back_button = discord.ui.Button(label="← Back to Hub", style=discord.ButtonStyle.secondary, row=button_row)
+            back_button.callback = self.back_to_hub_callback
+            self.add_item(back_button)
+
+    async def back_to_hub_callback(self, interaction: discord.Interaction):
+        async with aiosqlite.connect(DB_PATH) as db:
+            embed = await self.hub.build(db)
+        await interaction.response.edit_message(embed=embed, view=self.hub)
+
     def create_embed(self):
+        emoji_str = get_team_emoji_str(self.bot, self.emoji_id)
         embed = discord.Embed(
-            title=f"Free Agency Auction - Season {self.season_number}",
-            description=f"**Your Team:** {self.team_name}\n**Status:** {self.period_status.title()}",
+            title=f"{emoji_str}Free Agency Auction",
+            description=f"**Status:** {self.period_status.title()}",
             color=discord.Color.blue()
         )
 
@@ -2979,12 +3382,7 @@ class AuctionsMenuView(discord.ui.View):
                 inline=False
             )
 
-        if self.period_status == 'bidding':
-            footer_text = "Select bids from dropdown, then click 'Withdraw Selected Bids' • Click Refresh to update"
-        else:
-            footer_text = "Click 'Manage Bid Matches' to respond to bids on your players • Click Refresh to update"
-
-        embed.set_footer(text=footer_text)
+        embed.set_footer(text="Select bids from dropdown, then click 'Withdraw Selected Bids' • Click Refresh to update")
         return embed
 
     async def select_bids_callback(self, interaction: discord.Interaction):
@@ -3061,105 +3459,6 @@ class AuctionsMenuView(discord.ui.View):
             ephemeral=True
         )
 
-    async def free_resigns_callback(self, interaction: discord.Interaction):
-        """Open the free re-sign selection interface"""
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                # Calculate allowance for this team
-                free_agency_cog = self.bot.get_cog('FreeAgencyCommands')
-                allowance = await free_agency_cog.calculate_free_resign_allowance(db, self.team_id, self.season_number)
-
-                if allowance == 0:
-                    await interaction.response.send_message(
-                        "❌ Your team has no free re-sign allowance (need Band 1 or Band 2 free agents).",
-                        ephemeral=True
-                    )
-                    return
-
-                # Get team's free agents
-                cursor = await db.execute(
-                    """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating
-                       FROM players p
-                       WHERE p.team_id = ? AND p.contract_expiry = ?
-                       ORDER BY p.overall_rating DESC, p.name""",
-                    (self.team_id, self.season_number)
-                )
-                free_agents = await cursor.fetchall()
-
-                # Get existing selections (if any)
-                cursor = await db.execute(
-                    """SELECT player_id, confirmed FROM free_agency_resigns
-                       WHERE season_number = ? AND team_id = ?""",
-                    (self.season_number, self.team_id)
-                )
-                existing_selections = await cursor.fetchall()
-                selected_players = [p[0] for p in existing_selections]
-                is_confirmed = any(p[1] for p in existing_selections) if existing_selections else False
-
-                # Create the selection view
-                view = FreeResignSelectionView(
-                    self.bot, self.team_id, allowance,
-                    free_agents, selected_players, is_confirmed, self.season_number
-                )
-                embed = view.create_embed()
-                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
-
-    async def manage_matches_callback(self, interaction: discord.Interaction):
-        """Open the bid matching interface"""
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                # Check if period is still in matching status
-                status, auction_points = await get_fa_period_for_season(db, self.season_number)
-                if status != 'matching':
-                    await interaction.response.send_message(
-                        "❌ The matching period has ended! Matches are no longer editable.",
-                        ephemeral=True
-                    )
-                    return
-
-                # Get winning bids on this team's players
-                cursor = await db.execute(
-                    """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating,
-                              t.team_id, t.team_name, t.emoji_id, b.bid_amount
-                       FROM players p
-                       JOIN free_agency_bids b ON p.player_id = b.player_id
-                       JOIN teams t ON b.team_id = t.team_id
-                       WHERE p.team_id = ? AND b.season_number = ? AND b.status = 'winning'
-                       ORDER BY b.bid_amount DESC""",
-                    (self.team_id, self.season_number)
-                )
-                player_bids = await cursor.fetchall()
-
-                if not player_bids:
-                    await interaction.response.send_message(
-                        "❌ No winning bids on your players to match!",
-                        ephemeral=True
-                    )
-                    return
-
-                # Calculate remaining points for this team (auction_points - winning bids on other teams' players)
-                cursor = await db.execute(
-                    """SELECT COALESCE(SUM(b.bid_amount), 0)
-                       FROM free_agency_bids b
-                       JOIN players p ON b.player_id = p.player_id
-                       WHERE b.season_number = ? AND b.team_id = ? AND b.status = 'winning'
-                       AND p.team_id != ?""",
-                    (self.season_number, self.team_id, self.team_id)
-                )
-                winning_bid_total = (await cursor.fetchone())[0]
-                remaining_points = auction_points - winning_bid_total
-
-                # Create matching view
-                matching_view = MatchingView(self.bot, self.team_id, self.team_name, player_bids, self.season_number, remaining_points)
-                embed = await matching_view.create_embed()
-                await interaction.response.send_message(embed=embed, view=matching_view, ephemeral=True)
-
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
-
     async def refresh_callback(self, interaction: discord.Interaction):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
@@ -3188,7 +3487,8 @@ class AuctionsMenuView(discord.ui.View):
             # Recreate view with new buttons
             new_view = AuctionsMenuView(
                 self.bot, self.team_id, self.team_name,
-                self.bids, self.remaining_points, self.max_points, self.season_number, self.period_status
+                self.bids, self.remaining_points, self.max_points, self.season_number, self.period_status,
+                hub=self.hub, emoji_id=self.emoji_id
             )
             embed = new_view.create_embed()
             await interaction.response.edit_message(embed=embed, view=new_view)
@@ -3197,68 +3497,10 @@ class AuctionsMenuView(discord.ui.View):
             await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
 
-class FreeResignButtonView(discord.ui.View):
-    """Simple view with a button to open the free re-sign selection interface"""
-    def __init__(self, bot, season_number, team_id, allowance):
-        super().__init__(timeout=None)  # Persistent view
-        self.bot = bot
-        self.season_number = season_number
-        self.team_id = team_id
-        self.allowance = allowance
-
-    @discord.ui.button(label="Select Free Re-Signs", style=discord.ButtonStyle.primary, custom_id="free_resign_button")
-    async def open_resign_ui(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Open the free re-sign selection interface"""
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                # Get current season
-                current_season = await get_current_season(db)
-
-                # Check the current period status dynamically (don't rely on stored value)
-                status, _ = await get_fa_period_for_season(db, current_season)
-                if status != 'resign':
-                    await interaction.response.send_message("❌ No active free re-sign period!", ephemeral=True)
-                    return
-
-                # Calculate allowance dynamically
-                free_agency_cog = self.bot.get_cog('FreeAgencyCommands')
-                current_allowance = await free_agency_cog.calculate_free_resign_allowance(db, self.team_id, current_season)
-
-                # Get team's free agents
-                cursor = await db.execute(
-                    """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating
-                       FROM players p
-                       WHERE p.team_id = ? AND p.contract_expiry = ?
-                       ORDER BY p.overall_rating DESC, p.name""",
-                    (self.team_id, current_season)
-                )
-                free_agents = await cursor.fetchall()
-
-                # Get existing selections (if any) - use the current season
-                cursor = await db.execute(
-                    """SELECT player_id, confirmed FROM free_agency_resigns
-                       WHERE season_number = ? AND team_id = ?""",
-                    (current_season, self.team_id)
-                )
-                existing_selections = await cursor.fetchall()
-                selected_players = [p[0] for p in existing_selections]
-                is_confirmed = any(p[1] for p in existing_selections) if existing_selections else False
-
-                # Create the selection view for the current season
-                view = FreeResignSelectionView(
-                    self.bot, self.team_id, current_allowance,
-                    free_agents, selected_players, is_confirmed, current_season
-                )
-                embed = view.create_embed()
-                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
-
-
 class FreeResignSelectionView(discord.ui.View):
-    """Interactive UI for teams to select which players to re-sign for free"""
-    def __init__(self, bot, team_id, allowance, free_agents, selected_players, is_confirmed, season_number):
+    """Interactive UI for teams to select which players to re-sign for free -
+    reached from FreeAgencyHubView's "Select Free Re-Signs" button."""
+    def __init__(self, bot, team_id, allowance, free_agents, selected_players, is_confirmed, season_number, hub=None):
         super().__init__(timeout=180)
         self.bot = bot
         self.team_id = team_id
@@ -3267,6 +3509,7 @@ class FreeResignSelectionView(discord.ui.View):
         self.selected_players = selected_players
         self.is_confirmed = is_confirmed
         self.season_number = season_number
+        self.hub = hub
 
         # Add player selection dropdown
         self.add_player_dropdown()
@@ -3286,6 +3529,16 @@ class FreeResignSelectionView(discord.ui.View):
             )
             confirm_button.callback = self.confirm_selections
             self.add_item(confirm_button)
+
+        if self.hub is not None:
+            back_button = discord.ui.Button(label="← Back to Hub", style=discord.ButtonStyle.secondary)
+            back_button.callback = self.back_to_hub_callback
+            self.add_item(back_button)
+
+    async def back_to_hub_callback(self, interaction: discord.Interaction):
+        async with aiosqlite.connect(DB_PATH) as db:
+            embed = await self.hub.build(db)
+        await interaction.response.edit_message(embed=embed, view=self.hub)
 
     def add_player_dropdown(self):
         """Add dropdown for player selection"""
@@ -3340,7 +3593,7 @@ class FreeResignSelectionView(discord.ui.View):
             # Recreate view with updated selections
             new_view = FreeResignSelectionView(
                 self.bot, self.team_id, self.allowance,
-                self.free_agents, self.selected_players, False, self.season_number
+                self.free_agents, self.selected_players, False, self.season_number, hub=self.hub
             )
             embed = new_view.create_embed()
             await interaction.response.edit_message(embed=embed, view=new_view)
@@ -3390,7 +3643,7 @@ class FreeResignSelectionView(discord.ui.View):
             # Recreate view with confirmed state
             new_view = FreeResignSelectionView(
                 self.bot, self.team_id, self.allowance,
-                self.free_agents, self.selected_players, True, self.season_number
+                self.free_agents, self.selected_players, True, self.season_number, hub=self.hub
             )
             embed = new_view.create_embed()
             await interaction.response.edit_message(embed=embed, view=new_view)
@@ -3417,7 +3670,7 @@ class FreeResignSelectionView(discord.ui.View):
             # Recreate view in unconfirmed state
             new_view = FreeResignSelectionView(
                 self.bot, self.team_id, self.allowance,
-                self.free_agents, self.selected_players, False, self.season_number
+                self.free_agents, self.selected_players, False, self.season_number, hub=self.hub
             )
             embed = new_view.create_embed()
             await interaction.response.edit_message(embed=embed, view=new_view)
@@ -3453,9 +3706,7 @@ class FreeResignSelectionView(discord.ui.View):
             )
 
         if self.is_confirmed:
-            embed.set_footer(text="✓ Confirmed - Use 'Edit Selections' to make changes | Use /auctionsmenu if the below button doesn't work")
-        else:
-            embed.set_footer(text="Use /auctionsmenu if the below button doesn't work")
+            embed.set_footer(text="✓ Confirmed - Use 'Edit Selections' to make changes")
 
         return embed
 

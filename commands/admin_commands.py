@@ -845,11 +845,49 @@ class AdminCommands(commands.Cog):
             await interaction.response.send_message(response, ephemeral=True)
 
     @app_commands.command(name="exportdata", description="[ADMIN] Export all teams and players to Excel")
-    async def export_data(self, interaction: discord.Interaction):
+    @app_commands.describe(
+        include_historical_match_data="Include past seasons' matches and player stats (default: current season only)"
+    )
+    async def export_data(self, interaction: discord.Interaction,
+                          include_historical_match_data: bool = False):
+        """Excel export of the whole database.
+
+        The Matches and Player_Match_Stats sheets are scoped to the CURRENT
+        season by default. They dominate the file - player stats alone are
+        ~11.5k rows and ~400KB per season, several times everything else put
+        together - and they grow every season, so including every season's
+        history made the file slower to produce and to import with each year
+        that passed.
+
+        The current season is always included, so the file stays usable for
+        correcting this season's data. Pass include_historical_match_data to
+        get every season, for a full backup.
+
+        Note both sheets are a full REPLACE on import. That's why a
+        history-less export omits the sheets entirely rather than writing
+        them scoped-but-complete: an absent sheet is skipped on import (see
+        _read_optional_sheet), whereas a present one would replace the whole
+        table and delete the seasons it doesn't contain.
+        """
         await interaction.response.defer(ephemeral=True)
         
         try:
             async with aiosqlite.connect(DB_PATH) as db:
+                # The season those two sheets are scoped to when history is
+                # not requested. "Current" means active OR offseason - the
+                # offseason still belongs to the season that just finished
+                # (trades, drafts and list management all happen then), so
+                # it should stay the default export target until the next
+                # season actually starts, not disappear the moment
+                # /endseason runs.
+                cursor = await db.execute(
+                    """SELECT season_id FROM seasons
+                       WHERE status IN ('active', 'offseason')
+                       ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END
+                       LIMIT 1"""
+                )
+                row = await cursor.fetchone()
+                current_season_id = row[0] if row else None
                 # Export Teams
                 cursor = await db.execute(
                     """SELECT team_name as Team_Name, role_id as Role_ID, emoji_id as Emoji_ID, channel_id as Channel_ID,
@@ -1030,7 +1068,14 @@ class AdminCommands(commands.Cog):
                 settings_df = pd.DataFrame(settings, columns=['Setting_Key', 'Setting_Value'])
                 settings_df = settings_df.fillna('')
 
-                # Export Matches
+                # Export Matches - current season only unless history was
+                # asked for (see this command's docstring).
+                match_season_filter = ""
+                match_params = ()
+                if not include_historical_match_data and current_season_id is not None:
+                    match_season_filter = " WHERE m.season_id = ?"
+                    match_params = (current_season_id,)
+
                 cursor = await db.execute(
                     """SELECT m.match_id as Match_ID, s.season_number as Season,
                               m.round_number as Round, ht.team_name as Home_Team,
@@ -1039,8 +1084,10 @@ class AdminCommands(commands.Cog):
                        FROM matches m
                        JOIN seasons s ON m.season_id = s.season_id
                        JOIN teams ht ON m.home_team_id = ht.team_id
-                       JOIN teams at ON m.away_team_id = at.team_id
-                       ORDER BY s.season_number, m.round_number, m.match_id"""
+                       JOIN teams at ON m.away_team_id = at.team_id"""
+                    + match_season_filter
+                    + " ORDER BY s.season_number, m.round_number, m.match_id",
+                    match_params
                 )
                 matches = await cursor.fetchall()
                 matches_df = pd.DataFrame(matches, columns=['Match_ID', 'Season', 'Round', 'Home_Team', 'Away_Team', 'Home_Score', 'Away_Score', 'Simulated'])
@@ -1068,8 +1115,10 @@ class AdminCommands(commands.Cog):
                        JOIN players p ON pms.player_id = p.player_id
                        JOIN teams opp ON opp.team_id = (
                            CASE WHEN pms.team_id = m.home_team_id THEN m.away_team_id ELSE m.home_team_id END
-                       )
-                       ORDER BY s.season_number, m.round_number, pms.match_id, t.team_name, pms.disposals DESC"""
+                       )"""
+                    + match_season_filter
+                    + " ORDER BY s.season_number, m.round_number, pms.match_id, t.team_name, pms.disposals DESC",
+                    match_params
                 )
                 player_match_stats = await cursor.fetchall()
                 player_match_stats_df = pd.DataFrame(player_match_stats, columns=[
@@ -1323,7 +1372,13 @@ class AdminCommands(commands.Cog):
                         '   - The Type column distinguishes current / starting / submitted rows',
                         '   - All rows share the same Team/Position/Player format',
                         '',
-                        '5. Player_Match_Stats sheet fully replaces all match stats on import',
+                        '5. Matches / Player_Match_Stats cover only the CURRENT season by default',
+                        '   - Run /exportdata with include_historical_match_data to get every season',
+                        '   - These two sheets are by far the largest, and grow every season',
+                        '   - On import they replace only the seasons the sheet CONTAINS, so importing a',
+                        '     current-season file never deletes past seasons',
+                        '',
+                        "6. Player_Match_Stats sheet fully replaces that season's match stats on import",
                         '   - Every row needs a valid Match_ID (must exist in the Matches sheet/table) and Player_ID',
                         '   - To delete stats: delete their row(s) before importing - there is no Stat_ID to preserve,',
                         '     rows are just re-created fresh from whatever is in the sheet',
@@ -1331,13 +1386,13 @@ class AdminCommands(commands.Cog):
                         '     sheet alongside an OLD (or emptied) Player_Match_Stats sheet resets accumulated match',
                         '     stats back to that snapshot too - useful after a round of test-season simulation',
                         '',
-                        '6. Almost every sheet fully replaces existing data on import',
+                        '7. Almost every sheet fully replaces existing data on import',
                         '   - Players, Injuries, Suspensions, Draft_Picks, Ladder_Positions, Trades, Matches,',
                         '     Player_Match_Stats, Compensation_Chart, Contract_Config, Draft_Value_Index, and all',
                         '     Free_Agency sheets are cleared and replaced entirely from this file - double-check',
                         '     the data before importing',
                         '',
-                        '7. Every sheet is OPTIONAL - you can import just the ones you want to change',
+                        '8. Every sheet is OPTIONAL - you can import just the ones you want to change',
                         '   - Delete the tabs you do not want to touch, edit the ones you do, then import:',
                         '     only the sheets still in the file are applied, and the rest are left alone',
                         '   - A DELETED tab means "leave this table exactly as it is"',
@@ -1696,13 +1751,39 @@ class AdminCommands(commands.Cog):
                 seasons_df = _read_optional_sheet(excel_file, 'Seasons', found=sheets_imported, missing=sheets_skipped)
                 if seasons_df is not None:
                     for _, row in seasons_df.iterrows():
-                        await db.execute(
-                            """INSERT OR REPLACE INTO seasons
-                               (season_number, current_round, regular_rounds, total_rounds, round_name, status)
-                               VALUES (?, ?, ?, ?, ?, ?)""",
-                            (int(row['Season']), int(row['Current_Round']), int(row['Regular_Rounds']),
-                             int(row['Total_Rounds']), str(row['Round_Name']), str(row['Status']))
+                        # UPDATE an existing season rather than INSERT OR
+                        # REPLACE it. REPLACE deletes the row and reinserts
+                        # it, which hands out a NEW autoincrement season_id -
+                        # and matches.season_id still points at the old one,
+                        # orphaning every match and player stat for that
+                        # season. (Previously masked because the Matches
+                        # sheet wiped and re-linked everything by season
+                        # NUMBER; now that its delete is season-scoped, the
+                        # orphaned rows would simply be lost.)
+                        cursor = await db.execute(
+                            "SELECT season_id FROM seasons WHERE season_number = ?",
+                            (int(row['Season']),)
                         )
+                        existing_season = await cursor.fetchone()
+
+                        if existing_season:
+                            await db.execute(
+                                """UPDATE seasons
+                                   SET current_round = ?, regular_rounds = ?, total_rounds = ?,
+                                       round_name = ?, status = ?
+                                   WHERE season_id = ?""",
+                                (int(row['Current_Round']), int(row['Regular_Rounds']),
+                                 int(row['Total_Rounds']), str(row['Round_Name']),
+                                 str(row['Status']), existing_season[0])
+                            )
+                        else:
+                            await db.execute(
+                                """INSERT INTO seasons
+                                   (season_number, current_round, regular_rounds, total_rounds, round_name, status)
+                                   VALUES (?, ?, ?, ?, ?, ?)""",
+                                (int(row['Season']), int(row['Current_Round']), int(row['Regular_Rounds']),
+                                 int(row['Total_Rounds']), str(row['Round_Name']), str(row['Status']))
+                            )
                         seasons_imported += 1
 
                     # Import Injuries (calculate recovery_rounds from injury_round and return_round)
@@ -1859,7 +1940,30 @@ class AdminCommands(commands.Cog):
                 matches_df = _read_optional_sheet(excel_file, 'Matches', found=sheets_imported, missing=sheets_skipped)
                 if matches_df is not None:
 
-                    await db.execute("DELETE FROM matches")
+                    # Scoped to the seasons this sheet actually covers, NOT
+                    # a blanket wipe. /exportdata defaults to the current
+                    # season only, so a blanket DELETE would silently
+                    # destroy every past season's fixture whenever a normal
+                    # export was reimported.
+                    sheet_seasons = set()
+                    if 'Season' in matches_df.columns:
+                        sheet_seasons = {
+                            int(v) for v in matches_df['Season'].dropna().unique()
+                        }
+
+                    if sheet_seasons:
+                        placeholders = ",".join("?" * len(sheet_seasons))
+                        await db.execute(
+                            "DELETE FROM matches WHERE season_id IN ("
+                            "SELECT season_id FROM seasons WHERE season_number IN ("
+                            + placeholders + "))",
+                            tuple(sheet_seasons)
+                        )
+                    else:
+                        # An empty sheet still means "clear it" - the user
+                        # deliberately emptied it (see _read_optional_sheet's
+                        # missing-vs-empty note).
+                        await db.execute("DELETE FROM matches")
 
                     for _, row in matches_df.iterrows():
                         if row.isna().all():
@@ -1901,8 +2005,14 @@ class AdminCommands(commands.Cog):
                             match_id = int(row['Match_ID'])
 
                         if match_id is not None:
+                            # OR REPLACE because the delete above is scoped to
+                            # the seasons this sheet covers, so rows from other
+                            # seasons survive and a preserved Match_ID can
+                            # collide with one of them. Replacing is the right
+                            # resolution either way: the sheet is authoritative
+                            # for the ID it names.
                             await db.execute(
-                                """INSERT INTO matches
+                                """INSERT OR REPLACE INTO matches
                                    (match_id, season_id, round_number, home_team_id, away_team_id, home_score, away_score, simulated)
                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                                 (match_id, season[0], int(row['Round']), home_team[0], away_team[0],
@@ -1937,7 +2047,25 @@ class AdminCommands(commands.Cog):
                 player_match_stats_df = _read_optional_sheet(excel_file, 'Player_Match_Stats', found=sheets_imported, missing=sheets_skipped)
                 if player_match_stats_df is not None:
 
-                    await db.execute("DELETE FROM player_match_stats")
+                    # Same season-scoping as Matches above, and for the
+                    # same reason.
+                    stat_sheet_seasons = set()
+                    if 'Season' in player_match_stats_df.columns:
+                        stat_sheet_seasons = {
+                            int(v) for v in player_match_stats_df['Season'].dropna().unique()
+                        }
+
+                    if stat_sheet_seasons:
+                        placeholders = ",".join("?" * len(stat_sheet_seasons))
+                        await db.execute(
+                            "DELETE FROM player_match_stats WHERE match_id IN ("
+                            "SELECT m.match_id FROM matches m JOIN seasons s "
+                            "ON m.season_id = s.season_id "
+                            "WHERE s.season_number IN (" + placeholders + "))",
+                            tuple(stat_sheet_seasons)
+                        )
+                    else:
+                        await db.execute("DELETE FROM player_match_stats")
 
                     for _, row in player_match_stats_df.iterrows():
                         if row.isna().all():
@@ -1976,8 +2104,12 @@ class AdminCommands(commands.Cog):
                         brownlow_votes = int(row['Brownlow_Votes']) if 'Brownlow_Votes' in player_match_stats_df.columns and pd.notna(row['Brownlow_Votes']) else 0
                         best_fairest_votes = int(row['Best_Fairest_Votes']) if 'Best_Fairest_Votes' in player_match_stats_df.columns and pd.notna(row['Best_Fairest_Votes']) else 0
 
+                        # OR REPLACE for the same reason as Matches above -
+                        # the delete is season-scoped, so a row for this
+                        # (match_id, player_id) can already exist and the
+                        # table has a UNIQUE constraint on that pair.
                         await db.execute(
-                            """INSERT INTO player_match_stats
+                            """INSERT OR REPLACE INTO player_match_stats
                                (match_id, player_id, team_id, disposals, goals, behinds, marks, tackles, spoils, hitouts, brownlow_votes, best_fairest_votes)
                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (match_id, player_id, team[0], disposals, goals, behinds, marks, tackles, spoils, hitouts, brownlow_votes, best_fairest_votes)

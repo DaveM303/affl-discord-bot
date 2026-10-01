@@ -547,19 +547,21 @@ PROFILE_STAT_COLUMNS = [
 
 
 async def resolve_profile_season(db):
-    """The season a profile's stats are shown for: the active season if there
-    is one, otherwise the most recent season that exists (so profiles still
-    work in the offseason, showing the season just completed). Returns
+    """The season a profile's stats are shown for: active or offseason,
+    active preferred. Offseason still belongs to the season that just
+    finished (see the same status IN ('active', 'offseason') convention in
+    /exportdata and register_persistent_round_summary_views), so profiles
+    keep showing that season's stats through the offseason rather than
+    falling through to a 'future' placeholder season
+    (ensure_future_seasons_exist keeps several of those ahead with higher
+    season_number, which `ORDER BY season_number DESC` would otherwise pick
+    and show as an empty, unplayed season - the reported bug). Returns
     (season_id, season_number) or (None, None) if no season exists at all."""
     cursor = await db.execute(
-        "SELECT season_id, season_number FROM seasons WHERE status = 'active' LIMIT 1"
-    )
-    row = await cursor.fetchone()
-    if row:
-        return row[0], row[1]
-
-    cursor = await db.execute(
-        "SELECT season_id, season_number FROM seasons ORDER BY season_number DESC LIMIT 1"
+        """SELECT season_id, season_number FROM seasons
+           WHERE status IN ('active', 'offseason')
+           ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END
+           LIMIT 1"""
     )
     row = await cursor.fetchone()
     return (row[0], row[1]) if row else (None, None)

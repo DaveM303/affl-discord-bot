@@ -149,13 +149,38 @@ async def assign_drafted_player(db, team_id, player_id, season_number, rookie_ye
         db: Active aiosqlite database connection
         team_id: Team the player is being assigned to
         player_id: Player being assigned
-        season_number: The draft's season_number
+        season_number: The draft's season_number. Regular end-of-season
+            drafts store the season they feed INTO (e.g. the "Season 9
+            National Draft" stores 10), so start_season + years already
+            lands correctly there. Custom drafts always store 0 (they
+            aren't tied to a season slot - see create_custom_draft), which
+            isn't a real season to add years to.
         rookie_years: The draft's rookie_contract_years
 
     Returns:
         int: The contract_expiry that was assigned
     """
-    contract_expiry = calculate_contract_expiry(season_number, rookie_years)
+    if season_number:
+        contract_expiry = calculate_contract_expiry(season_number, rookie_years)
+    else:
+        # Custom draft (season_number == 0): the pick happens mid-season,
+        # against the currently active season, not a season boundary. A
+        # 1-year contract is meant to cover the rest of THIS season and
+        # nothing more, so the current season counts as year 1 - unlike an
+        # end-of-season draft/re-sign, where the just-finished season is
+        # never counted (see calculate_contract_expiry's docstring).
+        cursor = await db.execute(
+            "SELECT season_number FROM seasons WHERE status = 'active' LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        current_season = row[0] if row else None
+        if current_season is None:
+            # No active season to anchor to (shouldn't happen - custom
+            # drafts require one to even be created) - fall back to the
+            # old, wrong-but-non-crashing behaviour rather than raising.
+            contract_expiry = calculate_contract_expiry(season_number, rookie_years)
+        else:
+            contract_expiry = current_season + rookie_years - 1
     await db.execute(
         "UPDATE players SET team_id = ?, contract_expiry = ? WHERE player_id = ?",
         (team_id, contract_expiry, player_id)

@@ -35,9 +35,18 @@ class AwardsCommands(commands.Cog):
         shared utility, so it's reimplemented here rather than reaching
         into StatsCommands) - regular_rounds is needed so Brownlow/Coleman
         can be scoped to the home & away season only, excluding finals
-        rounds (see _fetch_brownlow_totals/_fetch_coleman_totals)."""
+        rounds (see _fetch_brownlow_totals/_fetch_coleman_totals).
+
+        Scoped to status IN ('active', 'offseason'), active preferred -
+        same convention as resolve_profile_season (player_commands.py) and
+        /exportdata, so /awards keeps showing the season that just finished
+        throughout the offseason instead of falling through to an empty
+        'future' placeholder season."""
         cursor = await db.execute(
-            "SELECT season_id, season_number, regular_rounds FROM seasons WHERE status = 'active' LIMIT 1"
+            """SELECT season_id, season_number, regular_rounds FROM seasons
+               WHERE status IN ('active', 'offseason')
+               ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END
+               LIMIT 1"""
         )
         return await cursor.fetchone()
 

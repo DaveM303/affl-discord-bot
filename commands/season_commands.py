@@ -1377,8 +1377,17 @@ class SeasonCommands(commands.Cog):
         """
         try:
             async with aiosqlite.connect(DB_PATH) as db:
+                # Active or offseason - the offseason still belongs to the
+                # season that just finished, and its round summaries are
+                # still sitting in their channels with buttons people
+                # revisit, so it should stay the target until the next
+                # season actually starts rather than going dead the moment
+                # /endseason runs.
                 cursor = await db.execute(
-                    "SELECT season_id FROM seasons WHERE status = 'active' LIMIT 1"
+                    """SELECT season_id FROM seasons
+                       WHERE status IN ('active', 'offseason')
+                       ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END
+                       LIMIT 1"""
                 )
                 season_row = await cursor.fetchone()
                 if not season_row:
@@ -2145,6 +2154,32 @@ class SeasonCommands(commands.Cog):
                 if 'best_fairest_votes' not in pms_columns:
                     await db.execute("ALTER TABLE player_match_stats ADD COLUMN best_fairest_votes INTEGER DEFAULT 0")
 
+                # Scratch teams - named, reusable lineups for /scratchmatch's
+                # custom_teams option. See bot.py's init_db comment on these
+                # tables for why they're deliberately separate from
+                # teams/lineups/matches/player_match_stats.
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS scratch_teams (
+                        scratch_team_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        team_name TEXT NOT NULL UNIQUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS scratch_team_players (
+                        scratch_team_id INTEGER NOT NULL,
+                        player_id INTEGER NOT NULL,
+                        slot_number INTEGER NOT NULL,
+                        position_name TEXT NOT NULL,
+                        UNIQUE(scratch_team_id, slot_number),
+                        UNIQUE(scratch_team_id, position_name),
+                        UNIQUE(scratch_team_id, player_id),
+                        FOREIGN KEY (scratch_team_id) REFERENCES scratch_teams(scratch_team_id),
+                        FOREIGN KEY (player_id) REFERENCES players(player_id)
+                    )
+                ''')
+
                 await db.commit()
 
                 await interaction.followup.send(
@@ -2165,7 +2200,8 @@ class SeasonCommands(commands.Cog):
                     "• **Seasons table**: Added lineups_locked column\n"
                     "• **Teams table**: Added lineup_confirmed column\n"
                     "• **Teams table**: Added color and color_secondary columns\n"
-                    "• Player Match Stats table created\n\n"
+                    "• Player Match Stats table created\n"
+                    "• Scratch Teams tables created\n\n"
                     "You can now use all season, injury, suspension, lineup, and free agency commands.\n"
                     "Use `/config lineups_channel:<#channel>` to configure where lineups are posted.",
                     ephemeral=True

@@ -24,9 +24,17 @@ class StatsCommands(commands.Cog):
     async def _resolve_active_season(self, db):
         """Same shape as MatchCommands._resolve_season(db, None) - that
         method lives on a different cog and isn't a shared utility, so
-        it's reimplemented here rather than reaching into MatchCommands."""
+        it's reimplemented here rather than reaching into MatchCommands.
+
+        Scoped to status IN ('active', 'offseason'), active preferred -
+        same convention as resolve_profile_season (player_commands.py), so
+        /statsmenu keeps showing the season that just finished throughout
+        the offseason instead of reporting "No active season!"."""
         cursor = await db.execute(
-            "SELECT season_id, season_number FROM seasons WHERE status = 'active' LIMIT 1"
+            """SELECT season_id, season_number FROM seasons
+               WHERE status IN ('active', 'offseason')
+               ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END
+               LIMIT 1"""
         )
         return await cursor.fetchone()
 

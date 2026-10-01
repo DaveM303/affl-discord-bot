@@ -51,35 +51,13 @@ def format_lineup_description(lineup):
     match_commands.py) and, previously, the old submit-and-post flow here."""
     # OVRs shown are the ADJUSTED (effective) ones, matching the lineup
     # editor - a player out of position shows the rating they'll actually
-    # play at, not their base rating. Interchange is never adjusted.
+    # play at, not their base rating. Interchange is never adjusted (see
+    # _display_ovr, which build_lineup_field_text calls for every slot).
     lineup_dict = {
         pos_name: {'player_id': player_id, 'name': name, 'pos': pos, 'rating': rating}
         for pos_name, player_id, name, pos, rating in lineup
     }
-    field_text = ""
-
-    for line_name, positions in _LINEUP_DISPLAY_ROWS:
-        row_text = []
-        for pos_name in positions:
-            if pos_name in lineup_dict:
-                p = lineup_dict[pos_name]
-                row_text.append(f"{p['name']} ({_display_ovr(pos_name, p)})")
-            else:
-                row_text.append("*Empty*")
-        field_text += f"**{line_name}:**  {', '.join(row_text)}\n"
-
-    field_text += "\n"
-
-    int_players = []
-    for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]:
-        if pos_name in lineup_dict:
-            p = lineup_dict[pos_name]
-            int_players.append(f"{p['name']} ({_display_ovr(pos_name, p)})")
-        else:
-            int_players.append("*Empty*")
-    field_text += f"**Int:**  {', '.join(int_players)}"
-
-    return field_text
+    return build_lineup_field_text(lineup_dict)
 
 
 def _display_ovr(pos_name, player_info):
@@ -1094,31 +1072,7 @@ class TeamLineupMenu(discord.ui.View):
         return duplicates
 
     def get_key_position_overload(self):
-        """Check for too many key-position-TYPE players genuinely on-field
-        (never interchange) in the backline or forward line - mirrors
-        match_sim.py's own in-sim penalty (see
-        KEY_POSITION_COUNT_THRESHOLD/KEY_POSITION_OVERLOAD_PENALTY_PER_EXCESS/
-        KEY_POSITION_OVERLOAD_GROUPS and _group_strength) so what the
-        lineup screen warns about matches what actually costs the team
-        strength when simulated. Counts ANY KEY_POSITION_TYPES player
-        currently in that line, not just that line's own "natural" key
-        positions - a KEY FWD misplaced in defense (or any other
-        key-position player in the wrong line) still counts as a tall
-        crowding that line, same as match_sim.py's own rule. Returns a
-        list of (group_label, count, names) tuples for any line over the
-        threshold - empty if neither line is overloaded."""
-        line_labels = {"defense": "Backline", "forward": "Forward line"}
-        overloads = []
-        for group, group_label in line_labels.items():
-            names = [
-                p['name'] for pos_name, p in self.lineup.items()
-                if pos_name not in INTERCHANGE_SLOTS
-                and slot_group(pos_name) == group
-                and p['pos'] in KEY_POSITION_TYPES
-            ]
-            if len(names) > KEY_POSITION_COUNT_THRESHOLD:
-                overloads.append((group_label, len(names), names))
-        return overloads
+        return get_key_position_overload(self.lineup)
 
     async def update_warnings(self):
         """Update the warnings list based on current lineup"""
@@ -1853,31 +1807,7 @@ class LineupView(discord.ui.View):
         return duplicates
 
     def get_key_position_overload(self):
-        """Check for too many key-position-TYPE players genuinely on-field
-        (never interchange) in the backline or forward line - mirrors
-        match_sim.py's own in-sim penalty (see
-        KEY_POSITION_COUNT_THRESHOLD/KEY_POSITION_OVERLOAD_PENALTY_PER_EXCESS/
-        KEY_POSITION_OVERLOAD_GROUPS and _group_strength) so what the
-        lineup screen warns about matches what actually costs the team
-        strength when simulated. Counts ANY KEY_POSITION_TYPES player
-        currently in that line, not just that line's own "natural" key
-        positions - a KEY FWD misplaced in defense (or any other
-        key-position player in the wrong line) still counts as a tall
-        crowding that line, same as match_sim.py's own rule. Returns a
-        list of (group_label, count, names) tuples for any line over the
-        threshold - empty if neither line is overloaded."""
-        line_labels = {"defense": "Backline", "forward": "Forward line"}
-        overloads = []
-        for group, group_label in line_labels.items():
-            names = [
-                p['name'] for pos_name, p in self.lineup.items()
-                if pos_name not in INTERCHANGE_SLOTS
-                and slot_group(pos_name) == group
-                and p['pos'] in KEY_POSITION_TYPES
-            ]
-            if len(names) > KEY_POSITION_COUNT_THRESHOLD:
-                overloads.append((group_label, len(names), names))
-        return overloads
+        return get_key_position_overload(self.lineup)
 
     async def get_injured_players(self):
         """Check for injured players in lineup - returns list of
@@ -2038,71 +1968,185 @@ class LineupView(discord.ui.View):
 
     def create_embed(self):
         """Create the lineup display embed"""
-        rows = [
-            ("FB", ["LBP", "FB", "RBP"]),
-            ("HB", ["LHB", "CHB", "RHB"]),
-            ("C", ["LW", "C", "RW"]),
-            ("HF", ["LHF", "CHF", "RHF"]),
-            ("FF", ["LFP", "FF", "RFP"]),
-            ("Fol", ["R", "RR", "RO"])
-        ]
-        
-        # Get team emoji
         emoji = get_team_emoji_str(self.bot, self.emoji_id)
-
         title = f"{emoji}{self.team_name} - Lineup Editor"
-        
+
         embed = discord.Embed(
             title=title,
             description="Select a position from the dropdown, then choose a player to fill it.",
             color=discord.Color.green()
         )
-        
-        def status_badge(player_info):
-            player_id = player_info.get('player_id')
-            if player_id in self.injured_player_ids:
-                return " 🚑"
-            if player_id in self.suspended_player_ids:
-                return " 🚫"
-            return ""
 
-        # Show field positions
-        field_text = ""
-        for line_name, positions in rows:
-            row_text = []
-            for pos_name in positions:
-                prefix = "→ " if pos_name == self.selected_position else ""
-                if pos_name in self.lineup:
-                    p = self.lineup[pos_name]
-                    row_text.append(f"{prefix}{p['name']} ({_display_ovr(pos_name, p)}){status_badge(p)}")
-                else:
-                    row_text.append(f"{prefix}*Empty*")
-            field_text += f"**{line_name}:**  {', '.join(row_text)}\n"
-
-        # Add spacing before interchange
-        field_text += "\n"
-
-        # Show interchange - all 5 on one line
-        int_players = []
-        for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]:
-            prefix = "→ " if pos_name == self.selected_position else ""
-            if pos_name in self.lineup:
-                p = self.lineup[pos_name]
-                int_players.append(f"{prefix}{p['name']} ({p['rating']}){status_badge(p)}")
-            else:
-                int_players.append(f"{prefix}*Empty*")
-
-        field_text += f"**Int:**  {', '.join(int_players)}"
-        
-        embed.add_field(name="\u200b", value=field_text, inline=False)
+        field_text = build_lineup_field_text(
+            self.lineup, self.selected_position, self.injured_player_ids, self.suspended_player_ids
+        )
+        embed.add_field(name="​", value=field_text, inline=False)
 
         # Add warnings if any exist
         if self.warnings:
-            embed.add_field(name="\u200b", value="\n".join(self.warnings), inline=False)
+            embed.add_field(name="​", value="\n".join(self.warnings), inline=False)
 
         embed.set_footer(text=f"{len(self.lineup)}/23 positions filled • {len(self.roster)} players available")
 
         return embed
+
+
+def get_key_position_overload(lineup):
+    """Check for too many key-position-TYPE players genuinely on-field
+    (never interchange) in the backline or forward line - mirrors
+    match_sim.py's own in-sim penalty (see
+    KEY_POSITION_COUNT_THRESHOLD/KEY_POSITION_OVERLOAD_PENALTY_PER_EXCESS/
+    KEY_POSITION_OVERLOAD_GROUPS and _group_strength) so what the lineup
+    screen warns about matches what actually costs the team strength when
+    simulated. Counts ANY KEY_POSITION_TYPES player currently in that line,
+    not just that line's own "natural" key positions - a KEY FWD misplaced
+    in defense (or any other key-position player in the wrong line) still
+    counts as a tall crowding that line, same as match_sim.py's own rule.
+    Returns a list of (group_label, count, names) tuples for any line over
+    the threshold - empty if neither line is overloaded. Shared by
+    TeamLineupMenu/LineupView (real team lineups) and scratch_lineup.py's
+    scratch-team editor."""
+    line_labels = {"defense": "Backline", "forward": "Forward line"}
+    overloads = []
+    for group, group_label in line_labels.items():
+        names = [
+            p['name'] for pos_name, p in lineup.items()
+            if pos_name not in INTERCHANGE_SLOTS
+            and slot_group(pos_name) == group
+            and p['pos'] in KEY_POSITION_TYPES
+        ]
+        if len(names) > KEY_POSITION_COUNT_THRESHOLD:
+            overloads.append((group_label, len(names), names))
+    return overloads
+
+
+def build_lineup_field_text(lineup, selected_position=None, injured_ids=frozenset(), suspended_ids=frozenset()):
+    """The lineup editor's field-grid text - one compact line per line of
+    the ground (FB/HB/C/HF/FF/Fol), then all 5 interchange slots on one
+    final line, with a "-> " prefix marking the currently selected
+    position (if any). Shared by LineupView (real team lineups, with
+    injury/suspension badges and a selection), format_lineup_description
+    above (the posted lineup-channel message - no selection or badges, so
+    those args are left at their defaults), and scratch_lineup.py's
+    scratch-team editor (no roster-wide injury data available) - every
+    lineup rendering in the bot goes through this one function."""
+    def status_badge(player_info):
+        player_id = player_info.get('player_id')
+        if player_id in injured_ids:
+            return " 🚑"
+        if player_id in suspended_ids:
+            return " 🚫"
+        return ""
+
+    field_text = ""
+    for line_name, positions in _LINEUP_DISPLAY_ROWS:
+        row_text = []
+        for pos_name in positions:
+            prefix = "→ " if pos_name == selected_position else ""
+            if pos_name in lineup:
+                p = lineup[pos_name]
+                row_text.append(f"{prefix}{p['name']} ({_display_ovr(pos_name, p)}){status_badge(p)}")
+            else:
+                row_text.append(f"{prefix}*Empty*")
+        field_text += f"**{line_name}:**  {', '.join(row_text)}\n"
+
+    field_text += "\n"
+
+    int_players = []
+    for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]:
+        prefix = "→ " if pos_name == selected_position else ""
+        if pos_name in lineup:
+            p = lineup[pos_name]
+            int_players.append(f"{prefix}{p['name']} ({_display_ovr(pos_name, p)}){status_badge(p)}")
+        else:
+            int_players.append(f"{prefix}*Empty*")
+
+    field_text += f"**Int:**  {', '.join(int_players)}"
+    return field_text
+
+
+def build_position_options(lineup, selected_position, age_by_player_id=None,
+                            injured_ids=frozenset(), suspended_ids=frozenset()):
+    """The 23 AFL_POSITIONS as SelectOptions, each described by its current
+    occupant (or "Empty"). Shared by PositionSelect (real team lineups,
+    with age/injury/suspension badges) and scratch_lineup.py's scratch-team
+    editor (no roster-wide age/injury data available, so those args default
+    to empty)."""
+    age_by_player_id = age_by_player_id or {}
+    options = []
+    for pos_name in AFL_POSITIONS:
+        if pos_name in lineup:
+            p = lineup[pos_name]
+            player_id = p.get('player_id')
+            age = age_by_player_id.get(player_id)
+            age_part = f", {age}" if age is not None else ""
+            description = f"{p['name']} ({p['pos']}{age_part}, {_display_ovr(pos_name, p)})"
+            if player_id in injured_ids:
+                description += " 🚑"
+            elif player_id in suspended_ids:
+                description += " 🚫"
+        else:
+            description = "Empty"
+        options.append(
+            discord.SelectOption(
+                label=pos_name,
+                description=description,
+                value=pos_name,
+                default=(pos_name == selected_position)
+            )
+        )
+    return options
+
+
+def build_player_options(players, lineup, page, injured_ids=frozenset(), suspended_ids=frozenset(),
+                          opposing_lineup=None, opposing_team_name=None):
+    """One page (<=25) of player SelectOptions for a position's picker,
+    from `players` as (player_id, name, pos, rating, age) tuples. Shows
+    each player's current slot if they're already elsewhere in `lineup`.
+    Shared by PlayerSelect (real team lineups - opposing_lineup left None,
+    there's only ever one team's lineup in play) and scratch_lineup.py's
+    scratch-team editor, which passes opposing_lineup/opposing_team_name
+    so a player already picked for the OTHER scratch team is flagged too
+    (a player can appear on both scratch teams independently - nothing
+    stops it - so this is purely informational, not a block)."""
+    used_ids = {p.get('player_id') for p in lineup.values() if p.get('player_id')}
+    opposing_ids = (
+        {p.get('player_id') for p in opposing_lineup.values() if p.get('player_id')}
+        if opposing_lineup else set()
+    )
+    start = page * 25
+    page_players = players[start:start + 25]
+
+    options = []
+    for player_id, name, pos, rating, age in page_players:
+        label = name
+        if player_id in used_ids:
+            current_pos = next(
+                (pn for pn, info in lineup.items() if info.get('player_id') == player_id),
+                None
+            )
+            if current_pos:
+                label += f" - Currently in {current_pos}"
+        elif player_id in opposing_ids:
+            opposing_pos = next(
+                (pn for pn, info in opposing_lineup.items() if info.get('player_id') == player_id),
+                None
+            )
+            if opposing_pos:
+                team_part = f" for {opposing_team_name}" if opposing_team_name else ""
+                label += f" - Already selected{team_part} ({opposing_pos})"
+
+        description = f"{pos}, {age}, {rating}"
+        if player_id in injured_ids:
+            description += " - 🚑 Injured"
+        elif player_id in suspended_ids:
+            description += " - 🚫 Suspended"
+
+        options.append(discord.SelectOption(label=label[:100], description=description[:100], value=str(player_id)))
+
+    if not options:
+        options.append(discord.SelectOption(label="No players available", value="none"))
+    return options
 
 
 class PositionSelect(discord.ui.Select):
@@ -2118,30 +2162,10 @@ class PositionSelect(discord.ui.Select):
         # instead, matching PlayerSelect's own "(pos, age, rating)" format.
         age_by_player_id = {p[0]: p[4] for p in parent_view.roster}
 
-        options = []
-        for pos_name in AFL_POSITIONS:
-            if pos_name in parent_view.lineup:
-                p = parent_view.lineup[pos_name]
-                age = age_by_player_id.get(p.get('player_id'))
-                age_part = f", {age}" if age is not None else ""
-                description = f"{p['name']} ({p['pos']}{age_part}, {_display_ovr(pos_name, p)})"
-                badge = ""
-                player_id = p.get('player_id')
-                if player_id in parent_view.injured_player_ids:
-                    badge = " 🚑"
-                elif player_id in parent_view.suspended_player_ids:
-                    badge = " 🚫"
-                description += badge
-            else:
-                description = "Empty"
-            options.append(
-                discord.SelectOption(
-                    label=pos_name,
-                    description=description,
-                    value=pos_name,
-                    default=(pos_name == parent_view.selected_position)
-                )
-            )
+        options = build_position_options(
+            parent_view.lineup, parent_view.selected_position, age_by_player_id,
+            parent_view.injured_player_ids, parent_view.suspended_player_ids
+        )
 
         super().__init__(
             placeholder="Select a position to edit...",
@@ -2246,70 +2270,18 @@ class PlayerSelect(discord.ui.Select):
     def __init__(self, position_name, parent_view):
         self.position_name = position_name
         self.parent_view = parent_view
-        
-        # Get sorted roster
+
         sorted_roster = parent_view.get_sorted_roster()
+        options = build_player_options(
+            sorted_roster, parent_view.lineup, parent_view.player_page,
+            parent_view.injured_player_ids, parent_view.suspended_player_ids
+        )
 
-        # Get players already in lineup (for display purposes)
-        used_ids = {p.get('player_id') for p in parent_view.lineup.values() if p.get('player_id')}
-
-        # Build options from all players with pagination
-        options = []
-        start_idx = parent_view.player_page * 25
-        end_idx = start_idx + 25
-        count = 0
-        added = 0
-
-        for player_id, name, pos, rating, age in sorted_roster:
-            # Show all players - they can be moved between positions
-            # Check if this player is in the current page
-            if count >= start_idx and added < 25:
-                # Label (1st line) - name + "Currently in X" if applicable.
-                label = name
-
-                # Mark if player is currently in lineup - including the
-                # slot being edited itself, so it's clear who currently
-                # holds that position (not just where everyone else is).
-                if player_id in used_ids:
-                    # Find which position they're in
-                    current_pos = None
-                    for pos_name, player_info in parent_view.lineup.items():
-                        if player_info.get('player_id') == player_id:
-                            current_pos = pos_name
-                            break
-                    if current_pos:
-                        label += f" - Currently in {current_pos}"
-
-                # Description (2nd line) - stats, then an injury/suspension
-                # badge if applicable.
-                description = f"{pos}, {age}, {rating}"
-                if player_id in parent_view.injured_player_ids:
-                    description += " - 🚑 Injured"
-                elif player_id in parent_view.suspended_player_ids:
-                    description += " - 🚫 Suspended"
-
-                options.append(
-                    discord.SelectOption(
-                        label=label,
-                        description=description,
-                        value=str(player_id)
-                    )
-                )
-                added += 1
-
-            count += 1
-            if added >= 25:
-                break
-        
-        if not options:
-            options.append(discord.SelectOption(label="No players available", value="none"))
-
-        # Add page indicator to placeholder
-        total_available = len(sorted_roster)  # Total number of players in roster
+        total_available = len(sorted_roster)
         current_page = parent_view.player_page + 1
         total_pages = (total_available + 24) // 25
         placeholder = f"Select player for {position_name} (Page {current_page}/{total_pages})"
-        
+
         super().__init__(
             placeholder=placeholder,
             options=options,

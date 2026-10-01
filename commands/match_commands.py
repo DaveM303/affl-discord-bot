@@ -12,6 +12,7 @@ from match_sim import (
     simulate_match, simulate_match_with_events, format_score, DEFAULT_VARIANCE,
     Player, MatchEvent, simulate_extra_time_half, simulate_extra_time_after_siren_shot,
 )
+from commands.scratch_lineup import ScratchMatchMainMenuView, fetch_scratch_lineup_tuples, PostFullStatsView
 
 # Pacing (Live Match Feed design doc, §04) - the baseline/floor delay is
 # adjustable live per match via the control panel's speed buttons (see
@@ -1541,11 +1542,12 @@ class MatchCommands(commands.Cog):
 
     @app_commands.command(name="scratchmatch", description="[ADMIN] Simulate a one-off match between two teams")
     @app_commands.describe(
-        team1="First team (treated as the home team)",
-        team2="Second team",
+        team1="First team (treated as the home team) - leave blank if using custom_teams",
+        team2="Second team - leave blank if using custom_teams",
         mode="Result only (one final result) or live (paced event feed with a control panel)",
-        home_ground_advantage="Give team1 home ground advantage (default: on)",
-        force="Force a specific test scenario instead of a natural result. 'After-siren winner' only applies in Live mode."
+        home_ground_advantage="Give team1 home ground advantage (default: off)",
+        force="Force a specific test scenario instead of a natural result. 'After-siren winner' only applies in Live mode.",
+        custom_teams="Build two ad-hoc scratch lineups instead (e.g. for draft scouting) - ignores team1/team2/mode/force"
     )
     @app_commands.rename(force="force_scenario")
     @app_commands.choices(mode=[
@@ -1557,11 +1559,23 @@ class MatchCommands(commands.Cog):
         app_commands.Choice(name="After-siren winner (Live only)", value="after_siren_winner"),
     ])
     @app_commands.autocomplete(team1=team_autocomplete, team2=team_autocomplete)
-    async def scratch_match(self, interaction: discord.Interaction, team1: str, team2: str, mode: str = "batch",
-                             home_ground_advantage: bool = True, force: str = None):
+    async def scratch_match(self, interaction: discord.Interaction, team1: str = None, team2: str = None,
+                             mode: str = "batch", home_ground_advantage: bool = False, force: str = None,
+                             custom_teams: bool = False):
         if not await self.is_admin(interaction):
             await interaction.response.send_message(
                 "❌ You need admin permissions to use this command.",
+                ephemeral=True
+            )
+            return
+
+        if custom_teams:
+            await self._scratch_match_custom_teams(interaction)
+            return
+
+        if not team1 or not team2:
+            await interaction.response.send_message(
+                "❌ Select both team1 and team2, or set custom_teams to build ad-hoc lineups instead.",
                 ephemeral=True
             )
             return
@@ -1796,10 +1810,53 @@ class MatchCommands(commands.Cog):
         if force_note:
             await interaction.followup.send(force_note.lstrip("\n"), ephemeral=True)
 
+    async def _scratch_match_custom_teams(self, interaction, home_ground_advantage=False):
+        """Entry point for /scratchmatch's custom_teams option -
+        ScratchMatchMainMenuView's two dropdowns pick Team 1/Team 2 from
+        saved scratch teams; "Manage Scratch Teams" is where teams are
+        created, have their lineup edited, or deleted; "Run Match" enables
+        once both dropdowns hold different, complete (23/23) teams. Neutral
+        venue by default (these aren't real teams, so no home ground
+        advantage) and batch-only - no live feed mode, matching the
+        "lightweight tool" scope this was built to."""
+        async def on_run(interaction, team1_id, team1_name, team2_id, team2_name):
+            async with aiosqlite.connect(DB_PATH) as db:
+                team1_lineup = await fetch_scratch_lineup_tuples(db, team1_id)
+                team2_lineup = await fetch_scratch_lineup_tuples(db, team2_id)
+
+                # Same league-average-OVR baseline the real /scratchmatch
+                # path uses (current real lineups' average rating) - scratch
+                # teams don't have their own "league", so they're measured
+                # against the real league's current standard.
+                cursor = await db.execute(
+                    """SELECT AVG(p.overall_rating) FROM lineups l
+                       JOIN players p ON l.player_id = p.player_id AND p.team_id = l.team_id"""
+                )
+                league_avg_result = await cursor.fetchone()
+                league_avg_ovr = league_avg_result[0] if league_avg_result and league_avg_result[0] else 85.0
+                variance = await self.get_match_sim_variance(db)
+
+            result = simulate_match(
+                team1_name, team1_lineup, team2_name, team2_lineup,
+                league_avg_ovr, variance=variance, home_ground_advantage=home_ground_advantage
+            )
+            embed = self.build_final_result_embed(team1_name, team2_name, result, "", "")
+            stats_view = PostFullStatsView(team1_name, team2_name, result)
+            await interaction.response.edit_message(embed=embed, view=stats_view)
+
+        menu = ScratchMatchMainMenuView(self, on_run)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await menu.refresh(db)
+        await interaction.response.send_message(embed=menu.create_embed(), view=menu, ephemeral=True)
+
     async def _resolve_season(self, db, season_number):
         """Returns (season_id, season_number, current_round) for the given
-        season_number, or for the active season if season_number is None.
-        Returns None (and lets the caller report the error) if not found."""
+        season_number, or for the active/offseason season if season_number
+        is None (active preferred - same status IN ('active', 'offseason')
+        convention as resolve_profile_season in player_commands.py, so
+        /matchcentre keeps browsing the season that just finished throughout
+        the offseason instead of reporting "No active season!"). Returns
+        None (and lets the caller report the error) if not found."""
         if season_number is not None:
             cursor = await db.execute(
                 "SELECT season_id, season_number, current_round FROM seasons WHERE season_number = ?",
@@ -1807,7 +1864,10 @@ class MatchCommands(commands.Cog):
             )
         else:
             cursor = await db.execute(
-                "SELECT season_id, season_number, current_round FROM seasons WHERE status = 'active' LIMIT 1"
+                """SELECT season_id, season_number, current_round FROM seasons
+                   WHERE status IN ('active', 'offseason')
+                   ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END
+                   LIMIT 1"""
             )
         return await cursor.fetchone()
 

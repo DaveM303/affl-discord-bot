@@ -132,7 +132,39 @@ async def init_db():
                 FOREIGN KEY (player_id) REFERENCES players(player_id)
             )
         ''')
-        
+
+        # Scratch teams: named, reusable lineups for /scratchmatch's
+        # custom_teams option (draft-scouting exhibition matches - mixing in
+        # undrafted prospects to see how they perform). Deliberately just a
+        # name + a lineup, nothing else - no scratch match/stats tables,
+        # since results are ephemeral and never persisted (see the
+        # scratch-match feature design discussion). Never a row in `teams`,
+        # so it's structurally invisible to the ladder, /awards,
+        # /matchcentre, /exportdata and career games-played, all of which
+        # only filter real data by season_id/team_name with no "is this
+        # real" flag to hook into.
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS scratch_teams (
+                scratch_team_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                team_name TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS scratch_team_players (
+                scratch_team_id INTEGER NOT NULL,
+                player_id INTEGER NOT NULL,
+                slot_number INTEGER NOT NULL,
+                position_name TEXT NOT NULL,
+                UNIQUE(scratch_team_id, slot_number),
+                UNIQUE(scratch_team_id, position_name),
+                UNIQUE(scratch_team_id, player_id),
+                FOREIGN KEY (scratch_team_id) REFERENCES scratch_teams(scratch_team_id),
+                FOREIGN KEY (player_id) REFERENCES players(player_id)
+            )
+        ''')
+
         # Create Trades table
         await db.execute('''
             CREATE TABLE IF NOT EXISTS trades (
