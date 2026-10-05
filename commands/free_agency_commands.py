@@ -1361,13 +1361,20 @@ class FreeAgencyCommands(commands.Cog):
                            LEFT JOIN ladder_positions lp ON b.team_id = lp.team_id
                            LEFT JOIN seasons s ON lp.season_id = s.season_id AND s.season_number = ?
                            WHERE b.season_number = ? AND b.player_id = ? AND b.status = 'active'
-                           ORDER BY b.bid_amount DESC, lp.position ASC""",
+                           ORDER BY b.bid_amount DESC, lp.position DESC""",
                         (current_season, current_season, player_id)
                     )
                     bids = await cursor.fetchall()
 
                     if bids:
-                        # Winner is highest bid, tiebreaker by ladder position (lower is better)
+                        # Winner is highest bid; tied bids go to the
+                        # lower-ranked team (higher ladder_positions.position
+                        # number = finished worse) as a competitive-balance
+                        # tiebreak - position DESC so that team sorts first
+                        # among ties. position 1 is the best team (see
+                        # compute_and_store_ladder's sort_key), so ASC here
+                        # would have let the BETTER team win ties, which is
+                        # backwards.
                         winning_team_id, winning_bid, _ = bids[0]
 
                         # Create result

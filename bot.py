@@ -467,6 +467,20 @@ async def init_db():
             await db.execute("ALTER TABLE teams ADD COLUMN color_secondary TEXT")
             print("Added 'color_secondary' column to teams table")
 
+        # Add emoji_id column to scratch_teams table if it doesn't exist -
+        # same stored shape as teams.emoji_id (a custom emoji's numeric ID
+        # as TEXT, resolved via get_team_emoji_str), set via Manage Scratch
+        # Teams' "Set Emoji" button. Needed so a scratch team's live-feed
+        # events can be identified by emoji like a real team's, instead of
+        # falling back to a bracketed name tag.
+        cursor = await db.execute("PRAGMA table_info(scratch_teams)")
+        columns = await cursor.fetchall()
+        column_names = [column[1] for column in columns]
+
+        if 'emoji_id' not in column_names:
+            await db.execute("ALTER TABLE scratch_teams ADD COLUMN emoji_id TEXT")
+            print("Added 'emoji_id' column to scratch_teams table")
+
         await db.commit()
         print("Database initialized successfully!")
 

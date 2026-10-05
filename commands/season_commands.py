@@ -2180,6 +2180,14 @@ class SeasonCommands(commands.Cog):
                     )
                 ''')
 
+                # Add emoji_id column to scratch_teams table if it doesn't
+                # exist - same shape as teams.emoji_id, set via Manage
+                # Scratch Teams' "Set Emoji" button.
+                cursor = await db.execute("PRAGMA table_info(scratch_teams)")
+                scratch_columns = [col[1] for col in await cursor.fetchall()]
+                if 'emoji_id' not in scratch_columns:
+                    await db.execute("ALTER TABLE scratch_teams ADD COLUMN emoji_id TEXT")
+
                 await db.commit()
 
                 await interaction.followup.send(
@@ -2201,7 +2209,8 @@ class SeasonCommands(commands.Cog):
                     "• **Teams table**: Added lineup_confirmed column\n"
                     "• **Teams table**: Added color and color_secondary columns\n"
                     "• Player Match Stats table created\n"
-                    "• Scratch Teams tables created\n\n"
+                    "• Scratch Teams tables created\n"
+                    "• **Scratch Teams table**: Added emoji_id column\n\n"
                     "You can now use all season, injury, suspension, lineup, and free agency commands.\n"
                     "Use `/config lineups_channel:<#channel>` to configure where lineups are posted.",
                     ephemeral=True

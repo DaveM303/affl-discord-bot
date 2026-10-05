@@ -249,8 +249,16 @@ class LiveMatchState:
                  is_finals=False, finals_slot_code=None, sim_panel_view=None):
         self.home_name = home_name
         self.away_name = away_name
-        self.home_emoji = home_emoji
-        self.away_emoji = away_emoji
+        # Every live-feed line (_event_message, _quarter_score_summary, the
+        # panel embeds) uses home_emoji/away_emoji as the ONLY per-event team
+        # identifier - the team name never otherwise appears next to a goal/
+        # behind/injury event. A real team always resolves a non-empty emoji
+        # string (get_team_emoji_str), but a scratch team has no emoji_id at
+        # all, so "" would make every event line ambiguous about who it
+        # belongs to. Fall back to a short bracketed name tag so that case
+        # still identifies the team, instead of silently going blank.
+        self.home_emoji = home_emoji or f"[{home_name}] "
+        self.away_emoji = away_emoji or f"[{away_name}] "
 
         # Set only for a real round match (via /matchsimulation) - None for
         # a /scratchmatch preview. _post_final_result uses this to decide
@@ -1547,7 +1555,7 @@ class MatchCommands(commands.Cog):
         mode="Result only (one final result) or live (paced event feed with a control panel)",
         home_ground_advantage="Give team1 home ground advantage (default: off)",
         force="Force a specific test scenario instead of a natural result. 'After-siren winner' only applies in Live mode.",
-        custom_teams="Build two ad-hoc scratch lineups instead (e.g. for draft scouting) - ignores team1/team2/mode/force"
+        custom_teams="Build two ad-hoc scratch lineups instead (e.g. for draft scouting) - ignores team1/team2"
     )
     @app_commands.rename(force="force_scenario")
     @app_commands.choices(mode=[
@@ -1569,20 +1577,20 @@ class MatchCommands(commands.Cog):
             )
             return
 
+        if force == "after_siren_winner" and mode != "live":
+            await interaction.response.send_message(
+                "❌ Forcing an after-siren winner only makes sense in Live mode (Batch has no event feed to show it happening).",
+                ephemeral=True
+            )
+            return
+
         if custom_teams:
-            await self._scratch_match_custom_teams(interaction)
+            await self._scratch_match_custom_teams(interaction, mode=mode, home_ground_advantage=home_ground_advantage, force=force)
             return
 
         if not team1 or not team2:
             await interaction.response.send_message(
                 "❌ Select both team1 and team2, or set custom_teams to build ad-hoc lineups instead.",
-                ephemeral=True
-            )
-            return
-
-        if force == "after_siren_winner" and mode != "live":
-            await interaction.response.send_message(
-                "❌ Forcing an after-siren winner only makes sense in Live mode (Batch has no event feed to show it happening).",
                 ephemeral=True
             )
             return
@@ -1810,16 +1818,20 @@ class MatchCommands(commands.Cog):
         if force_note:
             await interaction.followup.send(force_note.lstrip("\n"), ephemeral=True)
 
-    async def _scratch_match_custom_teams(self, interaction, home_ground_advantage=False):
+    async def _scratch_match_custom_teams(self, interaction, mode="batch", home_ground_advantage=False, force=None):
         """Entry point for /scratchmatch's custom_teams option -
         ScratchMatchMainMenuView's two dropdowns pick Team 1/Team 2 from
         saved scratch teams; "Manage Scratch Teams" is where teams are
         created, have their lineup edited, or deleted; "Run Match" enables
         once both dropdowns hold different, complete (23/23) teams. Neutral
         venue by default (these aren't real teams, so no home ground
-        advantage) and batch-only - no live feed mode, matching the
-        "lightweight tool" scope this was built to."""
-        async def on_run(interaction, team1_id, team1_name, team2_id, team2_name):
+        advantage). Supports both batch (Result Only) and live modes, same
+        as the built-in-team /scratchmatch path - live mode builds a
+        LiveMatchState with match_id/home_team_id/away_team_id/season_id
+        all left None, same as the built-in-team scratch live path, so
+        _post_final_result never tries to persist a scratch result to the
+        real matches/lineups tables."""
+        async def on_run(interaction, team1_id, team1_name, team2_id, team2_name, team1_emoji_id, team2_emoji_id):
             async with aiosqlite.connect(DB_PATH) as db:
                 team1_lineup = await fetch_scratch_lineup_tuples(db, team1_id)
                 team2_lineup = await fetch_scratch_lineup_tuples(db, team2_id)
@@ -1836,15 +1848,82 @@ class MatchCommands(commands.Cog):
                 league_avg_ovr = league_avg_result[0] if league_avg_result and league_avg_result[0] else 85.0
                 variance = await self.get_match_sim_variance(db)
 
+            if mode == "live":
+                global _active_live_match
+
+                if _active_live_match is not None:
+                    await interaction.response.send_message(
+                        "❌ A live match is already in progress. Only one live match can run at a time.",
+                        ephemeral=True
+                    )
+                    return
+
+                await interaction.response.defer(ephemeral=True)
+
+                async with aiosqlite.connect(DB_PATH) as db:
+                    control_channel, feed_channel = await self.get_live_match_channels(db, interaction.guild)
+                if control_channel is None or feed_channel is None:
+                    await interaction.followup.send(
+                        "❌ Live match channels not configured — set them with /config first.",
+                        ephemeral=True
+                    )
+                    return
+
+                result, events, quarter_lengths = simulate_match_with_events(
+                    team1_name, team1_lineup, team2_name, team2_lineup,
+                    league_avg_ovr, variance=variance, home_ground_advantage=home_ground_advantage
+                )
+
+                force_note = ""
+                if force == "draw":
+                    self._force_draw(result)
+                    force_note = (
+                        f"\n⚠️ Forced draw applied to the final score only — quarter-by-quarter "
+                        f"score displays before Full Time reflect the natural simulated events "
+                        f"and won't match the forced total until Q4 ends."
+                    )
+                elif force == "after_siren_winner":
+                    home_players = [Player(*row) for row in team1_lineup]
+                    away_players = [Player(*row) for row in team2_lineup]
+                    self._force_after_siren_winner(
+                        result, events, quarter_lengths, home_players, away_players,
+                        team1_name, team2_name, random.Random(),
+                    )
+                    force_note = "\n⚠️ Q4's after-siren shot has been forced to be a winning goal."
+
+                home_emoji = get_team_emoji_str(self.bot, team1_emoji_id)
+                away_emoji = get_team_emoji_str(self.bot, team2_emoji_id)
+
+                await feed_channel.send(embed=discord.Embed(
+                    title=f"{home_emoji}{team1_name} vs {away_emoji}{team2_name}",
+                    color=discord.Color.blurple(),
+                ))
+
+                state = LiveMatchState(team1_name, team2_name, home_emoji, away_emoji, result, events, variance, quarter_lengths,
+                                        home_lineup=team1_lineup, away_lineup=team2_lineup, league_avg_ovr=league_avg_ovr,
+                                        home_ground_advantage=home_ground_advantage)
+                view = LiveMatchControlView(self, state, feed_channel)
+                panel_message = await control_channel.send(embed=view.panel_embed(), view=view)
+                view.message = panel_message
+                _active_live_match = state
+
+                if force_note:
+                    await interaction.followup.send(force_note.lstrip("\n"), ephemeral=True)
+                return
+
             result = simulate_match(
                 team1_name, team1_lineup, team2_name, team2_lineup,
                 league_avg_ovr, variance=variance, home_ground_advantage=home_ground_advantage
             )
-            embed = self.build_final_result_embed(team1_name, team2_name, result, "", "")
+            if force == "draw":
+                self._force_draw(result)
+            home_emoji = get_team_emoji_str(self.bot, team1_emoji_id)
+            away_emoji = get_team_emoji_str(self.bot, team2_emoji_id)
+            embed = self.build_final_result_embed(team1_name, team2_name, result, home_emoji, away_emoji)
             stats_view = PostFullStatsView(team1_name, team2_name, result)
             await interaction.response.edit_message(embed=embed, view=stats_view)
 
-        menu = ScratchMatchMainMenuView(self, on_run)
+        menu = ScratchMatchMainMenuView(self, on_run, mode=mode)
         async with aiosqlite.connect(DB_PATH) as db:
             await menu.refresh(db)
         await interaction.response.send_message(embed=menu.create_embed(), view=menu, ephemeral=True)

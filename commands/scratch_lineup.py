@@ -24,7 +24,7 @@ tables - a scratch team is not a real team and never touches the ladder,
 import discord
 import aiosqlite
 from config import DB_PATH
-from utils import fetch_teams_for_dropdown, build_team_options, DISCORD_SELECT_MAX_OPTIONS
+from utils import fetch_teams_for_dropdown, build_team_options, DISCORD_SELECT_MAX_OPTIONS, get_team_emoji, get_team_emoji_str
 from commands.lineup_commands import (
     AFL_POSITIONS, fits_without_penalty,
     build_position_options, build_player_options, build_lineup_field_text,
@@ -39,9 +39,12 @@ SCRATCH_TEAM_NAME_MAX_LENGTH = 60
 
 
 async def fetch_scratch_teams(db):
-    """All saved scratch teams as (scratch_team_id, team_name), name order."""
+    """All saved scratch teams as (scratch_team_id, team_name, emoji_id),
+    name order. emoji_id is None until set via Manage Scratch Teams' "Set
+    Emoji" button - same stored shape as teams.emoji_id (a custom emoji's
+    numeric ID as TEXT, resolved via get_team_emoji_str)."""
     cursor = await db.execute(
-        "SELECT scratch_team_id, team_name FROM scratch_teams ORDER BY team_name"
+        "SELECT scratch_team_id, team_name, emoji_id FROM scratch_teams ORDER BY team_name"
     )
     return await cursor.fetchall()
 
@@ -185,13 +188,15 @@ class ScratchMatchMainMenuView(discord.ui.View):
     """/scratchmatch custom_teams:True's main menu - two dropdowns to pick
     Team 1 / Team 2 from saved scratch teams, a button to manage teams
     (create/edit lineup/delete), and Run Match, enabled only once both
-    teams are selected, different, and have complete (23/23) lineups.
-    on_run(interaction, team1_id, team1_name, team2_id, team2_name) is
-    called once Run Match is pressed."""
-    def __init__(self, cog, on_run, team1_id=None, team2_id=None):
+    teams are selected, different, and have complete (23/23) lineups (and,
+    in Live mode, both have an emoji set - see _run_enabled). on_run
+    (interaction, team1_id, team1_name, team2_id, team2_name) is called
+    once Run Match is pressed."""
+    def __init__(self, cog, on_run, mode="batch", team1_id=None, team2_id=None):
         super().__init__(timeout=600)
         self.cog = cog
         self.on_run = on_run
+        self.mode = mode
         self.team1_id = team1_id
         self.team2_id = team2_id
         self.message = None
@@ -199,7 +204,8 @@ class ScratchMatchMainMenuView(discord.ui.View):
     async def refresh(self, db):
         self.clear_items()
         teams = await fetch_scratch_teams(db)
-        self.teams_by_id = dict(teams)
+        self.teams_by_id = {team_id: name for team_id, name, _ in teams}
+        self.emoji_by_id = {team_id: emoji_id for team_id, _, emoji_id in teams}
 
         self.add_item(_MainMenuTeamSelect(self, teams, side=1, selected=self.team1_id))
         self.add_item(_MainMenuTeamSelect(self, teams, side=2, selected=self.team2_id))
@@ -229,21 +235,47 @@ class ScratchMatchMainMenuView(discord.ui.View):
             "SELECT COUNT(*) FROM scratch_team_players WHERE scratch_team_id = ?", (self.team2_id,)
         )
         team2_count = (await cursor.fetchone())[0]
-        return team1_count == 23 and team2_count == 23
+        if team1_count != 23 or team2_count != 23:
+            return False
+
+        # Live mode's per-event feed lines use each team's emoji as the
+        # ONLY identifier of who an event belongs to (see LiveMatchState) -
+        # without one, every goal/behind/injury line in the feed is
+        # ambiguous about which team it's for. Batch mode's result embed
+        # always labels each side by name regardless, so this only gates
+        # Live.
+        if self.mode == "live":
+            if not self.emoji_by_id.get(self.team1_id) or not self.emoji_by_id.get(self.team2_id):
+                return False
+
+        return True
 
     def create_embed(self):
         def team_line(side, team_id):
             if not team_id:
                 return f"Team {side}: *none selected*"
             name = self.teams_by_id.get(team_id, "Unknown")
-            return f"Team {side}: **{name}**"
+            emoji_str = get_team_emoji_str(self.cog.bot, self.emoji_by_id.get(team_id))
+            return f"Team {side}: {emoji_str}**{name}**"
 
         lines = [team_line(1, self.team1_id), team_line(2, self.team2_id)]
         if self.team1_id and self.team1_id == self.team2_id:
             lines.append("\n❌ Pick two different scratch teams.")
 
+        if self.mode == "live":
+            missing_emoji = [
+                self.teams_by_id[tid] for tid in (self.team1_id, self.team2_id)
+                if tid and not self.emoji_by_id.get(tid)
+            ]
+            if missing_emoji:
+                names = " and ".join(f"**{n}**" for n in missing_emoji)
+                lines.append(
+                    f"\n:exclamation: Live mode requires every team to have an emoji set. "
+                    f"Set one for {names} via Manage Scratch Teams first."
+                )
+
         return discord.Embed(
-            title="Custom Match",
+            title="Custom Match" + (" (Live)" if self.mode == "live" else ""),
             description=(
                 "Pick a scratch team for each side, then Run Match once both are ready.\n"
                 "Use Manage Scratch Teams to create teams or set their lineups.\n\n"
@@ -263,7 +295,12 @@ class ScratchMatchMainMenuView(discord.ui.View):
         async with aiosqlite.connect(DB_PATH) as db:
             team1_name = self.teams_by_id.get(self.team1_id, "Team 1")
             team2_name = self.teams_by_id.get(self.team2_id, "Team 2")
-        await self.on_run(interaction, self.team1_id, team1_name, self.team2_id, team2_name)
+            team1_emoji_id = self.emoji_by_id.get(self.team1_id)
+            team2_emoji_id = self.emoji_by_id.get(self.team2_id)
+        await self.on_run(
+            interaction, self.team1_id, team1_name, self.team2_id, team2_name,
+            team1_emoji_id, team2_emoji_id
+        )
 
 
 class _MainMenuTeamSelect(discord.ui.Select):
@@ -271,8 +308,11 @@ class _MainMenuTeamSelect(discord.ui.Select):
         self.parent_view = parent_view
         self.side = side
         options = [
-            discord.SelectOption(label=name[:100], value=str(team_id), default=(team_id == selected))
-            for team_id, name in teams
+            discord.SelectOption(
+                label=name[:100], value=str(team_id), default=(team_id == selected),
+                emoji=get_team_emoji(parent_view.cog.bot, emoji_id)
+            )
+            for team_id, name, emoji_id in teams
         ][:DISCORD_SELECT_MAX_OPTIONS]
         if not options:
             options = [discord.SelectOption(label="No saved scratch teams yet - use Manage Scratch Teams", value="none")]
@@ -307,7 +347,8 @@ class ScratchTeamManageView(discord.ui.View):
     async def refresh(self, db):
         self.clear_items()
         teams = await fetch_scratch_teams(db)
-        self.teams_by_id = dict(teams)
+        self.teams_by_id = {team_id: name for team_id, name, _ in teams}
+        self.emoji_by_id = {team_id: emoji_id for team_id, _, emoji_id in teams}
 
         self.add_item(_ManageTeamSelect(self, teams))
 
@@ -323,6 +364,10 @@ class ScratchTeamManageView(discord.ui.View):
             rename_btn = discord.ui.Button(label="✏ Rename Team", style=discord.ButtonStyle.secondary, row=2)
             rename_btn.callback = self._rename_callback
             self.add_item(rename_btn)
+
+            emoji_btn = discord.ui.Button(label="😀 Set Emoji", style=discord.ButtonStyle.secondary, row=2)
+            emoji_btn.callback = self._set_emoji_callback
+            self.add_item(emoji_btn)
 
             delete_btn = discord.ui.Button(label="🗑 Delete Team", style=discord.ButtonStyle.danger, row=2)
             delete_btn.callback = self._delete_callback
@@ -341,10 +386,11 @@ class ScratchTeamManageView(discord.ui.View):
             )
         lineup = await fetch_scratch_lineup(db, self.selected_team_id)
         name = self.teams_by_id[self.selected_team_id]
+        emoji_str = get_team_emoji_str(self.cog.bot, self.emoji_by_id.get(self.selected_team_id))
 
         embed = discord.Embed(
             title="Manage Scratch Teams",
-            description=f"Selected: **{name}** ({len(lineup)}/23 positions filled)",
+            description=f"Selected: {emoji_str}**{name}** ({len(lineup)}/23 positions filled)",
             color=discord.Color.blurple()
         )
         # Same field-grid layout as the lineup editor itself
@@ -352,6 +398,12 @@ class ScratchTeamManageView(discord.ui.View):
         # right here so managing a team doesn't require opening the editor
         # just to see who's in it.
         embed.add_field(name="​", value=build_lineup_field_text(lineup), inline=False)
+        if not emoji_str:
+            embed.add_field(
+                name="​",
+                value="⚠ No emoji set - required before this team can be used in a Live scratch match.",
+                inline=False
+            )
         return embed
 
     async def _new_team_callback(self, interaction: discord.Interaction):
@@ -360,6 +412,13 @@ class ScratchTeamManageView(discord.ui.View):
     async def _rename_callback(self, interaction: discord.Interaction):
         current_name = self.teams_by_id[self.selected_team_id]
         await interaction.response.send_modal(_RenameScratchTeamModal(self, self.selected_team_id, current_name))
+
+    async def _set_emoji_callback(self, interaction: discord.Interaction):
+        current_emoji_id = self.emoji_by_id.get(self.selected_team_id)
+        current_emoji_str = get_team_emoji_str(self.cog.bot, current_emoji_id, trailing_space=False)
+        await interaction.response.send_modal(
+            _SetScratchTeamEmojiModal(self, self.selected_team_id, current_emoji_str)
+        )
 
     async def _edit_lineup_callback(self, interaction: discord.Interaction):
         async with aiosqlite.connect(DB_PATH) as db:
@@ -387,9 +446,12 @@ class _ManageTeamSelect(discord.ui.Select):
     def __init__(self, parent_view, teams):
         self.parent_view = parent_view
         options = [
-            discord.SelectOption(label=name[:100], value=str(team_id),
-                                  default=(team_id == parent_view.selected_team_id))
-            for team_id, name in teams
+            discord.SelectOption(
+                label=name[:100], value=str(team_id),
+                default=(team_id == parent_view.selected_team_id),
+                emoji=get_team_emoji(parent_view.cog.bot, emoji_id)
+            )
+            for team_id, name, emoji_id in teams
         ][:DISCORD_SELECT_MAX_OPTIONS]
         if not options:
             options = [discord.SelectOption(label="No saved scratch teams yet", value="none")]
@@ -472,6 +534,63 @@ class _RenameScratchTeamModal(discord.ui.Modal, title="Rename Scratch Team"):
             await db.execute(
                 "UPDATE scratch_teams SET team_name = ? WHERE scratch_team_id = ?",
                 (name, self.scratch_team_id)
+            )
+            await db.commit()
+
+            await self.manage_view.refresh(db)
+            embed = await self.manage_view.create_embed(db)
+        await interaction.response.edit_message(embed=embed, view=self.manage_view)
+
+
+class _SetScratchTeamEmojiModal(discord.ui.Modal, title="Set Scratch Team Emoji"):
+    """Same input convention as /updateteam's emoji parameter - paste a
+    custom emoji (Discord renders it as <:name:id> text) or type the raw
+    numeric ID directly. Only a custom emoji (one the bot can resolve via
+    bot.get_emoji, i.e. from a server the bot is in) works here, same
+    restriction as a real team's emoji - a standard unicode emoji has no
+    ID to store and won't resolve via get_team_emoji_str."""
+    emoji_input = discord.ui.TextInput(
+        label="Emoji", max_length=100,
+        placeholder="Paste a custom emoji, e.g. <:hawks:123456789012345678>"
+    )
+
+    def __init__(self, manage_view, scratch_team_id, current_emoji_str):
+        super().__init__()
+        self.manage_view = manage_view
+        self.scratch_team_id = scratch_team_id
+        if current_emoji_str:
+            self.emoji_input.default = current_emoji_str
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.emoji_input.value.strip()
+        if not raw:
+            await interaction.response.send_message("❌ Emoji can't be empty.", ephemeral=True)
+            return
+
+        import re
+        match = re.match(r'<a?:(\w+):(\d+)>', raw)
+        emoji_id = match.group(2) if match else raw
+
+        if not emoji_id.isdigit():
+            await interaction.response.send_message(
+                "❌ That doesn't look like a custom emoji - paste the emoji itself "
+                "(Discord will show it as `<:name:id>`), or its numeric ID.",
+                ephemeral=True
+            )
+            return
+
+        resolved = get_team_emoji(self.manage_view.cog.bot, emoji_id)
+        if resolved is None:
+            await interaction.response.send_message(
+                "❌ Couldn't find that emoji - it must be a custom emoji from a server this bot is in.",
+                ephemeral=True
+            )
+            return
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE scratch_teams SET emoji_id = ? WHERE scratch_team_id = ?",
+                (emoji_id, self.scratch_team_id)
             )
             await db.commit()
 
