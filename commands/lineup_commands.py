@@ -572,13 +572,39 @@ class LineupCommands(commands.Cog):
         interaction: discord.Interaction,
         current: str,
     ) -> list[app_commands.Choice[str]]:
-        """Autocomplete for player names with format: Name (Team, POS, age, OVR)"""
+        """Autocomplete for /delist's player1-8 params, format: Name (Team,
+        POS, age, OVR). /delist isn't admin-only (a team manager can delist
+        from their own roster - see delist_player), so this must NEVER
+        query the full players table: that would hand every regular user a
+        live OVR lookup for every player in the game, including Draft Pool
+        prospects who aren't supposed to have their rating revealed before
+        being drafted. Scoped to the team /delist will actually act
+        on - the admin-only team_name override if one's already been typed
+        in that option (interaction.namespace), otherwise the invoking
+        user's own team."""
+        team_id = None
+        admin_team_name = getattr(interaction.namespace, "team_name", None)
+        if admin_team_name and await self.is_admin(interaction):
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT team_id FROM teams WHERE team_name = ?", (admin_team_name,)
+                )
+                row = await cursor.fetchone()
+                team_id = row[0] if row else None
+        else:
+            team_id, _ = await self.get_user_team(interaction.user.id, interaction.guild)
+
+        if not team_id:
+            return []
+
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
                 """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating, t.team_name
                    FROM players p
-                   LEFT JOIN teams t ON p.team_id = t.team_id
-                   ORDER BY p.name"""
+                   JOIN teams t ON p.team_id = t.team_id
+                   WHERE p.team_id = ?
+                   ORDER BY p.name""",
+                (team_id,)
             )
             players = await cursor.fetchall()
 
@@ -588,8 +614,7 @@ class LineupCommands(commands.Cog):
             # Check if current input matches player name
             if current.lower() in name.lower():
                 # Format: Name (Team, POS, age yo, OVR)
-                team_prefix = team_name if team_name else "Delisted"
-                display_name = f"{name} ({team_prefix}, {position}, {age}yo, {rating} OVR)"
+                display_name = f"{name} ({team_name}, {position}, {age}yo, {rating} OVR)"
 
                 # Value is player_id so we can query by ID later
                 choices.append(app_commands.Choice(name=display_name, value=str(player_id)))
