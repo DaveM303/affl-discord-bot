@@ -48,6 +48,14 @@ if not os.path.isfile(SAM_LLOYD_AUDIO_PATH):
     SAM_LLOYD_AUDIO_PATH = None
 SAM_LLOYD_AUDIO_DISPLAY_NAME = "audio.mp3"
 
+# Easter egg: in any live match involving this team, "Wharfie time" is
+# called once in the 4th quarter, straight after a goal kicked in this
+# window (or the goal closest to it - see run_quarter).
+WHARFIE_TIME_TEAM = "Fremantle"
+WHARFIE_TIME_WINDOW_MINUTES = (10, 25)
+WHARFIE_TIME_MESSAGE = ":bell: WHARFIE TIME :bell:"
+WHARFIE_TIME_DELAY_SECONDS = 3  # real seconds after the goal it follows
+
 # Only one live match may run at a time (see design doc §09) - keyed by
 # nothing in particular, just a single module-level slot, since a live match
 # is a whole-server sandbox event, not a per-channel or per-team thing.
@@ -1067,6 +1075,21 @@ class MatchCommands(commands.Cog):
         after_siren_events = [e for e in state.events_by_quarter[state.quarter] if e.after_siren]
         feed_channel = view.feed_channel
 
+        # Wharfie time easter egg: posted straight after one 4th-quarter goal
+        # (either team) in Fremantle games - a random goal kicked inside
+        # WHARFIE_TIME_WINDOW_MINUTES, or the goal closest to that window if
+        # none was. The 4th quarter only runs once per match (extra time is
+        # run_extra_time_half), so it happens at most once.
+        wharfie_goal = None
+        if state.quarter == 4 and WHARFIE_TIME_TEAM.lower() in (state.home_name.lower(), state.away_name.lower()):
+            earliest, latest = WHARFIE_TIME_WINDOW_MINUTES
+            goals = [e for e in events if e.kind == "goal"]
+            in_window = [g for g in goals if earliest <= g.minute <= latest]
+            if in_window:
+                wharfie_goal = random.choice(in_window)
+            elif goals:
+                wharfie_goal = min(goals, key=lambda g: earliest - g.minute if g.minute < earliest else g.minute - latest)
+
         if feed_channel is not None:
             await feed_channel.send(f"**{QUARTER_START_LABELS[state.quarter]}**")
 
@@ -1111,6 +1134,11 @@ class MatchCommands(commands.Cog):
                     home_goals, home_behinds, away_goals, away_behinds,
                 )
                 await feed_channel.send(message)
+                if event is wharfie_goal:
+                    await self._wait_with_controls(state, WHARFIE_TIME_DELAY_SECONDS)
+                    if state.abandon_requested:
+                        return
+                    await feed_channel.send(WHARFIE_TIME_MESSAGE)
 
             if i == len(events) - 1:
                 break
