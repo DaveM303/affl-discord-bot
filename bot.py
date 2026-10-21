@@ -2,13 +2,18 @@ import discord
 from discord.ext import commands
 import aiosqlite
 from config import DISCORD_BOT_TOKEN, GUILD_ID, DB_PATH
+from utils import ensure_fixture_schema, ensure_draft_pick_schema, ensure_season_schema
 
 # Bot setup
 intents = discord.Intents.default()
-intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+# Every command is a slash command, so there's no prefix help to offer
+# (discord.py would otherwise answer "!help" with an empty command list).
+# when_mentioned rather than a "!" prefix: there are no prefix commands, and
+# it's the one prefix discord.py doesn't warn about without the message
+# content intent (which the bot doesn't need, so doesn't request).
+bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
 
 # Initialize database
 async def init_db():
@@ -55,7 +60,6 @@ async def init_db():
                 current_round INTEGER DEFAULT 0,
                 regular_rounds INTEGER DEFAULT 24,
                 total_rounds INTEGER DEFAULT 29,
-                round_name TEXT DEFAULT 'Offseason',
                 status TEXT DEFAULT 'offseason'
             )
         ''')
@@ -140,7 +144,7 @@ async def init_db():
         # since results are ephemeral and never persisted (see the
         # scratch-match feature design discussion). Never a row in `teams`,
         # so it's structurally invisible to the ladder, /awards,
-        # /matchcentre, /exportdata and career games-played, all of which
+        # /matchcentre and career games-played, all of which
         # only filter real data by season_id/team_name with no "is this
         # real" flag to hook into.
         await db.execute('''
@@ -441,6 +445,13 @@ async def init_db():
             await db.execute("ALTER TABLE seasons ADD COLUMN lineups_locked INTEGER DEFAULT 0")
             print("Added 'lineups_locked' column to seasons table")
 
+        # seasons.round_name was a stored copy of get_round_name(current_round,
+        # regular_rounds) - /seasonstatus now works the label out live, so
+        # drop the column from older databases.
+        if 'round_name' in column_names:
+            await db.execute("ALTER TABLE seasons DROP COLUMN round_name")
+            print("Dropped 'round_name' column from seasons table")
+
         # Add lineup_confirmed column to teams table if it doesn't exist -
         # set by the Submit Lineup button in /teamlineup, cleared each round
         # when lineups_locked resets, checked by /matchsimulation's Announce
@@ -481,6 +492,13 @@ async def init_db():
             await db.execute("ALTER TABLE scratch_teams ADD COLUMN emoji_id TEXT")
             print("Added 'emoji_id' column to scratch_teams table")
 
+        # Fixture tables/columns for /generatefixture - see utils.ensure_fixture_schema.
+        await ensure_fixture_schema(db)
+        # draft_picks.pick_type - see utils.ensure_draft_pick_schema.
+        await ensure_draft_pick_schema(db)
+        # seasons.offseason_weeks - see utils.ensure_season_schema.
+        await ensure_season_schema(db)
+
         await db.commit()
         print("Database initialized successfully!")
 
@@ -502,6 +520,7 @@ async def on_ready():
     await bot.load_extension('commands.match_commands')
     await bot.load_extension('commands.stats_commands')
     await bot.load_extension('commands.awards_commands')
+    await bot.load_extension('commands.fixture_commands')
     
     try:
         if GUILD_ID:

@@ -2,13 +2,42 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import aiosqlite
+import json
 from config import DB_PATH
-from utils import (is_admin_user, assign_drafted_player, get_team_emoji,
-                   get_team_emoji_str, build_team_options, fetch_teams_for_dropdown)
+from utils import (is_admin_user, assign_drafted_player, get_team_emoji, pick_origin_label,
+                   get_team_emoji_str, build_team_options, fetch_teams_for_dropdown, add_page_buttons)
+
+
+def replace_page_buttons(view, page, total_pages, on_page, row):
+    """For views that keep their other components and only redraw the page
+    controls (decorated selects/buttons can't be rebuilt with clear_items):
+    removes the previous page buttons, then adds fresh standard ones."""
+    for item in [item for item in view.children if getattr(item, "_is_page_button", False)]:
+        view.remove_item(item)
+    before = set(view.children)
+    add_page_buttons(view, page, total_pages, on_page, row=row)
+    for item in view.children:
+        if item not in before:
+            item._is_page_button = True
 
 class DraftCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+
+    async def cog_load(self):
+        """Re-attaches the buttons of every live draft's control panel
+        after a restart (they're persistent - see DraftControlView)."""
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    """SELECT draft_id, status, control_message_id FROM drafts
+                       WHERE control_message_id IS NOT NULL
+                         AND status IN ('current', 'in_progress', 'completed')"""
+                )
+                for draft_id, status, message_id in await cursor.fetchall():
+                    self.bot.add_view(DraftControlView(self.bot, draft_id, status), message_id=int(message_id))
+        except Exception as e:
+            print(f"Couldn't re-register draft control panels: {e}")
 
     async def draft_name_autocomplete(
         self,
@@ -165,13 +194,11 @@ class DraftCommands(commands.Cog):
                 pick_counter = 1
                 for round_num in range(1, rounds + 1):
                     for team_id in draft_order:
-                        team_name = team_name_by_id[team_id]
-                        pick_origin = f"{team_name} R{round_num}"
                         await db.execute(
                             """INSERT INTO draft_picks (draft_id, draft_name, season_number, round_number, pick_number,
-                                                        pick_origin, original_team_id, current_team_id)
-                               VALUES (?, ?, 0, ?, ?, ?, ?, ?)""",
-                            (draft_id, draft_name, round_num, pick_counter, pick_origin, team_id, team_id)
+                                                        original_team_id, current_team_id, pick_type)
+                               VALUES (?, ?, 0, ?, ?, ?, ?, 'ladder')""",
+                            (draft_id, draft_name, round_num, pick_counter, team_id, team_id)
                         )
                         pick_counter += 1
 
@@ -237,15 +264,27 @@ class DraftCommands(commands.Cog):
                     """SELECT dp.pick_number, dp.round_number,
                               dp.pick_origin,
                               ct.team_name as current_team, ct.emoji_id as current_emoji,
-                              p.name as player_selected
+                              p.name as player_selected,
+                              dp.pick_type, ot.team_name, ot.emoji_id
                        FROM draft_picks dp
                        JOIN teams ct ON dp.current_team_id = ct.team_id
+                       LEFT JOIN teams ot ON dp.original_team_id = ot.team_id
                        LEFT JOIN players p ON dp.player_selected_id = p.player_id
                        WHERE dp.draft_name = ? AND dp.pick_number IS NOT NULL
                        ORDER BY dp.pick_number""",
                     (draft_name,)
                 )
-                picks = await cursor.fetchall()
+                # The origin column becomes the label to show ("R1 tied to
+                # <emoji>" for a ladder pick - see utils.pick_origin_label).
+                picks = [
+                    (pick_number, round_number,
+                     pick_origin_label(pick_type, pick_origin, round_number,
+                                       get_team_emoji_str(self.bot, original_emoji, trailing_space=False)
+                                       or original_name),
+                     current_team, current_emoji, player_selected)
+                    for (pick_number, round_number, pick_origin, current_team, current_emoji, player_selected,
+                         pick_type, original_name, original_emoji) in await cursor.fetchall()
+                ]
 
                 if not picks:
                     await interaction.followup.send(
@@ -464,6 +503,8 @@ class DraftCommands(commands.Cog):
                    LEFT JOIN drafts d ON dp.draft_id = d.draft_id
                    WHERE dp.current_team_id = ?
                      AND dp.player_selected_id IS NULL
+                     AND COALESCE(dp.passed, 0) = 0
+                     AND dp.draft_id NOT IN (SELECT draft_id FROM drafts WHERE status = 'completed')
                    ORDER BY dp.season_number ASC NULLS FIRST,
                             dp.pick_number ASC NULLS LAST,
                             dp.round_number ASC""",
@@ -623,177 +664,100 @@ class DraftCommands(commands.Cog):
         embed = view.create_embed()
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
-    @app_commands.command(name="livedraft", description="[ADMIN] Manage live draft")
-    @app_commands.describe(
-        action="Action to perform",
-        draft_name="Name of the draft"
-    )
-    @app_commands.choices(action=[
-        app_commands.Choice(name="start", value="start"),
-        app_commands.Choice(name="end", value="end"),
-        app_commands.Choice(name="re-send current pick notification", value="resend")
-    ])
+    @app_commands.command(name="livedraft", description="[ADMIN] Start a live draft (or re-post its control panel)")
+    @app_commands.describe(draft_name="Name of the draft")
     @app_commands.autocomplete(draft_name=draft_name_autocomplete)
-    async def live_draft(self, interaction: discord.Interaction, action: str, draft_name: str):
+    async def live_draft(self, interaction: discord.Interaction, draft_name: str):
+        """Posts a draft's control panel in the admin controls channel - the
+        draft itself starts from the panel's Start Draft button (see
+        start_draft). Run again, it re-posts the panel, e.g. if the panel
+        message was deleted."""
         await interaction.response.defer(ephemeral=True)
 
-        # Check if user has admin role
         if not await is_admin_user(interaction):
             await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
             return
 
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # Get draft info
                 cursor = await db.execute(
-                    "SELECT draft_id, status, rounds, season_number, current_pick_number FROM drafts WHERE draft_name = ?",
-                    (draft_name,)
+                    "SELECT draft_id, status FROM drafts WHERE draft_name = ?", (draft_name,)
                 )
                 draft_info = await cursor.fetchone()
-
                 if not draft_info:
                     await interaction.followup.send(f"❌ Draft '{draft_name}' not found!", ephemeral=True)
                     return
+                draft_id, status = draft_info
 
-                draft_id, status, rounds, season_number, current_pick_number = draft_info
-
-                if action == "start":
-                    # Check if draft is current (has ladder set)
-                    if status != 'current':
-                        await interaction.followup.send(
-                            f"❌ Draft '{draft_name}' is not ready to start (status: {status})!\n"
-                            f"A season-linked draft's order is set automatically once its season starts; "
-                            f"a custom draft's order is set at creation via `/createcustomdraft`.",
-                            ephemeral=True
-                        )
-                        return
-
-                    # Check if draft has already been started
-                    cursor = await db.execute(
-                        "SELECT started_at FROM drafts WHERE draft_id = ?",
-                        (draft_id,)
-                    )
-                    started_at = (await cursor.fetchone())[0]
-                    if started_at:
-                        await interaction.followup.send(
-                            f"❌ Draft '{draft_name}' has already been started!",
-                            ephemeral=True
-                        )
-                        return
-
-                    # Get draft channel from settings
-                    cursor = await db.execute(
-                        "SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'"
-                    )
-                    result = await cursor.fetchone()
-                    if not result or not result[0]:
-                        await interaction.followup.send(
-                            "❌ No draft channel configured! Use `/config` to set the draft channel.",
-                            ephemeral=True
-                        )
-                        return
-
-                    draft_channel_id = int(result[0])
-                    draft_channel = self.bot.get_channel(draft_channel_id)
-                    if not draft_channel:
-                        await interaction.followup.send(
-                            "❌ Draft channel not found! Please check the configuration.",
-                            ephemeral=True
-                        )
-                        return
-
-                    # Check if there are draft-eligible players (in Draft Pool team)
-                    cursor = await db.execute(
-                        """SELECT COUNT(*) FROM players p
-                           JOIN teams t ON p.team_id = t.team_id
-                           WHERE t.team_name = 'Draft Pool'"""
-                    )
-                    draft_pool_count = (await cursor.fetchone())[0]
-
-                    if draft_pool_count == 0:
-                        await interaction.followup.send(
-                            "❌ No players in the Draft Pool! Use `/updateplayer` to assign players to the 'Draft Pool' team.",
-                            ephemeral=True
-                        )
-                        return
-
-                    # Update draft status to 'in_progress' and set started_at
-                    await db.execute(
-                        """UPDATE drafts
-                           SET status = 'in_progress', started_at = CURRENT_TIMESTAMP, current_pick_number = 1
-                           WHERE draft_id = ?""",
-                        (draft_id,)
-                    )
-                    await db.commit()
-
-                    # Post draft start message to draft channel
-                    await draft_channel.send(f"# {draft_name}")
-
-                    # Send first pick notification
-                    await self.send_pick_notification(db, draft_id, draft_name, 1)
-
+                if status not in ('current', 'in_progress', 'completed'):
                     await interaction.followup.send(
-                        f"✅ **Draft Started!**\n\n"
-                        f"**Draft:** {draft_name}\n"
-                        f"**Rounds:** {rounds}\n"
-                        f"**Players Available:** {draft_pool_count}\n\n"
-                        f"Pick notifications have been sent to team channels.",
+                        f"❌ Draft '{draft_name}' is not ready yet (status: {status})!\n"
+                        f"A season-linked draft's order is set automatically once its season starts; "
+                        f"a custom draft's order is set at creation via `/createcustomdraft`.",
                         ephemeral=True
                     )
+                    return
 
-                elif action == "end":
-                    # Check if draft is in progress
-                    if status != 'in_progress':
-                        await interaction.followup.send(
-                            f"❌ Draft '{draft_name}' is not currently in progress (status: {status})!",
-                            ephemeral=True
-                        )
-                        return
-
-                    # End the draft
-                    await self.complete_draft(db, draft_id, draft_name)
-
+                panel = await post_draft_panel(self.bot, db, draft_id)
+                if panel is None:
                     await interaction.followup.send(
-                        f"✅ **Draft Ended!**\n\n"
-                        f"**Draft:** {draft_name}\n"
-                        f"The draft has been marked as completed.",
+                        "❌ No admin controls channel is set to post the control panel in - set one with "
+                        "`/config`, then run `/livedraft` again.",
                         ephemeral=True
                     )
-
-                elif action == "resend":
-                    # Check if draft is in progress
-                    if status != 'in_progress':
-                        await interaction.followup.send(
-                            f"❌ Draft '{draft_name}' is not currently in progress (status: {status})!",
-                            ephemeral=True
-                        )
-                        return
-
-                    if not current_pick_number:
-                        await interaction.followup.send(
-                            f"❌ No current pick to re-send!",
-                            ephemeral=True
-                        )
-                        return
-
-                    # Re-send the current pick notification
-                    await self.send_pick_notification(db, draft_id, draft_name, current_pick_number)
-
-                    await interaction.followup.send(
-                        f"✅ **Pick Notification Re-sent!**\n\n"
-                        f"**Draft:** {draft_name}\n"
-                        f"**Current Pick:** {current_pick_number}\n\n"
-                        f"Notification has been re-sent to the draft channel and team channel.",
-                        ephemeral=True
-                    )
+                    return
+                follow_up = ("Press **Start Draft** on it when you're ready." if status == 'current'
+                             else "The draft is already underway - this replaces its old panel.")
+                await interaction.followup.send(
+                    f"✅ Control panel for **{draft_name}** posted in {panel.channel.mention}. {follow_up}",
+                    ephemeral=True
+                )
 
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
             import traceback
             traceback.print_exc()
 
-    async def send_pick_notification(self, db, draft_id, draft_name, pick_number):
-        """Send draft pick notification to team's channel"""
+    async def start_draft(self, db, draft_id):
+        """Starts a draft (the control panel's Start Draft button): checks
+        the draft channel and Draft Pool, sets it running, posts its title
+        in the draft channel and puts pick 1 on the clock (which also takes
+        the pick 1 snapshot - the draft before it began). Returns None, or
+        why it couldn't start."""
+        cursor = await db.execute(
+            "SELECT draft_name, status, started_at FROM drafts WHERE draft_id = ?", (draft_id,)
+        )
+        draft_name, status, started_at = await cursor.fetchone()
+        if status != 'current' or started_at:
+            return "❌ This draft has already been started."
+
+        draft_channel = await _draft_channel(self.bot, db)
+        if not draft_channel:
+            return "❌ No draft channel configured (or it can't be found)! Use `/config` to set it."
+
+        cursor = await db.execute(
+            """SELECT COUNT(*) FROM players p
+               JOIN teams t ON p.team_id = t.team_id
+               WHERE t.team_name = 'Draft Pool'"""
+        )
+        if (await cursor.fetchone())[0] == 0:
+            return "❌ No players in the Draft Pool! Use `/importplayers` or `/addplayer` to add prospects."
+
+        await db.execute(
+            """UPDATE drafts
+               SET status = 'in_progress', started_at = CURRENT_TIMESTAMP, current_pick_number = 1
+               WHERE draft_id = ?""",
+            (draft_id,)
+        )
+        await db.commit()
+        await draft_channel.send(f"# {draft_name}")
+        await self.send_pick_notification(db, draft_id, draft_name, 1)
+        return None
+
+    async def send_pick_notification(self, db, draft_id, draft_name, pick_number, round_header=True):
+        """Send draft pick notification to team's channel. round_header
+        False skips the "-- ROUND N --" line even on a round's first pick -
+        for re-notifying a pick already announced (e.g. after it's traded)."""
         try:
             # Check if there are any players left in the draft pool
             cursor = await db.execute(
@@ -835,6 +799,11 @@ class DraftCommands(commands.Cog):
 
             team_id, round_number, pick_num, team_name, channel_id = pick_info
 
+            # Record the draft as it stands with this pick on the clock, so
+            # the control panel can rewind to it (see restore_draft_snapshot).
+            await snapshot_draft(db, draft_id, pick_number)
+            await db.commit()
+
             if not channel_id:
                 print(f"No channel configured for team {team_name}")
                 return
@@ -869,7 +838,7 @@ class DraftCommands(commands.Cog):
                 picks_per_round = (await cursor.fetchone())[0]
 
                 # Check if this pick number is the start of a new round
-                if (pick_num - 1) % picks_per_round == 0:
+                if round_header and (pick_num - 1) % picks_per_round == 0:
                     await draft_channel.send(f"**-- ROUND {round_number} --**")
 
                 # Post "on the clock" message
@@ -884,6 +853,31 @@ class DraftCommands(commands.Cog):
             print(f"Error sending pick notification: {e}")
             import traceback
             traceback.print_exc()
+        await refresh_draft_panel(self.bot, db, draft_id)
+
+    async def announce_traded_live_picks(self, pick_ids):
+        """Called after a trade is approved: if any of its picks is on the
+        clock in a running draft, says so in the draft channel and sends a
+        fresh "on the clock" notification to the pick's new owner (the old
+        owner's notification stops working - see draft_pick_problem)."""
+        pick_ids = set(pick_ids)
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                """SELECT d.draft_id, d.draft_name, d.current_pick_number, dp.pick_id, t.team_name, t.emoji_id
+                   FROM drafts d
+                   JOIN draft_picks dp ON dp.draft_id = d.draft_id AND dp.pick_number = d.current_pick_number
+                   JOIN teams t ON dp.current_team_id = t.team_id
+                   WHERE d.status = 'in_progress' AND dp.player_selected_id IS NULL AND dp.passed = 0"""
+            )
+            on_clock = [row for row in await cursor.fetchall() if row[3] in pick_ids]
+            for draft_id, draft_name, pick_number, _, team_name, emoji_id in on_clock:
+                channel = await _draft_channel(self.bot, db)
+                if channel:
+                    await channel.send(
+                        f"🔁 **Pick {pick_number}** has been traded to "
+                        f"{get_team_emoji_str(self.bot, emoji_id)}**{team_name}**!"
+                    )
+                await self.send_pick_notification(db, draft_id, draft_name, pick_number, round_header=False)
 
     async def complete_draft(self, db, draft_id, draft_name):
         """Mark draft as completed and post completion message"""
@@ -922,12 +916,604 @@ class DraftCommands(commands.Cog):
             if draft_channel:
                 await draft_channel.send(f"# End of Draft")
 
+            await self.post_team_draft_summaries(db, draft_id, draft_name)
+
             print(f"Draft '{draft_name}' completed!")
+            await refresh_draft_panel(self.bot, db, draft_id)
 
         except Exception as e:
             print(f"Error completing draft: {e}")
             import traceback
             traceback.print_exc()
+
+    async def post_team_draft_summaries(self, db, draft_id, draft_name):
+        """Sends each club that made at least one selection in this draft a
+        summary in its team channel: every player it took (in pick order)
+        and its list size now the draft's over."""
+        cursor = await db.execute(
+            """SELECT dp.current_team_id, dp.pick_number, dp.pick_origin,
+                      p.name, p.position, p.age, p.overall_rating
+               FROM draft_picks dp
+               JOIN players p ON p.player_id = dp.player_selected_id
+               WHERE dp.draft_id = ?
+               ORDER BY dp.pick_number""",
+            (draft_id,)
+        )
+        by_team = {}
+        for team_id, pick_num, origin, name, pos, age, ovr in await cursor.fetchall():
+            line = f"**Pick {pick_num}:** **{name}** ({pos}, {age} yo, {ovr} OVR)"
+            if origin and origin.endswith("F/S Match"):
+                line += " - *F/S match*"
+            by_team.setdefault(team_id, []).append(line)
+
+        for team_id, lines in by_team.items():
+            try:
+                cursor = await db.execute(
+                    "SELECT team_name, emoji_id, channel_id FROM teams WHERE team_id = ?", (team_id,)
+                )
+                team = await cursor.fetchone()
+                if not team or not team[2]:
+                    continue
+                team_name, emoji_id, channel_id = team
+                channel = self.bot.get_channel(int(channel_id))
+                if not channel:
+                    print(f"Channel not found for team {team_name}")
+                    continue
+                cursor = await db.execute("SELECT COUNT(*) FROM players WHERE team_id = ?", (team_id,))
+                list_size = (await cursor.fetchone())[0]
+
+                description = "\n".join(lines)
+                if len(description) > 4000:
+                    description = description[:4000].rsplit("\n", 1)[0] + "\n..."
+                embed = discord.Embed(
+                    title=f"{get_team_emoji_str(self.bot, emoji_id) if emoji_id else ''}{draft_name} Summary",
+                    description=description,
+                    color=discord.Color.blue()
+                )
+                embed.set_footer(text=f"List Size: {list_size}/44")
+                await channel.send(embed=embed)
+            except Exception as e:
+                print(f"Error sending draft summary to team {team_id}: {e}")
+
+
+async def void_trades_for_picks(bot, pick_ids):
+    """Voids any open trade offer that includes these picks now they've
+    been used, passed, or spent on a father-son match in the draft (see
+    TradeCommands.void_stale_trades). Call after the change is committed."""
+    trade_cog = bot.get_cog('TradeCommands')
+    if trade_cog and pick_ids:
+        await trade_cog.void_stale_trades(None, [], list(pick_ids))
+
+
+async def draft_pick_problem(db, draft_id, pick_number, team_id=None):
+    """Why a pick (or a father-son decision on it) can't be acted on now,
+    or None: its draft must still be running, with pick_number the pick
+    on the clock and not yet made - and, given team_id, still owned by that
+    team. Guards every draft button - an old notification (left over after
+    a rewind or abandon, a re-send, or the pick being traded away) would
+    otherwise make a pick out of turn, for the wrong club, or in a draft
+    that's been reset."""
+    cursor = await db.execute("SELECT status, current_pick_number FROM drafts WHERE draft_id = ?", (draft_id,))
+    draft = await cursor.fetchone()
+    if not draft or draft[0] != 'in_progress':
+        return "❌ This draft isn't running any more, so this pick can't be made."
+    if draft[1] != pick_number:
+        return "❌ This pick isn't on the clock any more."
+    cursor = await db.execute(
+        "SELECT player_selected_id, passed, current_team_id FROM draft_picks WHERE draft_id = ? AND pick_number = ?",
+        (draft_id, pick_number)
+    )
+    pick = await cursor.fetchone()
+    if not pick or pick[0] is not None or pick[1]:
+        return "❌ This pick has already been made."
+    if team_id is not None and pick[2] != team_id:
+        return "❌ This pick has been traded to another club."
+    return None
+
+
+async def snapshot_draft(db, draft_id, pick_number):
+    """Records a draft as it stands with pick_number on the clock: every
+    pick row (all columns, so father-son picks added later, and their
+    renumbering, can be undone exactly) and every Draft Pool player with
+    their contract_expiry. Pick 1's snapshot is the draft before it began.
+    restore_draft_snapshot puts one back. Replaces an earlier snapshot of
+    the same pick (e.g. a re-sent notification)."""
+    cursor = await db.execute("SELECT * FROM draft_picks WHERE draft_id = ?", (draft_id,))
+    columns = [d[0] for d in cursor.description]
+    picks = [dict(zip(columns, row)) for row in await cursor.fetchall()]
+    cursor = await db.execute(
+        """SELECT p.player_id, p.contract_expiry FROM players p
+           JOIN teams t ON p.team_id = t.team_id WHERE t.team_name = 'Draft Pool'"""
+    )
+    pool = [list(row) for row in await cursor.fetchall()]
+    await db.execute(
+        """INSERT OR REPLACE INTO draft_snapshots (draft_id, pick_number, picks, pool_players)
+           VALUES (?, ?, ?, ?)""",
+        (draft_id, pick_number, json.dumps(picks), json.dumps(pool))
+    )
+
+
+async def restore_draft_snapshot(db, draft_id, pick_number, abandon=False):
+    """Puts a draft back exactly as it was when pick_number came on the
+    clock (see snapshot_draft). Every pick row is replaced by its snapshot
+    (same pick ids, so trade references stay valid; picks added since, like
+    father-son picks, disappear). Every player who was in the Draft Pool
+    then goes back there with their contract from then, and out of any
+    lineup they've been put in since.
+
+    Rewinding (abandon=False) leaves the draft running with pick_number on
+    the clock - the caller re-sends its notification. Abandoning restores
+    pick 1 and returns the draft to unstarted ('current'), ready for
+    /livedraft again; every snapshot of it is then deleted. Doesn't commit.
+    Returns how many players went back to the Draft Pool."""
+    from commands.lineup_commands import clear_departed_players_from_lineups
+
+    cursor = await db.execute(
+        "SELECT picks, pool_players FROM draft_snapshots WHERE draft_id = ? AND pick_number = ?",
+        (draft_id, pick_number)
+    )
+    picks_json, pool_json = await cursor.fetchone()
+    picks, pool = json.loads(picks_json), json.loads(pool_json)
+
+    cursor = await db.execute("PRAGMA table_info(draft_picks)")
+    current_columns = {row[1] for row in await cursor.fetchall()}
+    await db.execute("DELETE FROM draft_picks WHERE draft_id = ?", (draft_id,))
+    for pick in picks:
+        columns = [c for c in pick if c in current_columns]
+        await db.execute(
+            f"INSERT INTO draft_picks ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
+            [pick[c] for c in columns]
+        )
+
+    cursor = await db.execute("SELECT team_id FROM teams WHERE team_name = 'Draft Pool'")
+    pool_team_id = (await cursor.fetchone())[0]
+    returned = 0
+    for player_id, contract_expiry in pool:
+        cursor = await db.execute("SELECT team_id FROM players WHERE player_id = ?", (player_id,))
+        row = await cursor.fetchone()
+        if row is None:
+            continue  # removed from the league since - nothing to put back
+        if row[0] != pool_team_id:
+            returned += 1
+            if row[0] is not None:
+                await clear_departed_players_from_lineups(db, [player_id], row[0])
+        await db.execute(
+            "UPDATE players SET team_id = ?, contract_expiry = ? WHERE player_id = ?",
+            (pool_team_id, contract_expiry, player_id)
+        )
+
+    if abandon:
+        await db.execute(
+            """UPDATE drafts SET status = 'current', started_at = NULL, completed_at = NULL,
+                                 current_pick_number = 0
+               WHERE draft_id = ?""",
+            (draft_id,)
+        )
+        await db.execute("DELETE FROM draft_snapshots WHERE draft_id = ?", (draft_id,))
+    else:
+        await db.execute(
+            """UPDATE drafts SET status = 'in_progress', completed_at = NULL, current_pick_number = ?
+               WHERE draft_id = ?""",
+            (pick_number, draft_id)
+        )
+        await db.execute(
+            "DELETE FROM draft_snapshots WHERE draft_id = ? AND pick_number > ?", (draft_id, pick_number)
+        )
+    return returned
+
+
+async def _draft_channel(bot, db):
+    cursor = await db.execute("SELECT setting_value FROM settings WHERE setting_key = 'draft_channel_id'")
+    row = await cursor.fetchone()
+    return bot.get_channel(int(row[0])) if row and row[0] else None
+
+
+async def build_draft_panel_embed(bot, db, draft_id):
+    """The control panel's embed: what's happening, then the current
+    round's picks (the round on the clock, or the last round picked in once
+    the draft is over), with the pick on the clock marked."""
+    cursor = await db.execute(
+        "SELECT draft_name, status, current_pick_number FROM drafts WHERE draft_id = ?", (draft_id,)
+    )
+    draft_name, status, current_pick = await cursor.fetchone()
+
+    cursor = await db.execute(
+        """SELECT dp.pick_number, dp.round_number, dp.pick_origin, dp.pick_type, ct.team_name, ct.emoji_id,
+                  ot.team_name, ot.emoji_id, p.name, dp.passed
+           FROM draft_picks dp
+           LEFT JOIN teams ct ON dp.current_team_id = ct.team_id
+           LEFT JOIN teams ot ON dp.original_team_id = ot.team_id
+           LEFT JOIN players p ON dp.player_selected_id = p.player_id
+           WHERE dp.draft_id = ? AND dp.pick_number IS NOT NULL
+           ORDER BY dp.pick_number""",
+        (draft_id,)
+    )
+    picks = await cursor.fetchall()
+    made = sum(1 for row in picks if row[8] or row[9])
+
+    on_clock = next((row for row in picks if row[0] == current_pick), None) if status == 'in_progress' else None
+    if on_clock:
+        shown_round = on_clock[1]
+    else:
+        used_rounds = [row[1] for row in picks if row[8] or row[9]]
+        shown_round = max(used_rounds) if used_rounds else (picks[0][1] if picks else 1)
+
+    if status == 'in_progress' and on_clock:
+        headline = (f"⏰ **Pick {current_pick}** (Round {on_clock[1]}) is on the clock: "
+                    f"{get_team_emoji_str(bot, on_clock[5])}**{on_clock[4]}**")
+        color = discord.Color.green()
+    elif status == 'in_progress':
+        headline = "⏰ Waiting on the next pick."
+        color = discord.Color.green()
+    elif status == 'completed':
+        headline = "✅ **Draft complete.** Rewind or Abandon can still undo it."
+        color = discord.Color.dark_grey()
+    else:
+        cursor = await db.execute(
+            """SELECT COUNT(*) FROM players p JOIN teams t ON p.team_id = t.team_id
+               WHERE t.team_name = 'Draft Pool'"""
+        )
+        pool_size = (await cursor.fetchone())[0]
+        headline = (f"📋 **Ready to start** - {pool_size} prospects in the Draft Pool. "
+                    "Press **Start Draft** to put pick 1 on the clock.")
+        color = discord.Color.blurple()
+
+    lines = []
+    for (number, round_number, origin, pick_type, team_name, emoji_id, original_name, original_emoji,
+         player_name, passed) in picks:
+        if round_number != shown_round:
+            continue
+        label = pick_origin_label(pick_type, origin, round_number,
+                                  get_team_emoji_str(bot, original_emoji, trailing_space=False) or original_name)
+        line = format_draft_pick_line(bot, number, label, emoji_id, player_name)
+        if passed:
+            line += " → *passed*"
+        if on_clock and number == current_pick:
+            line = f"⏰ {line}"
+        lines.append(line)
+
+    embed = discord.Embed(title=f"🎛️ Live Draft Control — {draft_name}", color=color)
+    body = headline + f"\n\n**Round {shown_round}**\n" + ("\n".join(lines) if lines else "*No picks*")
+    if len(body) > 4000:
+        body = body[:3990] + "\n…"
+    embed.description = body
+    embed.set_footer(text=f"{made} of {len(picks)} picks made")
+    return embed
+
+
+async def post_draft_panel(bot, db, draft_id):
+    """Posts a draft's control panel in the admin controls channel (the
+    live match control panel's channel) and records where, replacing any
+    earlier panel for it. Returns the message, or None if no channel is set."""
+    cursor = await db.execute(
+        "SELECT setting_value FROM settings WHERE setting_key = 'live_match_control_channel_id'"
+    )
+    row = await cursor.fetchone()
+    channel = bot.get_channel(int(row[0])) if row and row[0] else None
+    if channel is None:
+        return None
+
+    cursor = await db.execute(
+        "SELECT status, control_channel_id, control_message_id FROM drafts WHERE draft_id = ?", (draft_id,)
+    )
+    status, old_channel_id, old_message_id = await cursor.fetchone()
+    if old_message_id:
+        old_channel = bot.get_channel(int(old_channel_id)) if old_channel_id else None
+        if old_channel:
+            try:
+                await old_channel.get_partial_message(int(old_message_id)).delete()
+            except Exception:
+                pass  # already deleted
+
+    message = await channel.send(embed=await build_draft_panel_embed(bot, db, draft_id),
+                                 view=DraftControlView(bot, draft_id, status))
+    await db.execute(
+        "UPDATE drafts SET control_channel_id = ?, control_message_id = ? WHERE draft_id = ?",
+        (str(channel.id), str(message.id), draft_id)
+    )
+    await db.commit()
+    return message
+
+
+async def refresh_draft_panel(bot, db, draft_id):
+    """Redraws a draft's control panel, if it has one - called whenever a
+    pick comes on the clock, and after ending, rewinding or abandoning."""
+    try:
+        cursor = await db.execute(
+            "SELECT status, control_channel_id, control_message_id FROM drafts WHERE draft_id = ?", (draft_id,)
+        )
+        row = await cursor.fetchone()
+        if not row or not row[2]:
+            return
+        status, channel_id, message_id = row
+        channel = bot.get_channel(int(channel_id)) if channel_id else None
+        if channel is None:
+            return
+        await channel.get_partial_message(int(message_id)).edit(
+            embed=await build_draft_panel_embed(bot, db, draft_id),
+            view=DraftControlView(bot, draft_id, status)
+        )
+    except Exception as e:
+        print(f"Couldn't update the control panel for draft {draft_id}: {e}")
+
+
+class DraftControlView(discord.ui.View):
+    """A live draft's control panel buttons (admins only). Persistent: the
+    custom ids carry the draft id, and DraftCommands.cog_load re-registers
+    every panel after a restart. Each button re-checks the draft's status
+    when pressed, so a stale panel can't act on the wrong state."""
+
+    def __init__(self, bot, draft_id, status):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.draft_id = draft_id
+        running = status == 'in_progress'
+        started = status in ('in_progress', 'completed')
+        for label, style, action, enabled in (
+            ("▶ Start Draft", discord.ButtonStyle.success, "start", status == 'current'),
+            ("🎲 Auto Pick", discord.ButtonStyle.primary, "autopick", running),
+            ("🔁 Re-send Pick Notification", discord.ButtonStyle.secondary, "resend", running),
+            ("⏪ Rewind...", discord.ButtonStyle.secondary, "rewind", started),
+            ("⏹ End Draft", discord.ButtonStyle.danger, "end", running),
+            ("🗑 Abandon Draft", discord.ButtonStyle.danger, "abandon", started),
+        ):
+            button = discord.ui.Button(label=label, style=style, disabled=not enabled,
+                                       custom_id=f"draftpanel:{action}:{draft_id}")
+            button.callback = getattr(self, f"_{action}")
+            self.add_item(button)
+
+    async def interaction_check(self, interaction):
+        if await is_admin_user(interaction):
+            return True
+        await interaction.response.send_message("❌ Only admins can use the draft control panel.", ephemeral=True)
+        return False
+
+    async def _draft(self, db):
+        cursor = await db.execute(
+            "SELECT draft_name, status, current_pick_number FROM drafts WHERE draft_id = ?", (self.draft_id,)
+        )
+        return await cursor.fetchone()
+
+    async def _start(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        async with aiosqlite.connect(DB_PATH) as db:
+            problem = await self.bot.get_cog('DraftCommands').start_draft(db, self.draft_id)
+        await interaction.followup.send(problem or "✅ Draft started - pick 1 is on the clock.", ephemeral=True)
+
+    async def _autopick(self, interaction):
+        async with aiosqlite.connect(DB_PATH) as db:
+            draft_name, status, current_pick = await self._draft(db)
+            if status != 'in_progress':
+                await interaction.response.send_message("❌ This draft isn't running.", ephemeral=True)
+                return
+            cursor = await db.execute(
+                """SELECT dp.round_number, t.team_name, t.emoji_id FROM draft_picks dp
+                   JOIN teams t ON dp.current_team_id = t.team_id
+                   WHERE dp.draft_id = ? AND dp.pick_number = ?""",
+                (self.draft_id, current_pick)
+            )
+            row = await cursor.fetchone()
+        if not row:
+            await interaction.response.send_message("❌ There's no pick on the clock.", ephemeral=True)
+            return
+        round_number, team_name, emoji_id = row
+        await interaction.response.send_message(
+            f"Auto pick for **Pick {current_pick}** (Round {round_number}) - "
+            f"{get_team_emoji_str(self.bot, emoji_id)}**{team_name}**? A random player from the Draft Pool "
+            "will be drafted for them.",
+            view=_DraftActionConfirmView(self.bot, interaction.user.id, self.draft_id, "autopick", current_pick),
+            ephemeral=True
+        )
+
+    async def _resend(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        async with aiosqlite.connect(DB_PATH) as db:
+            draft_name, status, current_pick = await self._draft(db)
+            if status != 'in_progress':
+                await interaction.followup.send("❌ This draft isn't running.", ephemeral=True)
+                return
+            await self.bot.get_cog('DraftCommands').send_pick_notification(db, self.draft_id, draft_name, current_pick)
+        await interaction.followup.send(f"✅ Re-sent the notification for pick {current_pick}.", ephemeral=True)
+
+    async def _rewind(self, interaction):
+        await interaction.response.send_modal(_RewindDraftModal(self.bot, self.draft_id))
+
+    async def _end(self, interaction):
+        async with aiosqlite.connect(DB_PATH) as db:
+            draft_name, status, _ = await self._draft(db)
+        if status != 'in_progress':
+            await interaction.response.send_message("❌ This draft isn't running.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"End **{draft_name}** now? It's marked complete and every player left in the Draft Pool is "
+            "delisted. (Rewind or Abandon can still undo it afterwards.)",
+            view=_DraftActionConfirmView(self.bot, interaction.user.id, self.draft_id, "end"),
+            ephemeral=True
+        )
+
+    async def _abandon(self, interaction):
+        async with aiosqlite.connect(DB_PATH) as db:
+            draft_name, status, _ = await self._draft(db)
+            cursor = await db.execute(
+                """SELECT COUNT(*) FROM draft_picks
+                   WHERE draft_id = ? AND (player_selected_id IS NOT NULL OR passed = 1)""",
+                (self.draft_id,)
+            )
+            made = (await cursor.fetchone())[0]
+        if status not in ('in_progress', 'completed'):
+            await interaction.response.send_message("❌ This draft isn't running.", ephemeral=True)
+            return
+        warning = ("\n\n:warning: This draft has **finished** - any of its players who've since been traded, "
+                   "delisted or played will still be moved back to the Draft Pool." if status == 'completed' else "")
+        await interaction.response.send_message(
+            f"Abandon **{draft_name}**? All {made} pick(s) made or passed are undone: every drafted player goes "
+            "back to the Draft Pool with their original contract, every pick (including any father-son picks) "
+            "goes back to how it was before the draft began, and it can be started again with **Start Draft**."
+            + warning,
+            view=_DraftActionConfirmView(self.bot, interaction.user.id, self.draft_id, "abandon"),
+            ephemeral=True
+        )
+
+
+class _RewindDraftModal(discord.ui.Modal, title="Rewind Draft"):
+    pick = discord.ui.TextInput(label="Rewind to pick number", placeholder="e.g. 14", max_length=4)
+
+    def __init__(self, bot, draft_id):
+        super().__init__()
+        self.bot = bot
+        self.draft_id = draft_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        text = self.pick.value.strip().lstrip("#")
+        if not text.isdigit():
+            await interaction.response.send_message(f"❌ \"{self.pick.value}\" isn't a pick number.", ephemeral=True)
+            return
+        target = int(text)
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT draft_name, status, current_pick_number FROM drafts WHERE draft_id = ?", (self.draft_id,)
+            )
+            draft_name, status, current_pick = await cursor.fetchone()
+            cursor = await db.execute(
+                "SELECT 1 FROM draft_snapshots WHERE draft_id = ? AND pick_number = ?", (self.draft_id, target)
+            )
+            has_snapshot = await cursor.fetchone() is not None
+            cursor = await db.execute(
+                """SELECT dp.pick_number, t.team_name, p.name, dp.passed FROM draft_picks dp
+                   LEFT JOIN teams t ON dp.current_team_id = t.team_id
+                   LEFT JOIN players p ON dp.player_selected_id = p.player_id
+                   WHERE dp.draft_id = ? AND dp.pick_number >= ?
+                     AND (dp.player_selected_id IS NOT NULL OR dp.passed = 1)
+                   ORDER BY dp.pick_number""",
+                (self.draft_id, target)
+            )
+            undone = await cursor.fetchall()
+
+        if status not in ('in_progress', 'completed'):
+            await interaction.response.send_message("❌ This draft isn't running.", ephemeral=True)
+            return
+        if not has_snapshot:
+            reason = ("hasn't come up yet" if status == 'in_progress' and target > current_pick
+                      else "can't be rewound to - there's no record of the draft at that point")
+            await interaction.response.send_message(f"❌ Pick {target} {reason}.", ephemeral=True)
+            return
+        if not undone:
+            await interaction.response.send_message(
+                f"Pick {target} is already the pick on the clock - nothing to undo.", ephemeral=True)
+            return
+
+        shown = [f"• #{n} {team or '?'} - {('*passed*' if passed else name)}" for n, team, name, passed in undone[:15]]
+        if len(undone) > 15:
+            shown.append(f"… and {len(undone) - 15} more")
+        await interaction.response.send_message(
+            f"Rewind **{draft_name}** to pick {target}? These {len(undone)} pick(s) are undone, their players go "
+            "back to the Draft Pool, and pick " + str(target) + " goes back on the clock:\n" + "\n".join(shown),
+            view=_DraftActionConfirmView(self.bot, interaction.user.id, self.draft_id, "rewind", target),
+            ephemeral=True
+        )
+
+
+async def _auto_pick(bot, db, draft_id, draft_name, pick_number):
+    """Drafts a random Draft Pool player with pick_number for the team on
+    the clock, through the normal pick path (DraftPickView.process_pick -
+    announcement, contract, next pick). Players tied to another club as
+    father-son selections are skipped, since picking one starts a bid
+    rather than a pick. Returns the result message."""
+    problem = await draft_pick_problem(db, draft_id, pick_number)
+    if problem:
+        return problem.replace("this pick can't be made", "the auto pick wasn't made")
+    cursor = await db.execute(
+        "SELECT current_team_id FROM draft_picks WHERE draft_id = ? AND pick_number = ?", (draft_id, pick_number)
+    )
+    team_id = (await cursor.fetchone())[0]
+    cursor = await db.execute(
+        """SELECT p.player_id, p.name, p.position FROM players p JOIN teams t ON p.team_id = t.team_id
+           WHERE t.team_name = 'Draft Pool' AND (p.father_son_club_id IS NULL OR p.father_son_club_id = ?)
+           ORDER BY RANDOM() LIMIT 1""",
+        (team_id,)
+    )
+    player = await cursor.fetchone()
+    if not player:
+        return "❌ There's no player left in the Draft Pool this team can simply pick."
+    player_id, name, position = player
+    view = DraftPickView(bot, draft_id, draft_name, team_id, pick_number)
+    await view.process_pick(db, player_id, False)
+    return f"✅ Auto pick made: **{name}** ({position}) with pick {pick_number}."
+
+
+class _DraftActionConfirmView(discord.ui.View):
+    """Confirm / cancel for the panel's End, Abandon and Rewind - only the
+    admin who asked can press them."""
+
+    def __init__(self, bot, user_id, draft_id, action, pick_number=None):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.user_id = user_id
+        self.draft_id = draft_id
+        self.action = action
+        self.pick_number = pick_number
+        confirm = discord.ui.Button(
+            label={"end": "End draft", "abandon": "Abandon draft", "rewind": f"Rewind to pick {pick_number}",
+                   "autopick": "Make auto pick"}[action],
+            style=discord.ButtonStyle.primary if action == "autopick" else discord.ButtonStyle.danger,
+        )
+        confirm.callback = self._confirm
+        self.add_item(confirm)
+        cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+        cancel.callback = self._cancel
+        self.add_item(cancel)
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.user_id
+
+    async def _confirm(self, interaction):
+        self.stop()
+        await interaction.response.edit_message(content="⏳ Working...", view=None)
+        cog = self.bot.get_cog('DraftCommands')
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT draft_name, status FROM drafts WHERE draft_id = ?", (self.draft_id,))
+            draft_name, status = await cursor.fetchone()
+            allowed = {'end': ('in_progress',), 'abandon': ('in_progress', 'completed'),
+                       'rewind': ('in_progress', 'completed'), 'autopick': ('in_progress',)}[self.action]
+            if status not in allowed:
+                await interaction.edit_original_response(content="❌ The draft has changed since - nothing was done.")
+                return
+            channel = await _draft_channel(self.bot, db)
+
+            if self.action == "autopick":
+                result = await _auto_pick(self.bot, db, self.draft_id, draft_name, self.pick_number)
+            elif self.action == "end":
+                await cog.complete_draft(db, self.draft_id, draft_name)
+                result = f"✅ **{draft_name}** ended."
+            elif self.action == "abandon":
+                returned = await restore_draft_snapshot(db, self.draft_id, 1, abandon=True)
+                await db.commit()
+                if channel:
+                    await channel.send(f"# {draft_name} abandoned\nThe draft will be restarted.")
+                await refresh_draft_panel(self.bot, db, self.draft_id)
+                result = (f"✅ **{draft_name}** abandoned - {returned} player(s) went back to the Draft Pool. "
+                          "Start it again with **Start Draft**.")
+            else:
+                cursor = await db.execute(
+                    "SELECT 1 FROM draft_snapshots WHERE draft_id = ? AND pick_number = ?",
+                    (self.draft_id, self.pick_number)
+                )
+                if not await cursor.fetchone():
+                    await interaction.edit_original_response(content="❌ That pick can't be rewound to any more.")
+                    return
+                returned = await restore_draft_snapshot(db, self.draft_id, self.pick_number)
+                await db.commit()
+                if channel:
+                    await channel.send(f"⏪ **Draft rewound to pick {self.pick_number}** - picks from here on are being re-done.")
+                # Re-posts pick N's notification and redraws the panel.
+                await cog.send_pick_notification(db, self.draft_id, draft_name, self.pick_number)
+                result = (f"✅ Rewound to pick {self.pick_number} - {returned} player(s) went back to the Draft Pool, "
+                          "and the pick is back on the clock.")
+        await interaction.edit_original_response(content=result)
+
+    async def _cancel(self, interaction):
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled - nothing was changed.", view=None)
 
 
 def format_draft_pick_line(emoji_source, pick_number, pick_origin, team_emoji_id, player_selected):
@@ -992,29 +1578,13 @@ class DraftOrderView(discord.ui.View):
         return embed
 
     def update_buttons(self):
-        # Enable/disable buttons based on current round
-        for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                if item.custom_id == "prev":
-                    item.disabled = (self.current_round == 1)
-                elif item.custom_id == "next":
-                    item.disabled = (self.current_round == self.max_rounds)
+        self.clear_items()
+        add_page_buttons(self, self.current_round - 1, self.max_rounds, self._go_to_round, count_label="Round")
 
-    @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.gray, custom_id="prev")
-    async def previous_round(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.current_round > 1:
-            self.current_round -= 1
-            self.update_buttons()
-            embed = self.create_embed()
-            await interaction.response.edit_message(embed=embed, view=self)
-
-    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.gray, custom_id="next")
-    async def next_round(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.current_round < self.max_rounds:
-            self.current_round += 1
-            self.update_buttons()
-            embed = self.create_embed()
-            await interaction.response.edit_message(embed=embed, view=self)
+    async def _go_to_round(self, interaction: discord.Interaction, page):
+        self.current_round = page + 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
 
 class DraftPickView(discord.ui.View):
@@ -1095,13 +1665,8 @@ class DraftPickView(discord.ui.View):
                 item.disabled = len(all_players) == 0
                 break
 
-        # Update pagination buttons
-        for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                if item.custom_id == "draft_prev_page":
-                    item.disabled = (self.current_page == 0)
-                elif item.custom_id == "draft_next_page":
-                    item.disabled = (self.current_page >= total_pages - 1)
+        # Standard page buttons, rebuilt for the current page.
+        replace_page_buttons(self, self.current_page, total_pages, self._go_to_page, row=1)
 
         embed = discord.Embed(
             title=f":rotating_light: {emoji_str}{team_name} - On the Clock :rotating_light:",
@@ -1134,6 +1699,11 @@ class DraftPickView(discord.ui.View):
         """Confirm the draft pick"""
         if not self.selected_player_id:
             await interaction.response.send_message("❌ Please select a player first!", ephemeral=True)
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            problem = await draft_pick_problem(db, self.draft_id, self.pick_number, self.team_id)
+        if problem:
+            await interaction.response.send_message(problem, ephemeral=True)
             return
 
         await interaction.response.defer()
@@ -1171,6 +1741,11 @@ class DraftPickView(discord.ui.View):
     @discord.ui.button(label="Pass Pick", style=discord.ButtonStyle.secondary, row=2)
     async def pass_pick(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Pass on this pick"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            problem = await draft_pick_problem(db, self.draft_id, self.pick_number, self.team_id)
+        if problem:
+            await interaction.response.send_message(problem, ephemeral=True)
+            return
         await interaction.response.defer()
 
         # Disable all buttons immediately to prevent double-clicks
@@ -1190,21 +1765,8 @@ class DraftPickView(discord.ui.View):
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
-    @discord.ui.button(label="◀ Previous Page", style=discord.ButtonStyle.gray, custom_id="draft_prev_page", row=1)
-    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Go to previous page"""
-        if self.current_page > 0:
-            self.current_page -= 1
-            async with aiosqlite.connect(DB_PATH) as db:
-                embed = await self.create_embed(db)
-            await interaction.response.edit_message(embed=embed, view=self)
-        else:
-            await interaction.response.defer()
-
-    @discord.ui.button(label="Next Page ▶", style=discord.ButtonStyle.gray, custom_id="draft_next_page", row=1)
-    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Go to next page"""
-        self.current_page += 1
+    async def _go_to_page(self, interaction: discord.Interaction, page):
+        self.current_page = page
         async with aiosqlite.connect(DB_PATH) as db:
             embed = await self.create_embed(db)
         await interaction.response.edit_message(embed=embed, view=self)
@@ -1239,6 +1801,15 @@ class DraftPickView(discord.ui.View):
             await assign_drafted_player(db, self.team_id, player_id, season_number, rookie_years)
 
         await db.commit()
+
+        # Trade offers including this pick can't go ahead now it's used.
+        cursor = await db.execute(
+            "SELECT pick_id FROM draft_picks WHERE draft_id = ? AND pick_number = ?",
+            (self.draft_id, self.pick_number)
+        )
+        used = await cursor.fetchone()
+        if used:
+            await void_trades_for_picks(self.bot, [used[0]])
 
         # Post to draft channel
         await self.post_to_draft_channel(db, player_id, is_pass)
@@ -1395,26 +1966,10 @@ class DraftPickView(discord.ui.View):
             if not draft_channel:
                 return
 
-            # Get pick info for round header
-            cursor = await db.execute(
-                """SELECT dp.round_number
-                   FROM draft_picks dp
-                   WHERE dp.draft_id = ? AND dp.pick_number = ?""",
-                (self.draft_id, self.pick_number)
-            )
-            round_num = (await cursor.fetchone())[0]
-
-            # Check if this is the first pick of a new round (post round header)
-            cursor = await db.execute(
-                "SELECT COUNT(*) FROM draft_picks WHERE draft_id = ? AND round_number = 1",
-                (self.draft_id,)
-            )
-            picks_per_round = (await cursor.fetchone())[0]
-
-            if (self.pick_number - 1) % picks_per_round == 0:
-                # Calculate the actual round number for this pick
-                actual_round = ((self.pick_number - 1) // picks_per_round) + 1
-                await draft_channel.send(f"**-- ROUND {actual_round} --**")
+            # No round header here - this pick's "on the clock" post
+            # (send_pick_notification) already put one up if it opens a
+            # round, so repeating it doubled the header whenever a round's
+            # first pick was a father-son bid.
 
             # Get emojis
             bidding_emoji_str = ""
@@ -1665,6 +2220,11 @@ class FatherSonMatchView(discord.ui.View):
     @discord.ui.button(label="Match Bid", style=discord.ButtonStyle.success, custom_id="fs_match")
     async def match_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Match the bid and draft the player"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            problem = await draft_pick_problem(db, self.draft_id, self.bid_pick_number)
+        if problem:
+            await interaction.response.send_message(problem, ephemeral=True)
+            return
         await interaction.response.defer()
 
         try:
@@ -1686,6 +2246,11 @@ class FatherSonMatchView(discord.ui.View):
     @discord.ui.button(label="Pass on Bid", style=discord.ButtonStyle.danger, custom_id="fs_pass")
     async def pass_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Pass on the bid - let bidding team select the player"""
+        async with aiosqlite.connect(DB_PATH) as db:
+            problem = await draft_pick_problem(db, self.draft_id, self.bid_pick_number)
+        if problem:
+            await interaction.response.send_message(problem, ephemeral=True)
+            return
         await interaction.response.defer()
 
         try:
@@ -1715,6 +2280,17 @@ class FatherSonMatchView(discord.ui.View):
         # Calculate excess points for compensation pick
         total_match_value = sum(p[3] for p in self.matching_picks)
         excess_points = total_match_value - self.required_value
+
+        # The matching picks' ids, so trade offers including them can be
+        # voided once they're spent (below).
+        spent_pick_ids = []
+        for pick_num, _, _, _ in self.matching_picks:
+            cursor = await db.execute(
+                "SELECT pick_id FROM draft_picks WHERE draft_id = ? AND pick_number = ?", (self.draft_id, pick_num)
+            )
+            row = await cursor.fetchone()
+            if row:
+                spent_pick_ids.append(row[0])
 
         # Step 1: Delete the consumed matching picks (these are the F/S club's picks used to match)
         for pick_num, _, _, _ in self.matching_picks:
@@ -1751,8 +2327,9 @@ class FatherSonMatchView(discord.ui.View):
         await db.execute(
             """INSERT INTO draft_picks (
                 draft_id, draft_name, season_number, round_number, pick_number,
-                pick_origin, original_team_id, current_team_id, player_selected_id, picked_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                pick_origin, original_team_id, current_team_id, player_selected_id, picked_at,
+                pick_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'father_son')""",
             (self.draft_id, draft_name, season_number, round_number, self.bid_pick_number,
              f"{self.fs_team_name} F/S Match", self.fs_team_id, self.fs_team_id, self.player_id)
         )
@@ -1810,8 +2387,9 @@ class FatherSonMatchView(discord.ui.View):
                 await db.execute(
                     """INSERT INTO draft_picks (
                         draft_id, draft_name, season_number, round_number, pick_number,
-                        pick_origin, original_team_id, current_team_id, player_selected_id, picked_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+                        pick_origin, original_team_id, current_team_id, player_selected_id, picked_at,
+                        pick_type
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'father_son')""",
                     (self.draft_id, draft_name, season_number, comp_round_number, comp_pick_number,
                      f"{self.fs_team_name} F/S Comp", self.fs_team_id, self.fs_team_id, None)
                 )
@@ -1820,6 +2398,7 @@ class FatherSonMatchView(discord.ui.View):
         await assign_drafted_player(db, self.fs_team_id, self.player_id, season_number, rookie_years)
 
         await db.commit()
+        await void_trades_for_picks(self.bot, spent_pick_ids)
 
         # Post match result to draft channel
         await self.post_match_result_to_draft_channel(db, matched=True)
@@ -1853,6 +2432,14 @@ class FatherSonMatchView(discord.ui.View):
         await assign_drafted_player(db, self.bidding_team_id, self.player_id, season_number, rookie_years)
 
         await db.commit()
+
+        cursor = await db.execute(
+            "SELECT pick_id FROM draft_picks WHERE draft_id = ? AND pick_number = ?",
+            (self.draft_id, self.bid_pick_number)
+        )
+        used = await cursor.fetchone()
+        if used:
+            await void_trades_for_picks(self.bot, [used[0]])
 
         # Post pass result to draft channel
         await self.post_match_result_to_draft_channel(db, matched=False)
@@ -2065,28 +2652,10 @@ class DraftPointsCalculatorView(discord.ui.View):
         embed = self.create_embed()
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.gray, row=1)
-    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Go to previous page"""
-        if self.current_page > 0:
-            self.current_page -= 1
-            self.update_dropdown()
-            embed = self.create_embed()
-            await interaction.response.edit_message(embed=embed, view=self)
-        else:
-            await interaction.response.defer()
-
-    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.gray, row=1)
-    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Go to next page"""
-        total_pages = (len(self.all_picks) + self.picks_per_page - 1) // self.picks_per_page
-        if self.current_page < total_pages - 1:
-            self.current_page += 1
-            self.update_dropdown()
-            embed = self.create_embed()
-            await interaction.response.edit_message(embed=embed, view=self)
-        else:
-            await interaction.response.defer()
+    async def _go_to_page(self, interaction: discord.Interaction, page):
+        self.current_page = page
+        self.update_dropdown()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
     @discord.ui.button(label="Clear Selection", style=discord.ButtonStyle.danger, row=1)
     async def clear_selection(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2134,14 +2703,14 @@ class DraftPointsCalculatorView(discord.ui.View):
                 item.max_values = max(1, len(options))
                 break
 
-        # Update button states
+        # Standard page buttons, rebuilt for the current page - with Clear
+        # Selection kept after them on the same row.
         total_pages = (len(self.all_picks) + self.picks_per_page - 1) // self.picks_per_page
-        for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                if "◀ Previous" in item.label:
-                    item.disabled = (self.current_page == 0)
-                elif "Next ▶" in item.label:
-                    item.disabled = (self.current_page >= total_pages - 1)
+        replace_page_buttons(self, self.current_page, total_pages, self._go_to_page, row=1)
+        clear = next((item for item in self.children if getattr(item, "label", None) == "Clear Selection"), None)
+        if clear is not None:
+            self.remove_item(clear)
+            self.add_item(clear)
 
 
 class DraftPoolView(discord.ui.View):
@@ -2173,22 +2742,7 @@ class DraftPoolView(discord.ui.View):
 
     def update_components(self):
         self.clear_items()
-        if self.total_pages <= 1:
-            return
-
-        prev_button = discord.ui.Button(
-            label="◀ Prev", style=discord.ButtonStyle.secondary,
-            disabled=(self.current_page == 0)
-        )
-        prev_button.callback = self.previous_page
-        self.add_item(prev_button)
-
-        next_button = discord.ui.Button(
-            label="Next ▶", style=discord.ButtonStyle.secondary,
-            disabled=(self.current_page >= self.total_pages - 1)
-        )
-        next_button.callback = self.next_page
-        self.add_item(next_button)
+        add_page_buttons(self, self.current_page, self.total_pages, self._go_to_page)
 
     def create_embed(self):
         lines = []
@@ -2219,21 +2773,10 @@ class DraftPoolView(discord.ui.View):
         embed.set_footer(text=footer)
         return embed
 
-    async def previous_page(self, interaction: discord.Interaction):
-        if self.current_page > 0:
-            self.current_page -= 1
-            self.update_components()
-            await interaction.response.edit_message(embed=self.create_embed(), view=self)
-        else:
-            await interaction.response.defer()
-
-    async def next_page(self, interaction: discord.Interaction):
-        if self.current_page < self.total_pages - 1:
-            self.current_page += 1
-            self.update_components()
-            await interaction.response.edit_message(embed=self.create_embed(), view=self)
-        else:
-            await interaction.response.defer()
+    async def _go_to_page(self, interaction: discord.Interaction, page):
+        self.current_page = page
+        self.update_components()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
 
 async def _draft_round_order(db, draft_id):
@@ -2297,22 +2840,16 @@ async def _add_draft_rounds(db, draft_id, draft_name, season_number, from_round,
     )
     next_number = (await cursor.fetchone())[0] + 1
 
-    team_names = {}
-    cursor = await db.execute("SELECT team_id, team_name FROM teams")
-    for team_id, team_name in await cursor.fetchall():
-        team_names[team_id] = team_name
-
     created = 0
     for round_num in range(from_round + 1, to_round + 1):
         for team_id in order:
-            origin = f"{team_names.get(team_id, 'Unknown')} R{round_num}"
             await db.execute(
                 """INSERT INTO draft_picks
                    (draft_id, draft_name, season_number, round_number, pick_number,
-                    pick_origin, original_team_id, current_team_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    original_team_id, current_team_id, pick_type)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'ladder')""",
                 (draft_id, draft_name, season_number or 0, round_num, next_number,
-                 origin, team_id, team_id)
+                 team_id, team_id)
             )
             next_number += 1
             created += 1
@@ -2370,9 +2907,10 @@ class EditDraftView(discord.ui.View):
         # /draftorder uses.
         cursor = await db.execute(
             """SELECT dp.pick_id, dp.pick_number, dp.round_number, dp.pick_origin,
-                      ct.team_name, ct.emoji_id, p.name
+                      ct.team_name, ct.emoji_id, p.name, dp.pick_type, ot.team_name, ot.emoji_id
                FROM draft_picks dp
                LEFT JOIN teams ct ON dp.current_team_id = ct.team_id
+               LEFT JOIN teams ot ON dp.original_team_id = ot.team_id
                LEFT JOIN players p ON dp.player_selected_id = p.player_id
                WHERE dp.draft_id = ?
                ORDER BY dp.pick_number""",
@@ -2436,20 +2974,7 @@ class EditDraftView(discord.ui.View):
             remove.callback = self._remove_pick
             self.add_item(remove)
 
-        if self.total_pages > 1:
-            prev_button = discord.ui.Button(
-                label="◀ Previous Round", style=discord.ButtonStyle.secondary,
-                disabled=(self.page == 0), row=1
-            )
-            prev_button.callback = self._previous_page
-            self.add_item(prev_button)
-
-            next_button = discord.ui.Button(
-                label="Next Round ▶", style=discord.ButtonStyle.secondary,
-                disabled=(self.page >= self.total_pages - 1), row=1
-            )
-            next_button.callback = self._next_page
-            self.add_item(next_button)
+        add_page_buttons(self, self.page, self.total_pages, self._go_to_page, row=1, count_label="Round")
 
     def create_embed(self):
         embed = discord.Embed(
@@ -2469,9 +2994,14 @@ class EditDraftView(discord.ui.View):
 
         # Same line format as /draftorder, via the shared formatter.
         lines = [
-            format_draft_pick_line(self.bot, pick_number, pick_origin, emoji_id, player_name)
-            for _pick_id, pick_number, _round, pick_origin, _team, emoji_id, player_name
-            in self.page_picks()
+            format_draft_pick_line(
+                self.bot, pick_number,
+                pick_origin_label(pick_type, pick_origin, round_number,
+                                  get_team_emoji_str(self.bot, original_emoji, trailing_space=False)
+                                  or original_name),
+                emoji_id, player_name)
+            for (_pick_id, pick_number, round_number, pick_origin, _team, emoji_id, player_name,
+                 pick_type, original_name, original_emoji) in self.page_picks()
         ]
 
         # The pick list goes in the DESCRIPTION, not a field: a field caps at
@@ -2515,13 +3045,8 @@ class EditDraftView(discord.ui.View):
             content=note, embed=self.create_embed(), view=self
         )
 
-    async def _previous_page(self, interaction: discord.Interaction):
-        self.page = max(0, self.page - 1)
-        self.update_components()
-        await interaction.response.edit_message(embed=self.create_embed(), view=self)
-
-    async def _next_page(self, interaction: discord.Interaction):
-        self.page = min(self.total_pages - 1, self.page + 1)
+    async def _go_to_page(self, interaction: discord.Interaction, page):
+        self.page = page
         self.update_components()
         await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
@@ -2809,11 +3334,11 @@ class _AddPickModal(discord.ui.Modal, title="Add Pick"):
             await db.execute(
                 """INSERT INTO draft_picks
                    (draft_id, draft_name, season_number, round_number, pick_number,
-                    pick_origin, original_team_id, current_team_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    pick_origin, original_team_id, current_team_id, pick_type)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'custom')""",
                 (self.parent_view.draft_id, self.parent_view.draft_name,
                  self.parent_view.season_number or 0, round_number, insert_at - 0.5,
-                 origin, self.team_id, self.team_id)
+                 origin or None, self.team_id, self.team_id)
             )
             await _renumber_draft_picks(db, self.parent_view.draft_id)
             await db.commit()
@@ -2857,26 +3382,8 @@ class _EditPickView(discord.ui.View):
         self.add_item(_PickSelect(self.parent_view, self, "Pick to edit...", row=0,
                                   page=self.page, selected_id=self.pick_id))
 
-        if self.parent_view.total_pick_pages > 1:
-            prev_button = discord.ui.Button(
-                label="◀ Prev picks", style=discord.ButtonStyle.secondary,
-                disabled=(self.page == 0), row=1
-            )
-            prev_button.callback = self._previous_page
-            self.add_item(prev_button)
-
-            page_label = discord.ui.Button(
-                label=f"{self.page + 1}/{self.parent_view.total_pick_pages}",
-                style=discord.ButtonStyle.secondary, disabled=True, row=1
-            )
-            self.add_item(page_label)
-
-            next_button = discord.ui.Button(
-                label="Next picks ▶", style=discord.ButtonStyle.secondary,
-                disabled=(self.page >= self.parent_view.total_pick_pages - 1), row=1
-            )
-            next_button.callback = self._next_page
-            self.add_item(next_button)
+        add_page_buttons(self, self.page, self.parent_view.total_pick_pages, self._go_to_page, row=1,
+                         prev_label="◀ Prev picks", next_label="Next picks ▶")
 
         self.add_item(_EditPickTeamSelect(self.parent_view, self, row=2))
 
@@ -2911,12 +3418,8 @@ class _EditPickView(discord.ui.View):
         self.update_components()
         await interaction.response.edit_message(content=self.status_text(), view=self)
 
-    async def _previous_page(self, interaction: discord.Interaction):
-        self.page = max(0, self.page - 1)
-        await self.rerender(interaction)
-
-    async def _next_page(self, interaction: discord.Interaction):
-        self.page = min(self.parent_view.total_pick_pages - 1, self.page + 1)
+    async def _go_to_page(self, interaction: discord.Interaction, page):
+        self.page = page
         await self.rerender(interaction)
 
     async def _edit_details(self, interaction: discord.Interaction):
@@ -2979,7 +3482,9 @@ class _EditPickDetailsModal(discord.ui.Modal, title="Edit Pick Details"):
         )
         self.origin_input = discord.ui.TextInput(
             label="Origin (optional)", default=pick[3] or "",
-            placeholder="e.g. Adelaide R1", required=False, max_length=100,
+            placeholder=("Leave blank to show \"R1 tied to <team>\"" if pick[7] == 'ladder'
+                         else "e.g. Trade with Adelaide"),
+            required=False, max_length=100,
         )
         self.add_item(self.number_input)
         self.add_item(self.origin_input)
@@ -3039,36 +3544,13 @@ class _RemovePickView(discord.ui.View):
         self.add_item(_PickSelect(self.parent_view, self, "Pick to remove...",
                                   row=0, page=self.page))
 
-        if self.parent_view.total_pick_pages > 1:
-            prev_button = discord.ui.Button(
-                label="◀ Prev picks", style=discord.ButtonStyle.secondary,
-                disabled=(self.page == 0), row=1
-            )
-            prev_button.callback = self._previous_page
-            self.add_item(prev_button)
-
-            page_label = discord.ui.Button(
-                label=f"{self.page + 1}/{self.parent_view.total_pick_pages}",
-                style=discord.ButtonStyle.secondary, disabled=True, row=1
-            )
-            self.add_item(page_label)
-
-            next_button = discord.ui.Button(
-                label="Next picks ▶", style=discord.ButtonStyle.secondary,
-                disabled=(self.page >= self.parent_view.total_pick_pages - 1), row=1
-            )
-            next_button.callback = self._next_page
-            self.add_item(next_button)
+        add_page_buttons(self, self.page, self.parent_view.total_pick_pages, self._go_to_page, row=1,
+                         prev_label="◀ Prev picks", next_label="Next picks ▶")
 
         self.add_item(_BackToEditDraftButton(self.parent_view, row=2))
 
-    async def _previous_page(self, interaction: discord.Interaction):
-        self.page = max(0, self.page - 1)
-        self.update_components()
-        await interaction.response.edit_message(view=self)
-
-    async def _next_page(self, interaction: discord.Interaction):
-        self.page = min(self.parent_view.total_pick_pages - 1, self.page + 1)
+    async def _go_to_page(self, interaction: discord.Interaction, page):
+        self.page = page
         self.update_components()
         await interaction.response.edit_message(view=self)
 
@@ -3084,11 +3566,14 @@ class _PickSelect(discord.ui.Select):
         page_picks = picks[start:start + PICK_SELECT_OPTIONS_PER_PAGE]
 
         options = []
-        for pick_id, pick_number, round_number, pick_origin, team_name, _emoji_id, player_name in page_picks:
+        for (pick_id, pick_number, round_number, pick_origin, team_name, _emoji_id, player_name,
+             pick_type, original_name, _original_emoji) in page_picks:
             label = f"#{pick_number} - {team_name or 'Unknown'}"
             description = f"Round {round_number}"
-            if pick_origin:
-                description += f" • {pick_origin}"
+            # Dropdowns can't show custom emojis, so the team's name here.
+            origin = pick_origin_label(pick_type, pick_origin, round_number, original_name)
+            if origin:
+                description += f" • {origin}"
             if player_name:
                 description += f" • used on {player_name}"
             options.append(discord.SelectOption(

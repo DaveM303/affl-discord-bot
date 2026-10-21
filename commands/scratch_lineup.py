@@ -19,12 +19,12 @@ injury/suspension badges, no autofill - just position -> team filter ->
 player, repeated until all 23 slots are filled. Backed by scratch_teams/
 scratch_team_players (see bot.py's init_db), never the real teams/lineups
 tables - a scratch team is not a real team and never touches the ladder,
-/awards, /matchcentre, /exportdata, or career games-played.
+/awards, /matchcentre, or career games-played.
 """
 import discord
 import aiosqlite
 from config import DB_PATH
-from utils import fetch_teams_for_dropdown, build_team_options, DISCORD_SELECT_MAX_OPTIONS, get_team_emoji, get_team_emoji_str
+from utils import fetch_teams_for_dropdown, build_team_options, DISCORD_SELECT_MAX_OPTIONS, get_team_emoji, get_team_emoji_str, add_page_buttons
 from commands.lineup_commands import (
     AFL_POSITIONS, fits_without_penalty,
     build_position_options, build_player_options, build_lineup_field_text,
@@ -430,10 +430,12 @@ class ScratchTeamManageView(discord.ui.View):
 
     async def _delete_callback(self, interaction: discord.Interaction):
         name = self.teams_by_id[self.selected_team_id]
+        # Asked in this same message (not a separate one), so Confirm/Cancel
+        # can redraw the manage menu in place afterwards.
         confirm_view = _ConfirmDeleteView(self, self.selected_team_id, name)
-        await interaction.response.send_message(
-            f"❌ Delete scratch team **{name}** and its lineup? This can't be undone.",
-            view=confirm_view, ephemeral=True
+        await interaction.response.edit_message(
+            content=f"❌ Delete scratch team **{name}** and its lineup? This can't be undone.",
+            view=confirm_view
         )
 
     async def _back_callback(self, interaction: discord.Interaction):
@@ -600,8 +602,10 @@ class _SetScratchTeamEmojiModal(discord.ui.Modal, title="Set Scratch Team Emoji"
 
 
 class _ConfirmDeleteView(discord.ui.View):
+    """Shown in place of the manage menu's buttons; either choice redraws
+    the manage menu in the same message."""
     def __init__(self, manage_view, scratch_team_id, team_name):
-        super().__init__(timeout=60)
+        super().__init__(timeout=600)
         self.manage_view = manage_view
         self.scratch_team_id = scratch_team_id
         self.team_name = team_name
@@ -622,18 +626,15 @@ class _ConfirmDeleteView(discord.ui.View):
 
             await self.manage_view.refresh(db)
             manage_embed = await self.manage_view.create_embed(db)
-
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(content=f"✅ Deleted **{self.team_name}**.", view=self)
-        if self.manage_view.message:
-            await self.manage_view.message.edit(embed=manage_embed, view=self.manage_view)
+        manage_embed.description = f"✅ Deleted **{self.team_name}**.\n\n{manage_embed.description}"
+        await interaction.response.edit_message(content=None, embed=manage_embed, view=self.manage_view)
 
     @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(content="❌ Cancelled.", view=self)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await self.manage_view.refresh(db)
+            manage_embed = await self.manage_view.create_embed(db)
+        await interaction.response.edit_message(content=None, embed=manage_embed, view=self.manage_view)
 
 
 class ScratchLineupEditorView(discord.ui.View):
@@ -671,13 +672,8 @@ class ScratchLineupEditorView(discord.ui.View):
         if self.selected_position and self.team_filter_id is not None:
             await self._load_filtered_players(db)
             self.add_item(_ScratchPlayerSelect(self))
-            total = len(self.filtered_players)
-            if total > 25:
-                total_pages = (total + 24) // 25
-                if self.player_page > 0:
-                    self.add_item(_ScratchPrevPageButton(self, total_pages))
-                if (self.player_page + 1) * 25 < total:
-                    self.add_item(_ScratchNextPageButton(self, total_pages))
+            add_page_buttons(self, self.player_page, (len(self.filtered_players) + 24) // 25,
+                             self._go_to_player_page, row=3)
 
         if self.selected_position and self.selected_position in self.lineup:
             self.add_item(_ScratchClearPositionButton(self))
@@ -685,6 +681,12 @@ class ScratchLineupEditorView(discord.ui.View):
         back_btn = discord.ui.Button(label="← Back to Manage Scratch Teams", style=discord.ButtonStyle.secondary, row=4)
         back_btn.callback = self._back_callback
         self.add_item(back_btn)
+
+    async def _go_to_player_page(self, interaction: discord.Interaction, page):
+        self.player_page = page
+        async with aiosqlite.connect(DB_PATH) as db:
+            await self.refresh_components(db)
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
     async def _back_callback(self, interaction: discord.Interaction):
         async with aiosqlite.connect(DB_PATH) as db:
@@ -872,39 +874,6 @@ class _ScratchClearPositionButton(discord.ui.Button):
             await db.commit()
             if position_name in self.parent_view.lineup:
                 del self.parent_view.lineup[position_name]
-            await self.parent_view.refresh_components(db)
-        await interaction.response.edit_message(
-            embed=self.parent_view.create_embed(), view=self.parent_view
-        )
-
-
-class _ScratchPrevPageButton(discord.ui.Button):
-    def __init__(self, parent_view, total_pages):
-        # Row 3, not 2 - rows 0-2 are all Selects here (position, team
-        # filter, player), unlike the real lineup editor's two-Select
-        # layout where row 2 is free for these buttons.
-        super().__init__(label=f"◀ Page {parent_view.player_page}/{total_pages}",
-                          style=discord.ButtonStyle.secondary, row=3)
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction):
-        self.parent_view.player_page -= 1
-        async with aiosqlite.connect(DB_PATH) as db:
-            await self.parent_view.refresh_components(db)
-        await interaction.response.edit_message(
-            embed=self.parent_view.create_embed(), view=self.parent_view
-        )
-
-
-class _ScratchNextPageButton(discord.ui.Button):
-    def __init__(self, parent_view, total_pages):
-        super().__init__(label=f"Page {parent_view.player_page + 2}/{total_pages} ▶",
-                          style=discord.ButtonStyle.secondary, row=3)
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction):
-        self.parent_view.player_page += 1
-        async with aiosqlite.connect(DB_PATH) as db:
             await self.parent_view.refresh_components(db)
         await interaction.response.edit_message(
             embed=self.parent_view.create_embed(), view=self.parent_view

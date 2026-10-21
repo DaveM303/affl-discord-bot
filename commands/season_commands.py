@@ -3,7 +3,8 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH, ADMIN_ROLE_ID
-from utils import is_admin_user, get_team_emoji_str
+from utils import is_admin_user, get_team_emoji_str, finals_ground_name, DEFAULT_OFFSEASON_WEEKS
+from fixture_generator import finals_timeslots
 from ladder_image import fetch_team_icons, render_ladder_image, split_ladder_for_images
 import finals_bracket as finals_bracket_module
 from match_sim import INJURY_DIAGNOSES, REPORT_REASONS
@@ -173,15 +174,19 @@ async def compute_and_store_ladder(db, season_id):
     return ranked
 
 
-async def _insert_finals_match(db, season_id, round_number, slot_code, home_team_id, away_team_id):
+async def _insert_finals_match(db, season_id, round_number, slot_code, home_team_id, away_team_id, timeslot=None):
     """Inserts one finals fixture - a `matches` row (unsimulated, 0-0)
     plus its `finals_bracket` row recording which slot this is, with
     `match_id` filled in immediately so later rounds can look the result
-    back up by slot_code. Returns the new match_id."""
+    back up by slot_code. Returns the new match_id. Its ground follows
+    utils.finals_ground_name; its timeslot comes from
+    fixture_generator.finals_timeslots (see advance_to_next_round)."""
+    ground = await finals_ground_name(db, home_team_id, grand_final=slot_code == "GF")
     cursor = await db.execute(
-        """INSERT INTO matches (season_id, round_number, home_team_id, away_team_id, home_score, away_score, simulated)
-           VALUES (?, ?, ?, ?, 0, 0, 0)""",
-        (season_id, round_number, home_team_id, away_team_id)
+        """INSERT INTO matches (season_id, round_number, home_team_id, away_team_id, home_score, away_score,
+                                simulated, ground, timeslot)
+           VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?)""",
+        (season_id, round_number, home_team_id, away_team_id, ground, timeslot)
     )
     match_id = cursor.lastrowid
     await db.execute(
@@ -525,8 +530,12 @@ async def _generate_finals_round(db, season_id, next_round_num, regular_rounds):
     else:
         return False
 
-    for slot_code, home_team_id, away_team_id in matches:
-        await _insert_finals_match(db, season_id, next_round_num, slot_code, home_team_id, away_team_id)
+    # Inserted in play order, so lists ordered by match_id show them that
+    # way (as /generatefixture does for the regular season).
+    cursor = await db.execute("SELECT team_id, crowd_draw FROM team_grounds")
+    crowd_draw = dict(await cursor.fetchall())
+    for slot_code, home_team_id, away_team_id, timeslot in finals_timeslots(matches, crowd_draw):
+        await _insert_finals_match(db, season_id, next_round_num, slot_code, home_team_id, away_team_id, timeslot)
     await db.commit()
     return True
 
@@ -1067,12 +1076,10 @@ async def post_season_summaries(bot, db, season_id, season_number):
 
     Goals/best & fairest votes are summed straight from player_match_stats,
     joined through matches on season_id (matches.season_id, not a fresh
-    join through the seasons table - see the Excel export's equivalent
-    query in admin_commands.py for the same JOIN path) - filtered by
-    pms.team_id (the team a player played FOR in each match), not
-    players.team_id, so a since-traded player's votes/goals still count
-    toward the team they actually earned them for, consistent with how
-    the Excel export already treats this column."""
+    join through the seasons table) - filtered by pms.team_id (the team a
+    player played FOR in each match), not players.team_id, so a
+    since-traded player's votes/goals still count toward the team they
+    actually earned them for."""
     cursor = await db.execute(
         "SELECT team_id, team_name, channel_id, emoji_id FROM teams WHERE team_name != 'Draft Pool'"
     )
@@ -1275,12 +1282,13 @@ async def _ensure_season_draft_and_picks(db, season_num, teams, default_rounds=4
     if (await cursor.fetchone())[0] == 0:
         for team_id, team_name in teams:
             for round_num in range(1, default_rounds + 1):
-                pick_origin = f"{team_name} R{round_num}"
+                # A ladder pick's origin label is built when shown - see
+                # utils.pick_origin_label.
                 await db.execute(
                     """INSERT INTO draft_picks (draft_id, draft_name, season_number, round_number,
-                                                pick_number, pick_origin, original_team_id, current_team_id)
-                       VALUES (?, ?, ?, ?, NULL, ?, ?, ?)""",
-                    (draft_id, draft_name, season_num, round_num, pick_origin, team_id, team_id)
+                                                pick_number, original_team_id, current_team_id, pick_type)
+                       VALUES (?, ?, ?, ?, NULL, ?, ?, 'ladder')""",
+                    (draft_id, draft_name, season_num, round_num, team_id, team_id)
                 )
         touched = True
 
@@ -1329,8 +1337,8 @@ async def ensure_future_seasons_exist(db, current_season_number, num_future=2, d
         )
         if not await cursor.fetchone():
             await db.execute(
-                """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
-                   VALUES (?, 0, 24, 29, 'Future', 'future')""",
+                """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, status)
+                   VALUES (?, 0, 24, 29, 'future')""",
                 (future_season_num,)
             )
             season_touched = True
@@ -1503,7 +1511,6 @@ class SeasonCommands(commands.Cog):
                         current_round INTEGER DEFAULT 0,
                         regular_rounds INTEGER DEFAULT 24,
                         total_rounds INTEGER DEFAULT 29,
-                        round_name TEXT DEFAULT 'Offseason',
                         status TEXT DEFAULT 'offseason'
                     )
                 ''')
@@ -2188,6 +2195,15 @@ class SeasonCommands(commands.Cog):
                 if 'emoji_id' not in scratch_columns:
                     await db.execute("ALTER TABLE scratch_teams ADD COLUMN emoji_id TEXT")
 
+                # Fixture tables/columns for /generatefixture - see utils.ensure_fixture_schema.
+                from utils import ensure_fixture_schema, ensure_draft_pick_schema
+                await ensure_fixture_schema(db)
+                # draft_picks.pick_type - see utils.ensure_draft_pick_schema.
+                await ensure_draft_pick_schema(db)
+                # seasons.offseason_weeks - see utils.ensure_season_schema.
+                from utils import ensure_season_schema
+                await ensure_season_schema(db)
+
                 await db.commit()
 
                 await interaction.followup.send(
@@ -2210,7 +2226,9 @@ class SeasonCommands(commands.Cog):
                     "• **Teams table**: Added color and color_secondary columns\n"
                     "• Player Match Stats table created\n"
                     "• Scratch Teams tables created\n"
-                    "• **Scratch Teams table**: Added emoji_id column\n\n"
+                    "• **Scratch Teams table**: Added emoji_id column\n"
+                    "• **Matches table**: Added timeslot column\n"
+                    "• Fixture Derbies and Fixture Marquees tables created\n\n"
                     "You can now use all season, injury, suspension, lineup, and free agency commands.\n"
                     "Use `/config lineups_channel:<#channel>` to configure where lineups are posted.",
                     ephemeral=True
@@ -2223,10 +2241,9 @@ class SeasonCommands(commands.Cog):
 
     @app_commands.command(name="startseason", description="[ADMIN] End the current off-season and begin the next season")
     @app_commands.describe(
-        offseason_weeks="Number of weeks in offseason (default: 23)",
         next_season_rounds="Number of regular-season rounds for the season being started (default: 24)"
     )
-    async def start_season(self, interaction: discord.Interaction, offseason_weeks: int = 23, next_season_rounds: int = None):
+    async def start_season(self, interaction: discord.Interaction, next_season_rounds: int = None):
         await interaction.response.defer(ephemeral=True)
 
         try:
@@ -2258,9 +2275,9 @@ class SeasonCommands(commands.Cog):
                     total_rounds = bootstrap_rounds + len(FINALS_ROUNDS)
                     round_name = get_round_name(1, bootstrap_rounds)
                     cursor = await db.execute(
-                        """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
-                           VALUES (1, 1, ?, ?, ?, 'active')""",
-                        (bootstrap_rounds, total_rounds, round_name)
+                        """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, status)
+                           VALUES (1, 1, ?, ?, 'active')""",
+                        (bootstrap_rounds, total_rounds)
                     )
                     await db.commit()
 
@@ -2281,13 +2298,16 @@ class SeasonCommands(commands.Cog):
 
                 season_id, season_number, regular_rounds, total_rounds = season
 
-                # Get previous season's final round to calculate injury carryover
-                cursor = await db.execute(
-                    """SELECT season_id, total_rounds FROM seasons
-                       WHERE status = 'completed'
-                       ORDER BY season_number DESC LIMIT 1"""
-                )
-                prev_season = await cursor.fetchone()
+                # Injuries carry over from the season that's ending - this
+                # offseason's own season, NOT the last 'completed' one (it
+                # isn't marked completed until further down, so that query
+                # used to find the season BEFORE it: the wrong season length
+                # to measure from, and no carryover at all after Season 1).
+                # The offseason's length was set by /endseason.
+                cursor = await db.execute("SELECT offseason_weeks FROM seasons WHERE season_id = ?", (season_id,))
+                stored_weeks = (await cursor.fetchone())[0]
+                offseason_weeks = stored_weeks if stored_weeks is not None else DEFAULT_OFFSEASON_WEEKS
+                prev_season = (season_id, total_rounds)
 
                 carried_over = 0
                 healed_during_offseason = 0
@@ -2363,7 +2383,7 @@ class SeasonCommands(commands.Cog):
                 # Mark the offseason season as completed
                 await db.execute(
                     """UPDATE seasons
-                       SET status = 'completed', round_name = 'Season Complete'
+                       SET status = 'completed'
                        WHERE season_id = ?""",
                     (season_id,)
                 )
@@ -2391,8 +2411,8 @@ class SeasonCommands(commands.Cog):
                 if not next_season_result:
                     # Next season doesn't exist, create it
                     cursor = await db.execute(
-                        """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
-                           VALUES (?, 1, ?, ?, 'Round 1', 'active')""",
+                        """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, status)
+                           VALUES (?, 1, ?, ?, 'active')""",
                         (next_season_num, next_regular_rounds, next_total_rounds)
                     )
                     next_season_id = cursor.lastrowid
@@ -2409,10 +2429,10 @@ class SeasonCommands(commands.Cog):
                 round_name = get_round_name(1, next_regular_rounds)
                 await db.execute(
                     """UPDATE seasons
-                       SET current_round = 1, round_name = ?, status = 'active',
+                       SET current_round = 1, status = 'active',
                            regular_rounds = ?, total_rounds = ?
                        WHERE season_id = ?""",
-                    (round_name, next_regular_rounds, next_total_rounds, next_season_id)
+                    (next_regular_rounds, next_total_rounds, next_season_id)
                 )
                 await db.commit()
 
@@ -2447,7 +2467,7 @@ class SeasonCommands(commands.Cog):
                 if carried_over > 0 or healed_during_offseason > 0:
                     message += f"\n\n**Injury Updates:**"
                     if healed_during_offseason > 0:
-                        message += f"\n• {healed_during_offseason} player(s) healed during offseason"
+                        message += f"\n• {healed_during_offseason} player(s) healed during the {offseason_weeks}-week offseason"
                     if carried_over > 0:
                         message += f"\n• {carried_over} injury(ies) carried over to new season"
 
@@ -2471,6 +2491,22 @@ class SeasonCommands(commands.Cog):
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
     async def _try_announce_lineups(self, db):
+        """Refuses to run while another call is still announcing - see
+        _announce_lineups for the actual work. The round is only marked
+        locked once every lineup has been POSTED, so before this, a second
+        call starting mid-way (a double-clicked force-submit button, or two
+        force-submit prompts from pressing Announce Lineups twice) passed the
+        "already locked" check too and posted every lineup again. The flag is
+        set before any await, so a second call always sees it."""
+        if getattr(self, "_announcing_lineups", False):
+            return "⏳ Lineups are already being announced - check the lineups channel in a moment."
+        self._announcing_lineups = True
+        try:
+            return await self._announce_lineups(db)
+        finally:
+            self._announcing_lineups = False
+
+    async def _announce_lineups(self, db):
         """Locks in and posts every team's lineup for the round - called
         from the "Announce Lineups" button on /matchsimulation's panel
         (match_commands.py, via self.bot.get_cog('SeasonCommands')) and
@@ -2854,20 +2890,33 @@ class SeasonCommands(commands.Cog):
 
         await db.execute(
             """UPDATE seasons
-               SET current_round = ?, round_name = ?, lineups_locked = 0
+               SET current_round = ?, lineups_locked = 0
                WHERE season_id = ?""",
-            (next_round_num, next_round_name, season_id)
+            (next_round_num, season_id)
         )
         await db.execute("UPDATE teams SET lineup_confirmed = 0 WHERE team_name != 'Draft Pool'")
 
         # Auto-generate the next finals round's fixture, if next_round_num
         # lands on one of the 5 finals weeks (Wildcard/QF-EF/Semis/
         # Prelims/GF) - a no-op for a regular round. Fixtures for every
-        # OTHER round are set via /importdata's Excel import; this is the
-        # one exception, since finals matchups depend on bracket results
+        # OTHER round are entered into the matches table directly; this is
+        # the one exception, since finals matchups depend on bracket results
         # the admin has no way to know in advance.
         await _generate_finals_round(db, season_id, next_round_num, regular_rounds)
         await db.commit()
+
+        # Post injury list to configured channel - BEFORE recovered
+        # injuries and served suspensions are cleared below, so (like the
+        # round summaries) a player who recovered this round still shows
+        # once as "✅ Recovered" (or "✅ Available") before dropping off.
+        cursor = await db.execute(
+            "SELECT setting_value FROM settings WHERE setting_key = 'injury_list_channel_id'"
+        )
+        result = await cursor.fetchone()
+        if result and result[0]:
+            injury_commands = self.bot.get_cog('InjuryCommands')
+            if injury_commands:
+                await injury_commands.post_injury_list_to_channel(db, int(result[0]))
 
         # Check for players who have recovered from injuries
         cursor = await db.execute(
@@ -2905,16 +2954,6 @@ class SeasonCommands(commands.Cog):
 
         if completed_suspension_ids:
             await db.commit()
-
-        # Post injury list to configured channel
-        cursor = await db.execute(
-            "SELECT setting_value FROM settings WHERE setting_key = 'injury_list_channel_id'"
-        )
-        result = await cursor.fetchone()
-        if result and result[0]:
-            injury_commands = self.bot.get_cog('InjuryCommands')
-            if injury_commands:
-                await injury_commands.post_injury_list_to_channel(db, int(result[0]))
 
         response = f"✅ Advanced to **{next_round_name}** of Season {season_number}"
         if recovered_players:
@@ -3005,9 +3044,9 @@ class SeasonCommands(commands.Cog):
 
                 await db.execute(
                     """UPDATE seasons
-                       SET current_round = ?, round_name = ?
+                       SET current_round = ?
                        WHERE season_id = ?""",
-                    (round_number, round_name, season_id)
+                    (round_number, season_id)
                 )
                 await db.commit()
 
@@ -3018,7 +3057,10 @@ class SeasonCommands(commands.Cog):
             await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
     @app_commands.command(name="endseason", description="[ADMIN] End the current season and create offseason")
-    async def end_season(self, interaction: discord.Interaction):
+    @app_commands.describe(
+        offseason_weeks=f"How many weeks the offseason lasts - injuries heal during it (default: {DEFAULT_OFFSEASON_WEEKS})"
+    )
+    async def end_season(self, interaction: discord.Interaction, offseason_weeks: int = DEFAULT_OFFSEASON_WEEKS):
         # Deferred immediately - post_season_summaries below sends one
         # embed per team (a real channel.send per team, not batched), which
         # can easily run past Discord's 3-second initial-response window
@@ -3027,6 +3069,9 @@ class SeasonCommands(commands.Cog):
         # interaction" / 404). Every response from here on uses
         # interaction.followup.send, not interaction.response.send_message.
         await interaction.response.defer(ephemeral=True)
+        if offseason_weeks < 0:
+            await interaction.followup.send("❌ The offseason can't be shorter than 0 weeks.", ephemeral=True)
+            return
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get active season
@@ -3073,11 +3118,13 @@ class SeasonCommands(commands.Cog):
 
                 # End the current season (set to offseason, not completed)
                 # Note: Player ages will be updated when the new season STARTS (in /startseason)
+                # offseason_weeks is stored on the season for /startseason
+                # (injury carryover) and the offseason injury lists.
                 await db.execute(
                     """UPDATE seasons
-                       SET status = 'offseason', round_name = 'Offseason'
+                       SET status = 'offseason', offseason_weeks = ?
                        WHERE season_id = ?""",
-                    (season_id,)
+                    (offseason_weeks, season_id)
                 )
                 await db.commit()
 
@@ -3102,15 +3149,19 @@ class SeasonCommands(commands.Cog):
                 result = await cursor.fetchone()
                 if result and result[0]:
                     from commands.injury_commands import build_injury_suspension_list, _chunk_lines_into_descriptions
+                    # offseason=True: every team (no finals-elimination
+                    # filter - the season's over, so the whole league is
+                    # planning for next season) and each injury shows the
+                    # round of next season the player is back for.
                     combined_list = await build_injury_suspension_list(
-                        self.bot, db, ending_current_round, ending_total_rounds,
-                        season_id=season_id, regular_rounds=current_regular_rounds,
+                        self.bot, db, ending_current_round, ending_total_rounds, offseason=True,
+                        offseason_weeks=offseason_weeks,
                     )
                     if combined_list:
                         descriptions = _chunk_lines_into_descriptions(combined_list, max_length=4000)
                         embeds = [
                             discord.Embed(
-                                title=f"Injury & Suspension List - Off-season" if i == 0 else None,
+                                title="Injuries & Suspensions - Off-season" if i == 0 else None,
                                 description=description,
                                 color=discord.Color.red(),
                             )
@@ -3141,8 +3192,8 @@ class SeasonCommands(commands.Cog):
                     # Create next season as 'future' status
                     total_rounds = next_season_rounds + len(FINALS_ROUNDS)
                     await db.execute(
-                        """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, round_name, status)
-                           VALUES (?, 0, ?, ?, 'Future', 'future')""",
+                        """INSERT INTO seasons (season_number, current_round, regular_rounds, total_rounds, status)
+                           VALUES (?, 0, ?, ?, 'future')""",
                         (next_season_num, next_season_rounds, total_rounds)
                     )
                     message += f"\n✅ **Season {next_season_num}** created as future season ({next_season_rounds} rounds)"
@@ -3182,7 +3233,7 @@ class SeasonCommands(commands.Cog):
             async with aiosqlite.connect(DB_PATH) as db:
                 # Get active or most recent season
                 cursor = await db.execute(
-                    """SELECT season_number, current_round, total_rounds, round_name, status
+                    """SELECT season_number, current_round, regular_rounds, status
                        FROM seasons
                        ORDER BY
                            CASE status
@@ -3202,7 +3253,15 @@ class SeasonCommands(commands.Cog):
                     )
                     return
 
-                season_number, current_round, total_rounds, round_name, status = season
+                season_number, current_round, regular_rounds, status = season
+                if status == 'active':
+                    round_name = get_round_name(current_round, regular_rounds)
+                elif status == 'offseason':
+                    round_name = "Offseason"
+                elif status == 'future':
+                    round_name = "Future"
+                else:
+                    round_name = "Season Complete"
 
                 # Build embed
                 if status == 'active':
@@ -3229,12 +3288,12 @@ class SeasonCommands(commands.Cog):
 class _AnnounceLineupsMissingView(discord.ui.View):
     """Offered by /announcelineups when one or more teams are blocking the
     round (never confirmed, or confirmed but no longer valid) - lets the
-    admin force-submit them rather than waiting on every coach. For a team
-    whose current live lineup is invalid, auto_fill_lineup (lineup_commands.py)
-    is tried first - it backfills empty/injured/suspended starting-18 slots
-    from the interchange/reserves per its own priority order - before
-    re-validating; only a team still invalid after that auto-fix attempt
-    (e.g. the whole roster is exhausted) actually blocks force-submit."""
+    admin force-submit them rather than waiting on every coach. A team whose
+    live lineup is valid is left as it is; an invalid one is reset to its
+    main lineup (if saved) and repaired by auto_fill_lineup
+    (lineup_commands.py) - the same as the Autofill button. Only a team
+    still invalid after that (e.g. the whole roster is exhausted) actually
+    blocks force-submit."""
     def __init__(self, cog, blocking_team_ids, panel_view=None):
         super().__init__(timeout=300)
         self.cog = cog
@@ -3248,7 +3307,13 @@ class _AnnounceLineupsMissingView(discord.ui.View):
     async def force_confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         from commands.lineup_commands import validate_lineup, auto_fill_lineup
 
-        await interaction.response.defer(ephemeral=True)
+        # Disable straight away (this answers the click too) - the buttons
+        # used to stay live until every lineup had been posted, so a second
+        # click in that time posted them all again. _try_announce_lineups
+        # also refuses to run twice at once, for any other route in.
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="⏳ Force-submitting and announcing lineups...", view=self)
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
                 "SELECT current_round FROM seasons WHERE status = 'active' LIMIT 1"
@@ -3264,9 +3329,12 @@ class _AnnounceLineupsMissingView(discord.ui.View):
                 cursor = await db.execute("SELECT team_name FROM teams WHERE team_id = ?", (team_id,))
                 team_name = (await cursor.fetchone())[0]
 
+                # A valid lineup is left exactly as it is. An invalid one goes
+                # through the same process as the Autofill button: reset to the
+                # team's main lineup (if saved), then repair from there.
                 errors, player_ids = await validate_lineup(db, team_id, current_round)
                 if errors:
-                    await auto_fill_lineup(db, team_id, current_round)
+                    await auto_fill_lineup(db, team_id, current_round, from_main_lineup=True)
                     errors, player_ids = await validate_lineup(db, team_id, current_round)
 
                 if errors:

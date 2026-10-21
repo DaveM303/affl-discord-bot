@@ -5,7 +5,7 @@ import aiosqlite
 from config import DB_PATH
 from utils import (
     get_current_season, is_admin_user, calculate_contract_expiry, get_team_emoji, get_team_emoji_str, get_user_team,
-    fetch_teams_for_dropdown, build_team_options,
+    fetch_teams_for_dropdown, build_team_options, add_page_buttons,
 )
 from commands.lineup_commands import clear_departed_players_from_lineups
 from compensation_image import render_compensation_chart_image
@@ -77,6 +77,32 @@ async def set_fa_period_status(db, status):
         "INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)",
         ("fa_period_status", str(status))
     )
+
+
+async def load_band_lookup(db):
+    """Loads the compensation chart once and returns band_for(age, ovr) ->
+    band number, or None for no compensation - for working out bands for a
+    whole list of players without a query per player. NULL max values mean
+    single-value ranges (as in FreeAgencyCommands.get_compensation_band)."""
+    cursor = await db.execute(
+        """SELECT min_age, max_age, min_ovr, max_ovr, compensation_band
+           FROM compensation_chart
+           ORDER BY compensation_band ASC"""
+    )
+    chart_rows = await cursor.fetchall()
+
+    def band_for(age, ovr):
+        for min_age, max_age, min_ovr, max_ovr, band in chart_rows:
+            if min_age <= age <= (max_age if max_age is not None else min_age) \
+                    and min_ovr <= ovr <= (max_ovr if max_ovr is not None else min_ovr):
+                return band
+        return None
+    return band_for
+
+
+def band_text(band):
+    """How a compensation band reads in lists: "Band 2", or "No comp"."""
+    return f"Band {band}" if band else "No comp"
 
 
 class FreeAgencyCommands(commands.Cog):
@@ -230,19 +256,7 @@ class FreeAgencyCommands(commands.Cog):
 
         # Load the compensation chart once and match bands in Python instead of
         # issuing one query per free agent
-        cursor = await db.execute(
-            """SELECT min_age, max_age, min_ovr, max_ovr, compensation_band
-               FROM compensation_chart
-               ORDER BY compensation_band ASC"""
-        )
-        chart_rows = await cursor.fetchall()
-
-        def band_for(age, ovr):
-            for min_age, max_age, min_ovr, max_ovr, band in chart_rows:
-                if min_age <= age <= (max_age if max_age is not None else min_age) \
-                        and min_ovr <= ovr <= (max_ovr if max_ovr is not None else min_ovr):
-                    return band
-            return None
+        band_for = await load_band_lookup(db)
 
         credits = 0.0
         for player_id, age, ovr in free_agents:
@@ -314,7 +328,7 @@ class FreeAgencyCommands(commands.Cog):
 
         # Build embed
         embed = discord.Embed(
-            title=f"Season {season_number} Auctions - Free Re-Signs",
+            title=f"Season {season_number} Free Agency - Free Re-Signs Phase",
             color=discord.Color.blue()
         )
 
@@ -325,7 +339,8 @@ class FreeAgencyCommands(commands.Cog):
             emoji_str = get_team_emoji_str(self.bot, emoji_id)
 
             contract_years = contract_expiry - season_number
-            player_lines.append(f"{emoji_str}**{name}** ({pos}, {age}, {ovr}) - **{contract_years} years**")
+            year_text = "year" if contract_years == 1 else "years"
+            player_lines.append(f"{emoji_str}**{name}** ({pos}, {age}, {ovr}) - **{contract_years} {year_text}**")
 
         # Split into fields if needed (max 1024 chars per field)
         if player_lines:
@@ -427,57 +442,44 @@ class FreeAgencyCommands(commands.Cog):
             remaining_points = team_points.get(orig_team_id, 0)
 
             if remaining_points >= match_cost:
-                match_text = f"({orig_emoji_str}can match {match_cost}pts)"
+                match_text = f"{orig_emoji_str}can match for {match_cost}pts"
             else:
-                match_text = f"({orig_emoji_str}can't afford to match)"
+                match_text = f"{orig_emoji_str}can't afford to match"
 
+            # Same layout as the other auctions embeds (re-signs, player
+            # movements): the player's line, then a "└─" detail line.
             rfa_tag = " [RFA]" if is_rfa else ""
+            # One entry per player, so a field split never separates the two lines.
             player_lines.append(
-                f"{orig_emoji_str}**{name}**{rfa_tag} ({pos}, {age}, {ovr})\n"
-                f"Winning bid: {bid_emoji_str}{winning_bid}pts {match_text}"
+                f"{orig_emoji_str}**{name}** ({pos}, {age}, {ovr}){rfa_tag}\n"
+                f"└─ {bid_emoji_str}Winning bid: **{winning_bid}pts** · {match_text}"
             )
+            player_lines.append("")  # blank line between players, as in player movements
 
-        # Split into multiple embeds if needed to avoid description 4096 character limit
+        # Untitled fields, like the other auctions embeds. One embed holds
+        # 6000 characters across its fields, so a long list carries on in
+        # further untitled embeds within the same message.
         if player_lines:
             embeds = []
-            current_embed = discord.Embed(
-                title=f"Season {season_number} Auctions - Matching Period",
-                description="**Winning bids:**",
+            embed = discord.Embed(
+                title=f"Season {season_number} Free Agency - Bid Matching Phase",
                 color=discord.Color.gold()
             )
-            current_lines = []
-            base_description = "**Winning bids:**"
+            used = len(embed.title)
+            for _, value in self._split_field_content(player_lines, "", max_length=1000):
+                if used + len(value) > 5500:
+                    embeds.append(embed)
+                    embed = discord.Embed(color=discord.Color.gold())
+                    used = 0
+                embed.add_field(name="​", value=value, inline=False)
+                used += len(value) + 1
+            embeds.append(embed)
 
-            for line in player_lines:
-                # Check if adding this line would exceed the description limit (4096 chars)
-                # Use 3900 to be safe and account for formatting
-                test_content = base_description + "\n\n" + "\n\n".join(current_lines + [line])
-                if len(test_content) > 3900 and current_lines:
-                    # Finalize current embed
-                    current_embed.description = base_description + "\n\n" + "\n\n".join(current_lines)
-                    embeds.append(current_embed)
-
-                    # Start new embed
-                    current_embed = discord.Embed(
-                        title=f"Season {season_number} Auctions - Matching Period (cont.)",
-                        description="**Winning bids (continued):**",
-                        color=discord.Color.gold()
-                    )
-                    current_lines = [line]
-                    base_description = "**Winning bids (continued):**"
-                else:
-                    current_lines.append(line)
-
-            # Add the last embed
-            if current_lines:
-                current_embed.description = base_description + "\n\n" + "\n\n".join(current_lines)
-                embeds.append(current_embed)
-
-            # Send all embeds
+            # Send all embeds (Discord allows 10 per message)
             try:
-                for embed in embeds:
-                    await log_channel.send(embed=embed)
-                print(f"Successfully sent {len(embeds)} matching period notification(s) to auctions log channel")
+                for start in range(0, len(embeds), 10):
+                    await log_channel.send(embeds=embeds[start:start + 10])
+                print(f"Successfully sent {len(embeds)} matching period embed(s) to auctions log channel")
             except Exception as e:
                 print(f"Error logging winning bids: {e}")
                 import traceback
@@ -512,7 +514,7 @@ class FreeAgencyCommands(commands.Cog):
 
         # Build embed
         embed = discord.Embed(
-            title=f"Season {season_number} Free Agency Player Movements",
+            title=f"Season {season_number} Free Agency - Player Movements",
             color=discord.Color.green()
         )
 
@@ -1920,11 +1922,16 @@ class FreeAgencyCommands(commands.Cog):
                         # Get all compensation results for this period, ordered by band and ladder position
                         # For bands 1,3,5: order doesn't matter as much (inserted after natural pick)
                         # For bands 2,4: MUST be in reverse ladder order (worst team = highest position number = pick first)
+                        # The season filter has to be part of the ladder join
+                        # itself - joined by team alone, every result matched
+                        # one ladder row per season ever played, and got a
+                        # compensation pick inserted for each of them.
                         cursor = await db.execute(
                             """SELECT r.result_id, r.original_team_id, r.compensation_band, r.player_id
                                FROM free_agency_results r
-                               LEFT JOIN ladder_positions lp ON r.original_team_id = lp.team_id
-                               LEFT JOIN seasons s ON lp.season_id = s.season_id AND s.season_number = ?
+                               LEFT JOIN seasons s ON s.season_number = ?
+                               LEFT JOIN ladder_positions lp
+                                      ON lp.team_id = r.original_team_id AND lp.season_id = s.season_id
                                WHERE r.season_number = ? AND r.compensation_band IS NOT NULL
                                ORDER BY r.compensation_band,
                                         CASE
@@ -1947,21 +1954,15 @@ class FreeAgencyCommands(commands.Cog):
                                 # After team's natural pick in the round
                                 round_num = {1: 1, 3: 2, 5: 3}[comp_band]
 
-                                # Get team name to identify their natural pick by origin
-                                cursor = await db.execute("SELECT team_name FROM teams WHERE team_id = ?", (team_id,))
-                                team_name_result = await cursor.fetchone()
-                                if not team_name_result:
-                                    continue  # Skip if team not found
-
-                                team_name = team_name_result[0]
-                                natural_pick_origin = f"{team_name} R{round_num}"
-
-                                # Find the team's natural pick in this round by origin (unchanging identifier)
+                                # The team's own (ladder) pick in this round - found
+                                # by what it is, not by its origin text, which can be
+                                # edited or go stale (see utils.ensure_draft_pick_schema).
                                 cursor = await db.execute(
                                     """SELECT pick_number FROM draft_picks
-                                       WHERE draft_id = ? AND round_number = ? AND pick_origin = ?
+                                       WHERE draft_id = ? AND round_number = ? AND original_team_id = ?
+                                         AND pick_type = 'ladder'
                                        ORDER BY pick_number LIMIT 1""",
-                                    (draft_id, round_num, natural_pick_origin)
+                                    (draft_id, round_num, team_id)
                                 )
                                 natural_pick = await cursor.fetchone()
 
@@ -2012,8 +2013,8 @@ class FreeAgencyCommands(commands.Cog):
 
                             # Insert the compensation pick with proper round and pick number
                             cursor = await db.execute(
-                                """INSERT INTO draft_picks (draft_id, draft_name, season_number, round_number, pick_number, pick_origin, original_team_id, current_team_id)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                """INSERT INTO draft_picks (draft_id, draft_name, season_number, round_number, pick_number, pick_origin, original_team_id, current_team_id, pick_type)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'compensation')""",
                                 (draft_id, draft_name, draft_season, round_num, new_pick_num,
                                  f"Band {comp_band} Compensation", team_id, team_id)
                             )
@@ -2204,6 +2205,7 @@ class FreeAgencyHubView(discord.ui.View):
         self.bids = []
         self.remaining_points = None
         self.winning_bids = []
+        self.band_for = lambda age, ovr: None  # set by build()
 
     async def build(self, db):
         """(Re)loads phase state and this team's data for it, then
@@ -2211,6 +2213,7 @@ class FreeAgencyHubView(discord.ui.View):
         to the hub (so it always reflects the current phase, even if it
         changed while a sub-view was open)."""
         self.period_status, self.max_points = await get_fa_period_for_season(db, self.season_number)
+        self.band_for = await load_band_lookup(db)
 
         if self.team_id is not None and self.period_status == 'resign':
             cog = self.bot.get_cog('FreeAgencyCommands')
@@ -2342,7 +2345,8 @@ class FreeAgencyHubView(discord.ui.View):
             return embed
 
         if self.period_status == 'resign':
-            fa_lines = [f"• {name} ({pos}, {age}, {ovr})" for _, name, pos, age, ovr in self.free_agents]
+            fa_lines = [f"• {name} ({pos}, {age}, {ovr}) - {band_text(self.band_for(age, ovr))}"
+                        for _, name, pos, age, ovr in self.free_agents]
             embed.add_field(
                 name=f"Your Free Agents ({len(self.free_agents)})",
                 value="\n".join(fa_lines) if fa_lines else "*None*",
@@ -2359,7 +2363,8 @@ class FreeAgencyHubView(discord.ui.View):
             )
             if self.bids:
                 bid_lines = [
-                    f"• {get_team_emoji_str(self.bot, emoji_id)}**{name}** ({pos}, {age}, {ovr}) - **{amount} pts**"
+                    f"• {get_team_emoji_str(self.bot, emoji_id)}**{name}** ({pos}, {age}, {ovr}) - "
+                    f"{band_text(self.band_for(age, ovr))} - **{amount} pts**"
                     for _, _, amount, name, pos, age, ovr, opp_team, emoji_id in self.bids
                 ]
                 embed.add_field(name=f"Your Active Bids ({len(self.bids)})", value="\n".join(bid_lines), inline=False)
@@ -2375,7 +2380,8 @@ class FreeAgencyHubView(discord.ui.View):
             )
             if self.winning_bids:
                 bid_lines = [
-                    f"• {get_team_emoji_str(self.bot, emoji_id)}**{name}** ({pos}, {age}, {ovr}) - {bidding_team} bid **{amount} pts**"
+                    f"• {get_team_emoji_str(self.bot, emoji_id)}**{name}** ({pos}, {age}, {ovr}) - "
+                    f"{band_text(self.band_for(age, ovr))} - {bidding_team} bid **{amount} pts**"
                     for _, name, pos, age, ovr, _, bidding_team, emoji_id, amount in self.winning_bids
                 ]
                 embed.add_field(name=f"Winning Bids on Your Players ({len(self.winning_bids)})", value="\n".join(bid_lines), inline=False)
@@ -2384,7 +2390,8 @@ class FreeAgencyHubView(discord.ui.View):
             embed.set_footer(text="Click 'Choose Bids to Match' to decide which players to keep.")
 
         else:
-            fa_lines = [f"• {name} ({pos}, {age}, {ovr})" for _, name, pos, age, ovr in self.free_agents]
+            fa_lines = [f"• {name} ({pos}, {age}, {ovr}) - {band_text(self.band_for(age, ovr))}"
+                        for _, name, pos, age, ovr in self.free_agents]
             embed.add_field(
                 name=f"Your Free Agents ({len(self.free_agents)})",
                 value="\n".join(fa_lines) if fa_lines else "*None*",
@@ -2598,7 +2605,6 @@ class FreeAgentsView(discord.ui.View):
         self.total_fa_count = total_fa_count
         self.teams_list = sorted(teams_dict.keys())
         self.current_page = 0
-        self.teams_per_page = 5
         self.team_filter_id = team_filter_id
         # (team_id, team_name, emoji_id) rows for the filter dropdown -
         # fetched once by whoever opens this view (fetch_teams_for_dropdown
@@ -2614,39 +2620,41 @@ class FreeAgentsView(discord.ui.View):
 
         self.add_item(_FreeAgentsTeamFilterSelect(self))
 
-        total_pages = max(1, (len(self.teams_list) + self.teams_per_page - 1) // self.teams_per_page)
+        add_page_buttons(self, self.current_page, len(self.pages()), self._go_to_page, row=1)
 
-        # Previous button
-        prev_button = discord.ui.Button(
-            label="◀ Previous",
-            style=discord.ButtonStyle.secondary,
-            disabled=self.current_page == 0,
-            custom_id="prev",
-            row=1
-        )
-        prev_button.callback = self.prev_callback
-        self.add_item(prev_button)
+    # A page's text stays under this, short of Discord's 4096-character
+    # limit on an embed description.
+    PAGE_CHARACTER_LIMIT = 3900
 
-        # Page indicator
-        page_button = discord.ui.Button(
-            label=f"Page {self.current_page + 1}/{total_pages}",
-            style=discord.ButtonStyle.secondary,
-            disabled=True,
-            custom_id="page",
-            row=1
-        )
-        self.add_item(page_button)
-
-        # Next button
-        next_button = discord.ui.Button(
-            label="Next ▶",
-            style=discord.ButtonStyle.secondary,
-            disabled=self.current_page >= total_pages - 1,
-            custom_id="next",
-            row=1
-        )
-        next_button.callback = self.next_callback
-        self.add_item(next_button)
+    def pages(self):
+        """The free agents split into pages, each a list of lines. Pages are
+        filled by length, not a fixed number of clubs: a club's list stays
+        together on one page where it fits, and a page takes as many clubs
+        as fit - so a page is never too long for Discord, however many free
+        agents the clubs on it have (previously five clubs a page, which
+        overflowed once they had a dozen or so each). A single club with
+        more than a page's worth carries on to the next page."""
+        pages, current, length = [], [], 0
+        for team_name in self.teams_list:
+            team_data = self.teams_dict[team_name]
+            emoji_str = get_team_emoji_str(self.bot, team_data['emoji_id'])
+            block = [
+                f"{emoji_str}**{name}**{' [RFA]' if age <= 25 else ''} ({pos}, {age}, {ovr})"
+                for name, pos, age, ovr in team_data['players']
+            ]
+            block_length = sum(len(line) + 1 for line in block)
+            if current and length + block_length > self.PAGE_CHARACTER_LIMIT:
+                pages.append(current)
+                current, length = [], 0
+            for line in block:
+                if current and length + len(line) + 1 > self.PAGE_CHARACTER_LIMIT:
+                    pages.append(current)
+                    current, length = [], 0
+                current.append(line)
+                length += len(line) + 1
+        if current:
+            pages.append(current)
+        return pages or [[]]
 
     def create_embed(self):
         """Create embed for current page"""
@@ -2655,27 +2663,8 @@ class FreeAgentsView(discord.ui.View):
             color=discord.Color.blue()
         )
 
-        # Get teams for current page
-        start_idx = self.current_page * self.teams_per_page
-        end_idx = start_idx + self.teams_per_page
-        page_teams = self.teams_list[start_idx:end_idx]
-
-        # Build player list with team emojis
-        all_players = []
-        for team_name in page_teams:
-            team_data = self.teams_dict[team_name]
-            players = team_data['players']
-
-            # Get emoji
-            emoji_str = get_team_emoji_str(self.bot, team_data['emoji_id'])
-
-            # Add all players from this team with team emoji and RFA status
-            for name, pos, age, ovr in players:
-                # Check if RFA (age <= 25)
-                rfa_label = " [RFA]" if age <= 25 else ""
-                all_players.append(f"{emoji_str}**{name}**{rfa_label} ({pos}, {age}, {ovr})")
-
-        # Add as single field
+        pages = self.pages()
+        all_players = pages[min(self.current_page, len(pages) - 1)]
         if all_players:
             embed.description = "\n".join(all_players)
         else:
@@ -2684,19 +2673,10 @@ class FreeAgentsView(discord.ui.View):
         embed.set_footer(text=f"Total: {self.total_fa_count} free agents")
         return embed
 
-    async def prev_callback(self, interaction: discord.Interaction):
-        """Go to previous page"""
-        self.current_page -= 1
+    async def _go_to_page(self, interaction: discord.Interaction, page):
+        self.current_page = page
         self.update_buttons()
-        embed = self.create_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    async def next_callback(self, interaction: discord.Interaction):
-        """Go to next page"""
-        self.current_page += 1
-        self.update_buttons()
-        embed = self.create_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
 
 class _FreeAgentsTeamFilterSelect(discord.ui.Select):
@@ -3069,19 +3049,7 @@ class MatchingView(discord.ui.View):
         # Get compensation bands for all players (load chart once, match in Python
         # instead of one query per player)
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                """SELECT min_age, max_age, min_ovr, max_ovr, compensation_band
-                   FROM compensation_chart
-                   ORDER BY compensation_band ASC"""
-            )
-            chart_rows = await cursor.fetchall()
-
-        def band_for(age, ovr):
-            for min_age, max_age, min_ovr, max_ovr, band in chart_rows:
-                if min_age <= age <= (max_age if max_age is not None else min_age) \
-                        and min_ovr <= ovr <= (max_ovr if max_ovr is not None else min_ovr):
-                    return band
-            return None
+            band_for = await load_band_lookup(db)
 
         compensation_bands = {}
         for player_id, name, pos, age, ovr, winning_team_id, bidding_team, emoji_id, bid in self.player_bids:

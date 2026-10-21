@@ -14,7 +14,12 @@ class SuspensionCommands(commands.Cog):
         interaction: discord.Interaction,
         current: str,
     ) -> list[app_commands.Choice[str]]:
-        """Autocomplete for player names with format: Team Name (POS, age, OVR)"""
+        """Autocomplete for player names with format: Team Name (POS, age, OVR).
+        Admins only - the cog's interaction_check doesn't run for autocomplete,
+        so without this any member could read every player's OVR (Draft Pool
+        prospects included) just by typing the command."""
+        if not await is_admin_user(interaction):
+            return []
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
                 """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating, t.team_name

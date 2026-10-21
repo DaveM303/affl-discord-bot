@@ -6,7 +6,7 @@ import aiosqlite
 import json
 from config import DB_PATH
 from commands.season_commands import get_round_name
-from utils import is_admin_user, get_team_emoji, get_team_emoji_str
+from utils import is_admin_user, get_team_emoji, get_team_emoji_str, add_page_buttons
 from match_sim import (
     slot_group, POSITION_ALLOWED_GROUPS, RUCK_SLOT, RUCK_ELIGIBLE_POSITIONS, Player,
     _team_strengths, _resolve_bench_groups, INTERCHANGE_SLOTS,
@@ -28,6 +28,18 @@ AFL_POSITIONS = [
     # Interchange (5)
     "INT1", "INT2", "INT3", "INT4", "INT5"
 ]
+
+# The order auto_fill_lineup fills empty starting slots in - key positions
+# first, then flanks, then pockets, and the inside midfield before the
+# wings - so the most specialised slots get first pick of the roster.
+AUTOFILL_ORDER = [
+    "FB", "CHB", "LHB", "RHB", "LBP", "RBP",
+    "R", "RR", "RO", "C", "LW", "RW",
+    "FF", "CHF", "LHF", "RHF", "LFP", "RFP",
+]
+
+# How an empty lineup slot reads in every lineup view.
+EMPTY_SLOT = "EMPTY"
 
 # Row groupings used by format_lineup_description below - display only,
 # distinct from AFL_POSITIONS which is the actual slot order used for
@@ -142,12 +154,17 @@ async def clear_departed_players_from_lineups(db, player_ids, old_team_id=None):
 
 
 async def team_playing_this_round(db, team_id, round_number):
-    """True if team_id has a fixture (as home or away) in round_number.
-    Used to block lineup submission for teams on a bye or already
-    eliminated from the finals - there's nothing to submit a lineup for."""
+    """True if team_id has a fixture (as home or away) in round_number of
+    the ACTIVE season. Used to block lineup submission for teams on a bye
+    or already eliminated from the finals - there's nothing to submit a
+    lineup for. Scoped to the active season because round numbers repeat
+    every season: unscoped, a team that played a round-25 final in an
+    earlier season counted as playing this season's round 25 too (so a
+    4-team wildcard round announced 6 lineups)."""
     cursor = await db.execute(
         """SELECT 1 FROM matches
            WHERE round_number = ? AND (home_team_id = ? OR away_team_id = ?)
+             AND season_id = (SELECT season_id FROM seasons WHERE status = 'active' LIMIT 1)
            LIMIT 1""",
         (round_number, team_id, team_id)
     )
@@ -230,8 +247,15 @@ async def validate_lineup(db, team_id, current_round):
     return errors, player_ids
 
 
-async def auto_fill_lineup(db, team_id, current_round):
-    """Automatically repairs a team's full 23-slot lineup by maximizing
+async def auto_fill_lineup(db, team_id, current_round, from_main_lineup=False):
+    """from_main_lineup: first reset the team's live lineup to its saved
+    main lineup (starting_lineups), if it has one, and build from that -
+    used by the Autofill button. Each slot that changes in the reset is
+    listed in `changes` as "{slot}: {name} ({ovr}) - main lineup". The
+    repair below then runs on the main lineup exactly as it would on any
+    lineup.
+
+    Automatically repairs a team's full 23-slot lineup by maximizing
     overall team strength, reusing match_sim.py's own scoring
     (_team_strengths/Player.effective_ovr) - the same math the simulator
     itself uses, so this is automatically aware of out-of-position
@@ -244,8 +268,9 @@ async def auto_fill_lineup(db, team_id, current_round):
     tool (a repair pass, not a full lineup optimizer).
 
     Invalid slots (empty, injured, suspended, or a duplicate of an earlier
-    slot in the whole lineup - see below) are processed one at a time, in
-    AFL_POSITIONS order (starting slots first, then interchange). For each,
+    slot in the whole lineup - see below) are processed one at a time,
+    starting slots first in AUTOFILL_ORDER (key positions, then flanks,
+    then pockets; inside midfield before the wings), then interchange. For each,
     every legal candidate is considered:
       - any currently-unclaimed, available reserve - scored by the single
         resulting team strength of putting them in this slot
@@ -298,6 +323,26 @@ async def auto_fill_lineup(db, team_id, current_round):
         (team_id,)
     )
     roster = {row[0]: {"name": row[1], "position": row[2], "ovr": row[3]} for row in await cursor.fetchall()}
+
+    reverted = []
+    if from_main_lineup:
+        cursor = await db.execute("SELECT lineup_data FROM starting_lineups WHERE team_id = ?", (team_id,))
+        saved = await cursor.fetchone()
+        if saved:
+            main = {pos: int(pid) for pos, pid in json.loads(saved[0]).items() if pos in AFL_POSITIONS}
+            cursor = await db.execute("SELECT position_name, player_id FROM lineups WHERE team_id = ?", (team_id,))
+            live = dict(await cursor.fetchall())
+            if main != live:
+                await db.execute("DELETE FROM lineups WHERE team_id = ?", (team_id,))
+                for pos, player_id in main.items():
+                    await db.execute(
+                        "INSERT INTO lineups (team_id, player_id, slot_number, position_name) VALUES (?, ?, ?, ?)",
+                        (team_id, player_id, AFL_POSITIONS.index(pos) + 1, pos)
+                    )
+                for pos in AFL_POSITIONS:
+                    if pos in main and main[pos] != live.get(pos) and main[pos] in roster:
+                        info = roster[main[pos]]
+                        reverted.append(f"{pos}: {info['name']} ({info['ovr']}) - main lineup")
 
     cursor = await db.execute(
         "SELECT slot_number, position_name, player_id FROM lineups WHERE team_id = ? ORDER BY slot_number",
@@ -370,6 +415,7 @@ async def auto_fill_lineup(db, team_id, current_round):
             target_list.append(slot)
         else:
             seen_player_ids.add(player_id)
+    invalid_starting_slots.sort(key=AUTOFILL_ORDER.index)
 
     def reserve_pool():
         """Roster players not currently claimed by any slot and not
@@ -417,11 +463,11 @@ async def auto_fill_lineup(db, team_id, current_round):
         pid, info = max(pool, key=lambda item: team_strength_of({slot: item[0]}))
         return pid, info, team_strength_of({slot: pid})
 
-    changes = []
+    changes = list(reverted)
     unfilled = []
 
     # Slots still needing a fill, processed in order - starting slots first
-    # (matches AFL_POSITIONS order), then interchange. Borrowing a valid
+    # (in AUTOFILL_ORDER), then interchange. Borrowing a valid
     # interchange player for a starting slot appends that player's now-
     # vacant interchange slot to the back of this queue, so it gets filled
     # afterward like any other empty slot (from reserves only - interchange
@@ -874,6 +920,16 @@ class LineupCommands(commands.Cog):
             )
             result = await cursor.fetchone()
 
+            cursor = await db.execute(
+                "SELECT setting_value FROM settings WHERE setting_key = 'bot_logs_channel_id'"
+            )
+            bot_logs_setting = await cursor.fetchone()
+
+            cursor = await db.execute("SELECT emoji_id FROM teams WHERE team_id = ?", (team_id,))
+            emoji_row = await cursor.fetchone()
+            team_display = (get_team_emoji_str(self.bot, emoji_row[0])
+                            if emoji_row and emoji_row[0] else f"**{team_name}** ")
+
         # Build response message
         response = ""
         if delisted_players:
@@ -888,39 +944,41 @@ class LineupCommands(commands.Cog):
                 response += "\n\n"
             response += "\n".join(errors)
 
-        await interaction.response.send_message(response)
+        await interaction.response.send_message(response, ephemeral=True)
+
+        if not delisted_players:
+            return
+
+        # "A", "A & B", "A, B, & C"
+        names = [f"**{full_name}** ({position}, {age}, {rating})" for full_name, position, rating, age in delisted_players]
+        if len(names) == 1:
+            player_list = names[0]
+        elif len(names) == 2:
+            player_list = f"{names[0]} & {names[1]}"
+        else:
+            player_list = ", ".join(names[:-1]) + f", & {names[-1]}"
 
         # Log to delist channel if configured
-        if result and result[0] and delisted_players:
+        if result and result[0]:
             try:
                 log_channel = interaction.guild.get_channel(int(result[0]))
                 if log_channel:
-                    if len(delisted_players) == 1:
-                        full_name, position, rating, age = delisted_players[0]
-                        embed = discord.Embed(
-                            title="Player Delisted",
-                            color=discord.Color.red(),
-                            description=f"**{full_name}** ({position}, {rating} OVR, {age}yo) has been delisted from **{team_name}**."
-                        )
-                        embed.set_footer(text=f"Delisted by {interaction.user.display_name}")
-                        await log_channel.send(embed=embed)
-                    else:
-                        embed = discord.Embed(
-                            title=f"{len(delisted_players)} Players Delisted",
-                            color=discord.Color.red(),
-                            description=f"**{team_name}** delisted:"
-                        )
-                        for full_name, position, rating, age in delisted_players:
-                            embed.add_field(
-                                name=full_name,
-                                value=f"{position}, {rating} OVR, {age}yo",
-                                inline=True
-                            )
-                        embed.set_footer(text=f"Delisted by {interaction.user.display_name}")
-                        await log_channel.send(embed=embed)
+                    await log_channel.send(f"{team_display}have delisted {player_list}")
             except Exception as e:
                 # Don't fail the command if logging fails
                 print(f"Failed to log delist: {e}")
+
+        if bot_logs_setting and bot_logs_setting[0]:
+            try:
+                bot_logs = interaction.guild.get_channel(int(bot_logs_setting[0]))
+                if bot_logs:
+                    count = len(delisted_players)
+                    await bot_logs.send(
+                        f"{team_display}have delisted {count} player{'s' if count != 1 else ''} "
+                        f"({interaction.user.mention})"
+                    )
+            except Exception as e:
+                print(f"Failed to log delist to bot logs channel: {e}")
 
 
 async def build_team_lineup_menu(db, bot, team_id, team_name=None):
@@ -1554,7 +1612,7 @@ class TeamLineupMenu(discord.ui.View):
                     else:
                         row_text.append("*Unknown*")
                 else:
-                    row_text.append("*Empty*")
+                    row_text.append(EMPTY_SLOT)
             field_text += f"**{line_name}:**  {', '.join(row_text)}\n"
 
         field_text += "\n"
@@ -1571,7 +1629,7 @@ class TeamLineupMenu(discord.ui.View):
                 else:
                     int_players.append("*Unknown*")
             else:
-                int_players.append("*Empty*")
+                int_players.append(EMPTY_SLOT)
         field_text += f"**Int:**  {', '.join(int_players)}"
 
         embed.description = field_text
@@ -1616,7 +1674,7 @@ class TeamLineupMenu(discord.ui.View):
                     p = self.lineup[pos_name]
                     row_text.append(f"{p['name']} ({_display_ovr(pos_name, p)}){status_badge(pos_name)}")
                 else:
-                    row_text.append("*Empty*")
+                    row_text.append(EMPTY_SLOT)
             field_text += f"**{line_name}:**  {', '.join(row_text)}\n"
 
         field_text += "\n"
@@ -1628,7 +1686,7 @@ class TeamLineupMenu(discord.ui.View):
                 p = self.lineup[pos_name]
                 int_players.append(f"{p['name']} ({p['rating']}){status_badge(pos_name)}")
             else:
-                int_players.append("*Empty*")
+                int_players.append(EMPTY_SLOT)
         field_text += f"**Int:**  {', '.join(int_players)}"
 
         embed.description = field_text
@@ -1778,12 +1836,7 @@ class LineupView(discord.ui.View):
             self.add_item(PlayerSelect(self.selected_position, self))
             # Add pagination buttons if needed
             total_players = self.get_sorted_roster_count()
-            if total_players > 25:
-                total_pages = (total_players + 24) // 25
-                if self.player_page > 0:
-                    self.add_item(PrevPageButton(self, total_pages))
-                if (self.player_page + 1) * 25 < total_players:
-                    self.add_item(NextPageButton(self, total_pages))
+            add_page_buttons(self, self.player_page, (total_players + 24) // 25, self._go_to_player_page, row=2)
 
         # Add autofill, clear, and main menu buttons
         self.add_item(AutofillButton(self))
@@ -1925,13 +1978,19 @@ class LineupView(discord.ui.View):
         for group_label, count, names in self.get_key_position_overload():
             self.warnings.append(f"❗ **Too many key position players in {group_label}:** {count} ({', '.join(names)})")
 
+    async def _go_to_player_page(self, interaction: discord.Interaction, page):
+        self.player_page = page
+        self.add_position_buttons()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
     async def do_autofill(self, interaction: discord.Interaction):
         """Actually run autofill after confirmation - called by
-        ConfirmActionView via AutofillButton. Fills every empty slot and
-        replaces every invalid occupant (injured, suspended, or a duplicate
-        elsewhere in the lineup) using auto_fill_lineup - the same repair
-        logic the Announce Lineups panel's Force-submit button uses. Valid
-        slots are never touched. interaction here is the CONFIRM button's
+        ConfirmActionView via AutofillButton. Resets the lineup to the
+        team's main lineup (if it has one saved), then fills every empty
+        slot and replaces every invalid occupant (injured, suspended, or a
+        duplicate elsewhere in the lineup) using auto_fill_lineup - the same
+        repair logic the Announce Lineups panel's Force-submit button uses
+        (which doesn't reset to the main lineup). interaction here is the CONFIRM button's
         own interaction (already responded to by ConfirmActionView) - its
         edit_original_response updates the confirmation prompt itself,
         while self.message (captured once when this editor was first
@@ -1954,7 +2013,7 @@ class LineupView(discord.ui.View):
                 )
                 return
 
-            changes, unfilled = await auto_fill_lineup(db, self.team_id, current_round)
+            changes, unfilled = await auto_fill_lineup(db, self.team_id, current_round, from_main_lineup=True)
             await unconfirm_lineup(db, self.team_id)
             await db.commit()
 
@@ -2054,7 +2113,8 @@ def build_lineup_field_text(lineup, selected_position=None, injured_ids=frozense
     above (the posted lineup-channel message - no selection or badges, so
     those args are left at their defaults), and scratch_lineup.py's
     scratch-team editor (no roster-wide injury data available) - every
-    lineup rendering in the bot goes through this one function."""
+    lineup rendering in the bot goes through this one function. The
+    selected position is in bold; an empty slot reads EMPTY_SLOT."""
     def status_badge(player_info):
         player_id = player_info.get('player_id')
         if player_id in injured_ids:
@@ -2063,28 +2123,23 @@ def build_lineup_field_text(lineup, selected_position=None, injured_ids=frozense
             return " 🚫"
         return ""
 
+    def slot_text(pos_name):
+        selected = pos_name == selected_position
+        if pos_name in lineup:
+            p = lineup[pos_name]
+            text = f"{p['name']} ({_display_ovr(pos_name, p)}){status_badge(p)}"
+        else:
+            text = EMPTY_SLOT
+        return f"**{text}**" if selected else text
+
     field_text = ""
     for line_name, positions in _LINEUP_DISPLAY_ROWS:
-        row_text = []
-        for pos_name in positions:
-            prefix = "→ " if pos_name == selected_position else ""
-            if pos_name in lineup:
-                p = lineup[pos_name]
-                row_text.append(f"{prefix}{p['name']} ({_display_ovr(pos_name, p)}){status_badge(p)}")
-            else:
-                row_text.append(f"{prefix}*Empty*")
+        row_text = [slot_text(pos_name) for pos_name in positions]
         field_text += f"**{line_name}:**  {', '.join(row_text)}\n"
 
     field_text += "\n"
 
-    int_players = []
-    for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]:
-        prefix = "→ " if pos_name == selected_position else ""
-        if pos_name in lineup:
-            p = lineup[pos_name]
-            int_players.append(f"{prefix}{p['name']} ({_display_ovr(pos_name, p)}){status_badge(p)}")
-        else:
-            int_players.append(f"{prefix}*Empty*")
+    int_players = [slot_text(pos_name) for pos_name in ["INT1", "INT2", "INT3", "INT4", "INT5"]]
 
     field_text += f"**Int:**  {', '.join(int_players)}"
     return field_text
@@ -2208,32 +2263,6 @@ class PositionSelect(discord.ui.Select):
         await interaction.response.edit_message(embed=embed, view=self.parent_view)
 
 
-class PrevPageButton(discord.ui.Button):
-    def __init__(self, parent_view, total_pages):
-        prev_page = parent_view.player_page  # 1-indexed page being navigated to
-        super().__init__(label=f"◀ Page {prev_page}/{total_pages}", style=discord.ButtonStyle.secondary, row=2)
-        self.parent_view = parent_view
-    
-    async def callback(self, interaction: discord.Interaction):
-        self.parent_view.player_page -= 1
-        self.parent_view.add_position_buttons()
-        embed = self.parent_view.create_embed()
-        await interaction.response.edit_message(embed=embed, view=self.parent_view)
-
-
-class NextPageButton(discord.ui.Button):
-    def __init__(self, parent_view, total_pages):
-        next_page = parent_view.player_page + 2  # 1-indexed page being navigated to
-        super().__init__(label=f"Page {next_page}/{total_pages} ▶", style=discord.ButtonStyle.secondary, row=2)
-        self.parent_view = parent_view
-    
-    async def callback(self, interaction: discord.Interaction):
-        self.parent_view.player_page += 1
-        self.parent_view.add_position_buttons()
-        embed = self.parent_view.create_embed()
-        await interaction.response.edit_message(embed=embed, view=self.parent_view)
-
-
 class AutofillButton(discord.ui.Button):
     def __init__(self, parent_view):
         super().__init__(label="⚡ Autofill", style=discord.ButtonStyle.success, row=3)
@@ -2249,8 +2278,9 @@ class AutofillButton(discord.ui.Button):
         back to this message."""
         confirmation_view = ConfirmActionView(self.parent_view, 'do_autofill', discord.ButtonStyle.success)
         message = (
-            "⚡ **Autofill?**\n\nAutofill will automatically fill empty position slots "
-            "and replace injured/suspended players. Are you sure you wish to continue?"
+            "⚡ **Autofill?**\n\nAutofill will reset your lineup to your main lineup (if you have one "
+            "saved), then fill any empty position slots and replace injured/suspended players. "
+            "Are you sure you wish to continue?"
         )
         await interaction.response.send_message(message, view=confirmation_view, ephemeral=True)
 

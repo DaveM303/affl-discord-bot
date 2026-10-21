@@ -5,11 +5,20 @@ from discord import app_commands
 import aiosqlite
 from config import DB_PATH, ADMIN_ROLE_ID
 from commands.season_commands import get_round_name
-from utils import is_admin_user, get_team_emoji_str
+from utils import is_admin_user, get_team_emoji_str, DEFAULT_OFFSEASON_WEEKS
+
+
+def next_season_return_round(return_round, total_rounds, offseason_weeks=DEFAULT_OFFSEASON_WEEKS):
+    """The round of NEXT season an injured player is back for, from their
+    current-season return_round - the same carryover /startseason applies
+    (weeks left after the season's last round, less the offseason). 1 if
+    they'll have recovered during the offseason."""
+    return max(return_round - total_rounds - offseason_weeks, 1)
 
 
 async def build_injury_suspension_list(bot, db, current_round, total_rounds, filter_team_id=None,
-                                        season_id=None, regular_rounds=None, new_this_round=None):
+                                        season_id=None, regular_rounds=None, new_this_round=None,
+                                        offseason=False, offseason_weeks=DEFAULT_OFFSEASON_WEEKS):
     """Shared combined injuries+suspensions list builder, returned as a list
     of display-ready lines (headers, entries, blank separator) - the same
     format post_injury_list_to_channel renders, factored out so
@@ -38,7 +47,16 @@ async def build_injury_suspension_list(bot, db, current_round, total_rounds, fil
     calls in BEFORE the increment, where current_round already IS that
     round) - safer for each caller to just say explicitly which round
     counts as "new" than to bake in one of those two off-by-one
-    assumptions here. None (the default) bolds nothing."""
+    assumptions here. None (the default) bolds nothing.
+
+    offseason: the season is over - each injury shows the round of NEXT
+    season the player is available from (see next_season_return_round,
+    with offseason_weeks - the length /endseason set) instead of weeks
+    left, and no team is left out as eliminated (pass no season_id either
+    way for that).
+
+    Delisted players (no team) are never listed - nobody is waiting on
+    them for a match."""
     eliminated_team_ids = set()
     if season_id is not None and regular_rounds is not None and current_round > regular_rounds:
         from commands.season_commands import get_eliminated_finals_team_ids
@@ -60,7 +78,7 @@ async def build_injury_suspension_list(bot, db, current_round, total_rounds, fil
                FROM injuries i
                JOIN players p ON i.player_id = p.player_id
                LEFT JOIN teams t ON p.team_id = t.team_id
-               WHERE i.status = 'injured'
+               WHERE i.status = 'injured' AND p.team_id IS NOT NULL
                ORDER BY t.team_name ASC, i.return_round ASC, p.name ASC"""
         )
     injuries = [row for row in await cursor.fetchall() if row[6] not in eliminated_team_ids]
@@ -81,7 +99,7 @@ async def build_injury_suspension_list(bot, db, current_round, total_rounds, fil
                FROM suspensions s
                JOIN players p ON s.player_id = p.player_id
                LEFT JOIN teams t ON p.team_id = t.team_id
-               WHERE s.status = 'suspended'
+               WHERE s.status = 'suspended' AND p.team_id IS NOT NULL
                ORDER BY t.team_name ASC, s.games_remaining ASC, p.name ASC"""
         )
     suspensions = [row for row in await cursor.fetchall() if row[6] not in eliminated_team_ids]
@@ -101,6 +119,8 @@ async def build_injury_suspension_list(bot, db, current_round, total_rounds, fil
                 # happened in hasn't finished being advanced past yet (see
                 # season_commands.py's _roll_pending_injury_recoveries).
                 status = "- TBC"
+            elif offseason:
+                status = f"- Round {next_season_return_round(return_round, total_rounds, offseason_weeks)}"
             else:
                 weeks_left = return_round - current_round
                 if weeks_left <= 0:
@@ -189,7 +209,12 @@ class InjuryCommands(commands.Cog):
         interaction: discord.Interaction,
         current: str,
     ) -> list[app_commands.Choice[str]]:
-        """Autocomplete for player names with format: Team Name (POS, age, OVR)"""
+        """Autocomplete for player names with format: Team Name (POS, age, OVR).
+        Admins only - the cog's interaction_check doesn't run for autocomplete,
+        so without this any member could read every player's OVR (Draft Pool
+        prospects included) just by typing the command."""
+        if not await is_admin_user(interaction):
+            return []
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
                 """SELECT p.player_id, p.name, p.position, p.age, p.overall_rating, t.team_name
@@ -420,7 +445,7 @@ class InjuryCommands(commands.Cog):
         embeds = []
         for i, description in enumerate(descriptions):
             embeds.append(discord.Embed(
-                title=f"Injury & Suspension List - {round_display}" if i == 0 else None,
+                title=f"Injuries & Suspensions - {round_display}" if i == 0 else None,
                 description=description,
                 color=discord.Color.red(),
             ))

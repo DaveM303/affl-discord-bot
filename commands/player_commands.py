@@ -1,10 +1,10 @@
-import re
 import discord
 from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH
-from utils import get_team_emoji_str, build_team_options, fetch_teams_for_dropdown
+from utils import (get_team_emoji_str, build_team_options, fetch_teams_for_dropdown, DEFAULT_OFFSEASON_WEEKS, add_page_buttons,
+                   fetch_stat_seasons, add_season_select)
 
 class PlayerCommands(commands.Cog):
     def __init__(self, bot):
@@ -311,8 +311,6 @@ class PlayerCommands(commands.Cog):
     @app_commands.describe(team_name="Name of the team (leave empty for all teams)")
     @app_commands.autocomplete(team_name=team_name_autocomplete)
     async def injurylist(self, interaction: discord.Interaction, team_name: str = None):
-        from commands.season_commands import get_round_name
-
         await interaction.response.defer(ephemeral=True)
         async with aiosqlite.connect(DB_PATH) as db:
             team_id = None
@@ -345,161 +343,24 @@ class PlayerCommands(commands.Cog):
 
             season_id, season_number, current_round, regular_rounds, total_rounds, status = season
 
+            # The same line builder as the posted list and round summaries
+            # (injury_commands.build_injury_suspension_list), so every
+            # injury list reads the same. Deliberately NOT filtered by
+            # finals elimination (no season_id passed): this is a public
+            # reference list people check for any player - an eliminated
+            # club's injuries still matter for trade/draft planning and next
+            # season. In the offseason each injury shows the round of next
+            # season the player is back for.
+            from commands.injury_commands import build_injury_suspension_list
+            offseason_weeks = None
             if status == 'offseason':
-                # No live "current round" to compare against during the
-                # offseason - return_round is still expressed in the OLD
-                # season's round numbers (carryover into the new season's
-                # numbering only happens once /startseason actually runs,
-                # since it needs an admin-supplied offseason_weeks value -
-                # see season_commands.py's start_season). Estimate using
-                # that command's own default (23) so the round shown here
-                # lines up with what /startseason will produce if run with
-                # its default, but it's still just an estimate - offseason_weeks
-                # can be overridden at that point in time.
-                default_offseason_weeks = 23
-                if team_id:
-                    cursor = await db.execute(
-                        """SELECT p.name, p.overall_rating, i.injury_type, i.return_round, t.team_name, t.emoji_id
-                           FROM injuries i
-                           JOIN players p ON i.player_id = p.player_id
-                           LEFT JOIN teams t ON p.team_id = t.team_id
-                           WHERE i.status = 'injured' AND p.team_id = ?
-                           ORDER BY i.return_round ASC, p.name ASC""",
-                        (team_id,)
-                    )
-                else:
-                    cursor = await db.execute(
-                        """SELECT p.name, p.overall_rating, i.injury_type, i.return_round, t.team_name, t.emoji_id
-                           FROM injuries i
-                           JOIN players p ON i.player_id = p.player_id
-                           LEFT JOIN teams t ON p.team_id = t.team_id
-                           WHERE i.status = 'injured'
-                           ORDER BY t.team_name ASC, i.return_round ASC, p.name ASC"""
-                    )
-                injuries = await cursor.fetchall()
-
-                if team_id:
-                    cursor = await db.execute(
-                        """SELECT p.name, p.overall_rating, s.suspension_reason, s.games_remaining, t.team_name, t.emoji_id
-                           FROM suspensions s
-                           JOIN players p ON s.player_id = p.player_id
-                           LEFT JOIN teams t ON p.team_id = t.team_id
-                           WHERE s.status = 'suspended' AND p.team_id = ?
-                           ORDER BY s.games_remaining ASC, p.name ASC""",
-                        (team_id,)
-                    )
-                else:
-                    cursor = await db.execute(
-                        """SELECT p.name, p.overall_rating, s.suspension_reason, s.games_remaining, t.team_name, t.emoji_id
-                           FROM suspensions s
-                           JOIN players p ON s.player_id = p.player_id
-                           LEFT JOIN teams t ON p.team_id = t.team_id
-                           WHERE s.status = 'suspended'
-                           ORDER BY t.team_name ASC, s.games_remaining ASC, p.name ASC"""
-                    )
-                suspensions = await cursor.fetchall()
-
-                lines = []
-                if injuries:
-                    lines.append("**🚑 Injuries:**")
-                    for name, ovr, injury_type, return_round, t_name, emoji_id in injuries:
-                        team_display = get_team_emoji_str(self.bot, emoji_id) if t_name and not team_id else ""
-                        weeks_remaining = return_round - total_rounds
-                        new_season_round = max(weeks_remaining - default_offseason_weeks, 1)
-                        lines.append(f"{team_display}{name} ({ovr}) - {injury_type} - Round {new_season_round}")
-
-                if suspensions:
-                    if injuries:
-                        lines.append("")
-                    lines.append("**🚫 Suspensions:**")
-                    for name, ovr, suspension_reason, games_remaining, t_name, emoji_id in suspensions:
-                        team_display = get_team_emoji_str(self.bot, emoji_id) if t_name and not team_id else ""
-                        display_reason = re.sub(r' - (low|medium|high) impact$', '', suspension_reason)
-                        game_text = "match" if games_remaining == 1 else "matches"
-                        lines.append(f"{team_display}{name} ({ovr}) - {display_reason} - {games_remaining} {game_text}")
-
-                embed = discord.Embed(
-                    title=f"{team_title} - Injuries & Suspensions",
-                    description="\n".join(lines) if lines else "No current injuries or suspensions.",
-                    color=discord.Color.blue()
-                )
-                await interaction.followup.send(embed=embed)
-                return
-
-            # Deliberately NOT filtered by finals elimination. This is a
-            # public reference list people check for any player - an
-            # eliminated club's injuries still matter for trade/draft
-            # planning and next season, so /injurylist shows every team all
-            # year. The round-by-round list posted to the injury channel
-            # (build_injury_suspension_list in injury_commands.py) DOES
-            # exclude eliminated teams, since that one is about who is
-            # available for the matches still to be played.
-
-            if team_id:
-                cursor = await db.execute(
-                    """SELECT p.name, p.overall_rating, i.injury_type, i.return_round, t.team_name, t.emoji_id, p.team_id
-                       FROM injuries i
-                       JOIN players p ON i.player_id = p.player_id
-                       LEFT JOIN teams t ON p.team_id = t.team_id
-                       WHERE i.status = 'injured' AND p.team_id = ?
-                       ORDER BY i.return_round ASC, p.name ASC""",
-                    (team_id,)
-                )
-            else:
-                cursor = await db.execute(
-                    """SELECT p.name, p.overall_rating, i.injury_type, i.return_round, t.team_name, t.emoji_id, p.team_id
-                       FROM injuries i
-                       JOIN players p ON i.player_id = p.player_id
-                       LEFT JOIN teams t ON p.team_id = t.team_id
-                       WHERE i.status = 'injured'
-                       ORDER BY t.team_name ASC, i.return_round ASC, p.name ASC"""
-                )
-            injuries = await cursor.fetchall()
-
-            if team_id:
-                cursor = await db.execute(
-                    """SELECT p.name, p.overall_rating, s.suspension_reason, s.games_remaining, t.team_name, t.emoji_id, p.team_id
-                       FROM suspensions s
-                       JOIN players p ON s.player_id = p.player_id
-                       LEFT JOIN teams t ON p.team_id = t.team_id
-                       WHERE s.status = 'suspended' AND p.team_id = ?
-                       ORDER BY s.games_remaining ASC, p.name ASC""",
-                    (team_id,)
-                )
-            else:
-                cursor = await db.execute(
-                    """SELECT p.name, p.overall_rating, s.suspension_reason, s.games_remaining, t.team_name, t.emoji_id, p.team_id
-                       FROM suspensions s
-                       JOIN players p ON s.player_id = p.player_id
-                       LEFT JOIN teams t ON p.team_id = t.team_id
-                       WHERE s.status = 'suspended'
-                       ORDER BY t.team_name ASC, s.games_remaining ASC, p.name ASC"""
-                )
-            suspensions = await cursor.fetchall()
-
-            lines = []
-            if injuries:
-                lines.append("**🚑 Injuries:**")
-                for name, ovr, injury_type, return_round, t_name, emoji_id, _ in injuries:
-                    team_display = get_team_emoji_str(self.bot, emoji_id) if t_name and not team_id else ""
-                    weeks_left = return_round - current_round
-                    if weeks_left <= 0:
-                        status_text = "✅ Recovered"
-                    else:
-                        week_text = "week" if weeks_left == 1 else "weeks"
-                        season_indicator = " (SEASON)" if return_round > total_rounds else ""
-                        status_text = f"{weeks_left} {week_text}{season_indicator}"
-                    lines.append(f"{team_display}{name} ({ovr}) - {injury_type} - {status_text}")
-
-            if suspensions:
-                if injuries:
-                    lines.append("")
-                lines.append("**🚫 Suspensions:**")
-                for name, ovr, suspension_reason, games_remaining, t_name, emoji_id, _ in suspensions:
-                    team_display = get_team_emoji_str(self.bot, emoji_id) if t_name and not team_id else ""
-                    display_reason = re.sub(r' - (low|medium|high) impact$', '', suspension_reason)
-                    game_text = "match" if games_remaining == 1 else "matches"
-                    lines.append(f"{team_display}{name} ({ovr}) - {display_reason} - {games_remaining} {game_text}")
+                cursor = await db.execute("SELECT offseason_weeks FROM seasons WHERE season_id = ?", (season_id,))
+                offseason_weeks = (await cursor.fetchone())[0]
+            lines = await build_injury_suspension_list(
+                self.bot, db, current_round, total_rounds, filter_team_id=team_id,
+                offseason=status == 'offseason',
+                offseason_weeks=offseason_weeks if offseason_weeks is not None else DEFAULT_OFFSEASON_WEEKS,
+            )
 
             embed = discord.Embed(
                 title=f"{team_title} - Injuries & Suspensions",
@@ -550,7 +411,7 @@ async def resolve_profile_season(db):
     """The season a profile's stats are shown for: active or offseason,
     active preferred. Offseason still belongs to the season that just
     finished (see the same status IN ('active', 'offseason') convention in
-    /exportdata and register_persistent_round_summary_views), so profiles
+    register_persistent_round_summary_views), so profiles
     keep showing that season's stats through the offseason rather than
     falling through to a 'future' placeholder season
     (ensure_future_seasons_exist keeps several of those ahead with higher
@@ -583,6 +444,7 @@ async def fetch_player_profile_data(db, player_id, season_id):
         return None
 
     data = {
+        'season_id': season_id,
         'player_id': row[0],
         'name': row[1],
         'position': row[2],
@@ -625,21 +487,8 @@ async def fetch_player_profile_data(db, player_id, season_id):
     )
     data['career_games'] = (await cursor.fetchone())[0]
 
-    # Availability. Mirrors the status wording used by /injurylist.
-    cursor = await db.execute(
-        """SELECT injury_type, return_round FROM injuries
-           WHERE player_id = ? AND status = 'injured'""",
-        (player_id,)
-    )
-    injury = await cursor.fetchone()
-    cursor = await db.execute(
-        """SELECT suspension_reason, games_remaining FROM suspensions
-           WHERE player_id = ? AND status = 'suspended'""",
-        (player_id,)
-    )
-    suspension = await cursor.fetchone()
-    data['injury'] = injury
-    data['suspension'] = suspension
+    # The seasons the player played in, for the profile's season dropdown.
+    data['seasons'] = await fetch_stat_seasons(db, player_id)
 
     return data
 
@@ -666,18 +515,7 @@ def build_player_profile_embed(cog, data, season_number, per_game=False):
     if data['team_name'] is None:
         header_bits.append("*Delisted*")
 
-    # Availability line, only when there's something to report.
-    if data['suspension']:
-        reason, games_remaining = data['suspension']
-        display_reason = re.sub(r' - (low|medium|high) impact$', '', reason)
-        game_text = "match" if games_remaining == 1 else "matches"
-        header_bits.append(f"🟥 Suspended - {display_reason} ({games_remaining} {game_text})")
-    elif data['injury']:
-        injury_type, return_round = data['injury']
-        if return_round:
-            header_bits.append(f"🏥 Injured - {injury_type} (returns Round {return_round})")
-        else:
-            header_bits.append(f"🏥 Injured - {injury_type}")
+    # Injuries and suspensions aren't shown here - see /injurylist.
 
     embed = discord.Embed(
         title=title,
@@ -746,26 +584,213 @@ class PlayerProfileView(discord.ui.View):
         if self.data['games_played'] > 0:
             toggle = discord.ui.Button(
                 label="Show Totals" if self.per_game else "Show Averages",
-                style=discord.ButtonStyle.primary
+                style=discord.ButtonStyle.primary, row=0
             )
             toggle.callback = self.toggle_mode
             self.add_item(toggle)
 
+            game_log = discord.ui.Button(label="📋 View Per-Match Stats", style=discord.ButtonStyle.secondary, row=0)
+            game_log.callback = self.open_game_log
+            self.add_item(game_log)
+
         if self.back_view is not None:
-            back = discord.ui.Button(label="◀ Back", style=discord.ButtonStyle.secondary)
+            back = discord.ui.Button(label="◀ Back", style=discord.ButtonStyle.secondary, row=0)
             back.callback = self.go_back
             self.add_item(back)
+
+        add_season_select(self, self.data.get('seasons', []), self.data['season_id'], self.season_number,
+                          self._switch_season, row=1)
+
+    async def _switch_season(self, interaction: discord.Interaction, season_id, season_number):
+        async with aiosqlite.connect(DB_PATH) as db:
+            data = await fetch_player_profile_data(db, self.data['player_id'], season_id)
+        if data is None:
+            await interaction.response.send_message("❌ That player no longer exists.", ephemeral=True)
+            return
+        self.data = data
+        self.season_number = season_number
+        self.update_components()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
     async def toggle_mode(self, interaction: discord.Interaction):
         self.per_game = not self.per_game
         self.update_components()
         await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
+    async def open_game_log(self, interaction: discord.Interaction):
+        await open_game_log(interaction, self.data['player_id'], self.data['season_id'],
+                            back_view=self, back_embed=self.create_embed())
+
     async def go_back(self, interaction: discord.Interaction):
         embed = self.back_embed
         if embed is None and hasattr(self.back_view, 'create_embed'):
             embed = self.back_view.create_embed()
         await interaction.response.edit_message(embed=embed, view=self.back_view)
+
+
+# ---------------------------------------------------------------------------
+# Per-match stats ("game log") - every game a player played in a season, one line each
+# ---------------------------------------------------------------------------
+
+GAME_LOG_GAMES_PER_PAGE = 15
+# Finals slot codes (finals_bracket.slot_code) shortened for a game log line.
+FINALS_SHORT = {"WC": "WC", "QF": "QF", "EF": "EF", "SF": "SF", "PF": "PF", "GF": "GF"}
+
+
+async def fetch_game_log(db, player_id, season_id):
+    """Every game player_id played in season_id, in round order, as dicts:
+    match_id, round (short label - "R5", or a finals code like "QF"),
+    opponent name/emoji id, result text from the player's side ("W by 12"),
+    and their stats."""
+    cursor = await db.execute(
+        """SELECT m.match_id, m.round_number, s.regular_rounds, pms.team_id, m.home_team_id,
+                  m.home_score, m.away_score, ht.team_name, ht.emoji_id, at.team_name, at.emoji_id,
+                  fb.slot_code, pms.disposals, pms.goals, pms.behinds, pms.marks, pms.tackles,
+                  pms.spoils, pms.hitouts
+           FROM player_match_stats pms
+           JOIN matches m ON pms.match_id = m.match_id
+           JOIN seasons s ON m.season_id = s.season_id
+           JOIN teams ht ON m.home_team_id = ht.team_id
+           JOIN teams at ON m.away_team_id = at.team_id
+           LEFT JOIN finals_bracket fb ON fb.match_id = m.match_id
+           WHERE pms.player_id = ? AND m.season_id = ?
+           ORDER BY m.round_number, m.match_id""",
+        (player_id, season_id)
+    )
+    games = []
+    for (match_id, round_number, regular_rounds, team_id, home_id, home_score, away_score,
+         home_name, home_emoji, away_name, away_emoji, slot_code, disposals, goals, behinds,
+         marks, tackles, spoils, hitouts) in await cursor.fetchall():
+        at_home = team_id == home_id
+        own, opp = (home_score, away_score) if at_home else (away_score, home_score)
+        result = f"W by {own - opp}" if own > opp else f"L by {opp - own}" if own < opp else "Drew"
+        label = FINALS_SHORT.get((slot_code or "")[:2]) if round_number > regular_rounds else None
+        games.append({
+            "match_id": match_id, "round": label or f"R{round_number}", "result": result,
+            "opponent": away_name if at_home else home_name,
+            "opponent_emoji_id": away_emoji if at_home else home_emoji,
+            "disposals": disposals, "goals": goals, "behinds": behinds, "marks": marks,
+            "tackles": tackles, "spoils": spoils, "hitouts": hitouts,
+        })
+    return games
+
+
+async def open_game_log(interaction, player_id, season_id, back_view=None, back_embed=None):
+    """Shows a player's game log for a season, in place of the current
+    message - from a profile's Game Log button, or a player's line on the
+    match stats screen. Back returns to back_view."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT p.name, t.emoji_id, s.season_number FROM players p
+               LEFT JOIN teams t ON p.team_id = t.team_id
+               LEFT JOIN seasons s ON s.season_id = ?
+               WHERE p.player_id = ?""",
+            (season_id, player_id)
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            await interaction.response.send_message("❌ That player no longer exists.", ephemeral=True)
+            return
+        games = await fetch_game_log(db, player_id, season_id)
+    name, emoji_id, season_number = row
+    view = GameLogView(interaction.client, name, emoji_id, season_number, games, back_view, back_embed)
+    await interaction.response.edit_message(content=None, embed=view.create_embed(), view=view)
+
+
+class GameLogView(discord.ui.View):
+    """A player's game log for one season: one line per game - round,
+    opponent, result, and their stats - GAME_LOG_GAMES_PER_PAGE games a
+    page. "Open a game..." shows that match's full stats (Match Centre's
+    match stats screen); Back returns to whatever opened the log."""
+
+    def __init__(self, bot, name, emoji_id, season_number, games, back_view=None, back_embed=None):
+        super().__init__(timeout=1800)
+        self.bot = bot
+        self.name = name
+        self.emoji_id = emoji_id
+        self.season_number = season_number
+        self.games = games
+        self.back_view = back_view
+        self.back_embed = back_embed
+        # Hitouts only matter for players who take them - a column of zeros
+        # for everyone else would just be noise.
+        self.show_hitouts = any(game["hitouts"] for game in games)
+        self.page = 0
+        self.update_components()
+
+    @property
+    def total_pages(self):
+        return max(1, -(-len(self.games) // GAME_LOG_GAMES_PER_PAGE))
+
+    def page_games(self):
+        start = self.page * GAME_LOG_GAMES_PER_PAGE
+        return self.games[start:start + GAME_LOG_GAMES_PER_PAGE]
+
+    def game_line(self, game):
+        opponent = get_team_emoji_str(self.bot, game["opponent_emoji_id"]) or f"{game['opponent']} "
+        line = (f"`{game['round']:<3}` v {opponent}{game['result']} - "
+                f"{game['disposals']} D · {game['goals']}.{game['behinds']} · {game['marks']} M · "
+                f"{game['tackles']} T · {game['spoils']} S")
+        if self.show_hitouts:
+            line += f" · {game['hitouts']} HO"
+        return line
+
+    def create_embed(self):
+        emoji = get_team_emoji_str(self.bot, self.emoji_id)
+        season = f"Season {self.season_number} " if self.season_number else ""
+        embed = discord.Embed(
+            title=f"{emoji}{self.name} - {season}Per-Match Stats",
+            description="\n".join(self.game_line(game) for game in self.page_games()) or "No games played this season.",
+            color=discord.Color.blue(),
+        )
+        legend = "D disposals · G.B goals.behinds · M marks · T tackles · S spoils"
+        if self.show_hitouts:
+            legend += " · HO hitouts"
+        embed.set_footer(text=f"{len(self.games)} games · {legend}")
+        return embed
+
+    def update_components(self):
+        self.clear_items()
+        add_page_buttons(self, self.page, self.total_pages, self._go_to_page, row=0)
+        if self.games:
+            select = discord.ui.Select(
+                placeholder="Open a game...", row=1,
+                options=[
+                    discord.SelectOption(label=f"{game['round']} v {game['opponent']} - {game['result']}"[:100],
+                                         value=str(game["match_id"]))
+                    for game in self.page_games()
+                ],
+            )
+            select.callback = self._open_game
+            self.add_item(select)
+        if self.back_view is not None:
+            back = discord.ui.Button(label="◀ Back", style=discord.ButtonStyle.secondary, row=2)
+            back.callback = self._back
+            self.add_item(back)
+
+    async def _go_to_page(self, interaction: discord.Interaction, page):
+        self.page = page
+        self.update_components()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    async def _open_game(self, interaction: discord.Interaction):
+        from commands.match_commands import _MatchStatsView
+        match_id = int(interaction.data["values"][0])
+        match_cog = self.bot.get_cog('MatchCommands')
+        async with aiosqlite.connect(DB_PATH) as db:
+            data = await match_cog._fetch_box_score_data(db, match_id) if match_cog else None
+        if data is None:
+            await interaction.response.send_message("❌ That match's stats aren't available.", ephemeral=True)
+            return
+        # Its "Main menu" button comes back to this log.
+        stats_view = _MatchStatsView(self, data)
+        await interaction.response.edit_message(content=None, embed=stats_view.create_embed(), view=stats_view)
+
+    async def _back(self, interaction: discord.Interaction):
+        embed = self.back_embed
+        if embed is None and hasattr(self.back_view, 'create_embed'):
+            embed = self.back_view.create_embed()
+        await interaction.response.edit_message(content=None, embed=embed, view=self.back_view)
 
 
 class ProfilePickSelect(discord.ui.Select):
@@ -846,6 +871,7 @@ class FilterState:
     """The current filter selections, and the query that realises them."""
 
     def __init__(self):
+        self.name = None           # part of a player's name, any case
         self.positions = []        # [] means all positions
         self.team_ids = []         # [] means all teams
         # Delisted players (team_id IS NULL) are excluded by default - the
@@ -890,6 +916,11 @@ class FilterState:
         else:
             query += " AND p.team_id IS NOT NULL"
 
+        if self.name:
+            # instr rather than LIKE, so a typed % or _ is just a character.
+            query += " AND instr(lower(p.name), lower(?)) > 0"
+            params.append(self.name)
+
         if self.positions:
             placeholders = ", ".join(["?"] * len(self.positions))
             query += f" AND p.position IN ({placeholders})"
@@ -922,17 +953,20 @@ class FilterState:
         cursor = await db.execute(query, params)
         return await cursor.fetchall()
 
-    def describe(self, team_names):
-        """Human-readable summary of the active filters. `team_names` maps
-        team_id -> team_name for rendering the team filter."""
+    def describe(self, team_labels):
+        """Human-readable summary of the active filters. `team_labels` maps
+        team_id -> how to show that team (its emoji, or its name if it has
+        no emoji the bot can show)."""
         bits = []
+        if self.name:
+            bits.append(f"Name: \"{self.name}\"")
         if self.positions:
             bits.append(f"Positions: {', '.join(self.positions)}")
         if self.team_ids or self.include_delisted:
-            names = [team_names.get(tid, str(tid)) for tid in self.team_ids]
+            labels = [team_labels.get(tid, str(tid)) for tid in self.team_ids]
             if self.include_delisted:
-                names.append("Delisted")
-            bits.append(f"Teams: {', '.join(names)}")
+                labels.append("Delisted")
+            bits.append(f"Teams: {' '.join(labels)}")
         if self.min_ovr is not None:
             bits.append(f"OVR min {self.min_ovr}")
         if self.max_ovr is not None:
@@ -1008,6 +1042,41 @@ class NumericFiltersButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(NumericFiltersModal(self.parent_view))
+
+
+class NameFilterModal(discord.ui.Modal, title="Filter by Name"):
+    """Part of a player's name - clearing it clears the filter."""
+
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+        self.name = discord.ui.TextInput(
+            label="Name contains",
+            placeholder="e.g. smith - leave blank for any name",
+            default=parent_view.state.name,
+            required=False,
+            max_length=50
+        )
+        self.add_item(self.name)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.parent_view.state.name = self.name.value.strip() or None
+        self.parent_view.current_page = 0
+        await self.parent_view.refresh(interaction)
+
+
+class NameFilterButton(discord.ui.Button):
+    def __init__(self, parent_view, row):
+        name = parent_view.state.name
+        super().__init__(
+            label=f"🔍 \"{name}\""[:80] if name else "🔍 Name",
+            style=discord.ButtonStyle.primary if name else discord.ButtonStyle.secondary,
+            row=row
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(NameFilterModal(self.parent_view))
 
 
 class ResetFiltersButton(discord.ui.Button):
@@ -1101,7 +1170,7 @@ class FilterPlayersView(discord.ui.View):
     so the filters and their results are always one panel.
 
     Row layout (Discord's cap is 5 rows, a Select taking a full row):
-        0  numeric-filters button, reset, pagination
+        0  name button, numeric-filters button, reset, pagination
         1  position dropdown
         2  team dropdown
         3  sort dropdown
@@ -1114,7 +1183,10 @@ class FilterPlayersView(discord.ui.View):
         super().__init__(timeout=300)
         self.cog = cog
         self.teams = teams                                  # [(team_id, team_name, emoji_id)]
-        self.team_names = {row[0]: row[1] for row in teams}
+        # How each team appears in the Filters line - its emoji, else its name.
+        self.team_labels = {
+            team_id: cog.get_team_emoji(emoji_id) or team_name for team_id, team_name, emoji_id in teams
+        }
         self.state = state or FilterState()
         self.players = []
         self.current_page = 0
@@ -1148,27 +1220,14 @@ class FilterPlayersView(discord.ui.View):
     def update_components(self):
         self.clear_items()
 
+        self.add_item(NameFilterButton(self, row=0))
         self.add_item(NumericFiltersButton(self, row=0))
         self.add_item(ResetFiltersButton(self, row=0))
 
-        if self.total_pages > 1:
-            prev_button = discord.ui.Button(
-                label="◀ Prev",
-                style=discord.ButtonStyle.secondary,
-                disabled=(self.current_page == 0),
-                row=0
-            )
-            prev_button.callback = self.previous_page
-            self.add_item(prev_button)
-
-            next_button = discord.ui.Button(
-                label="Next ▶",
-                style=discord.ButtonStyle.secondary,
-                disabled=(self.current_page >= self.total_pages - 1),
-                row=0
-            )
-            next_button.callback = self.next_page
-            self.add_item(next_button)
+        # Standard page buttons; no counter - the top row already holds the
+        # 3 filter buttons, and the footer shows the page.
+        add_page_buttons(self, self.current_page, self.total_pages, self._go_to_page, row=0,
+                         count_label=None)
 
         self.add_item(PositionFilterSelect(self, row=1))
         self.add_item(TeamFilterSelect(self, self.teams, row=2))
@@ -1199,7 +1258,7 @@ class FilterPlayersView(discord.ui.View):
             description=description,
             color=discord.Color.purple()
         )
-        embed.add_field(name="Filters", value=self.state.describe(self.team_names), inline=False)
+        embed.add_field(name="Filters", value=self.state.describe(self.team_labels), inline=False)
 
         if self.players and self.total_pages > 1:
             start = self.current_page * self.PLAYERS_PER_PAGE
@@ -1211,21 +1270,10 @@ class FilterPlayersView(discord.ui.View):
 
         return embed
 
-    async def previous_page(self, interaction: discord.Interaction):
-        if self.current_page > 0:
-            self.current_page -= 1
-            self.update_components()
-            await interaction.response.edit_message(embed=self.create_embed(), view=self)
-        else:
-            await interaction.response.defer()
-
-    async def next_page(self, interaction: discord.Interaction):
-        if self.current_page < self.total_pages - 1:
-            self.current_page += 1
-            self.update_components()
-            await interaction.response.edit_message(embed=self.create_embed(), view=self)
-        else:
-            await interaction.response.defer()
+    async def _go_to_page(self, interaction: discord.Interaction, page):
+        self.current_page = page
+        self.update_components()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
 
 class PlayerSearchResultsView(discord.ui.View):
@@ -1262,24 +1310,7 @@ class PlayerSearchResultsView(discord.ui.View):
         if page_players:
             self.add_item(ProfilePickSelect(self.cog, page_players, self, row=0))
 
-        if self.total_pages > 1:
-            prev_button = discord.ui.Button(
-                label="◀ Prev",
-                style=discord.ButtonStyle.secondary,
-                disabled=(self.current_page == 0),
-                row=1
-            )
-            prev_button.callback = self.previous_page
-            self.add_item(prev_button)
-
-            next_button = discord.ui.Button(
-                label="Next ▶",
-                style=discord.ButtonStyle.secondary,
-                disabled=(self.current_page >= self.total_pages - 1),
-                row=1
-            )
-            next_button.callback = self.next_page
-            self.add_item(next_button)
+        add_page_buttons(self, self.current_page, self.total_pages, self._go_to_page, row=1)
 
     def create_embed(self):
         lines = []
@@ -1300,21 +1331,10 @@ class PlayerSearchResultsView(discord.ui.View):
         )
         return embed
 
-    async def previous_page(self, interaction: discord.Interaction):
-        if self.current_page > 0:
-            self.current_page -= 1
-            self.update_components()
-            await interaction.response.edit_message(embed=self.create_embed(), view=self)
-        else:
-            await interaction.response.defer()
-
-    async def next_page(self, interaction: discord.Interaction):
-        if self.current_page < self.total_pages - 1:
-            self.current_page += 1
-            self.update_components()
-            await interaction.response.edit_message(embed=self.create_embed(), view=self)
-        else:
-            await interaction.response.defer()
+    async def _go_to_page(self, interaction: discord.Interaction, page):
+        self.current_page = page
+        self.update_components()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
 
 async def setup(bot):

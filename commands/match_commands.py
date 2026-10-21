@@ -7,12 +7,14 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH
-from utils import is_admin_user, get_team_emoji_str, build_team_options, fetch_teams_for_dropdown
+from utils import (is_admin_user, get_team_emoji_str, build_team_options, fetch_teams_for_dropdown, add_page_buttons,
+                   fetch_stat_seasons, add_season_select)
 from match_sim import (
     simulate_match, simulate_match_with_events, format_score, DEFAULT_VARIANCE,
     Player, MatchEvent, simulate_extra_time_half, simulate_extra_time_after_siren_shot,
 )
 from commands.scratch_lineup import ScratchMatchMainMenuView, fetch_scratch_lineup_tuples, PostFullStatsView
+from fixture_generator import short_timeslot
 
 # Pacing (Live Match Feed design doc, §04) - the baseline/floor delay is
 # adjustable live per match via the control panel's speed buttons (see
@@ -1002,7 +1004,8 @@ class MatchCommands(commands.Cog):
 
         cursor = await db.execute(
             """SELECT m.round_number, m.home_team_id, m.away_team_id, m.home_score, m.away_score,
-                      s.season_number, s.regular_rounds, h.team_name, h.emoji_id, a.team_name, a.emoji_id
+                      s.season_number, s.regular_rounds, h.team_name, h.emoji_id, a.team_name, a.emoji_id,
+                      m.season_id
                FROM matches m
                JOIN seasons s ON m.season_id = s.season_id
                JOIN teams h ON m.home_team_id = h.team_id
@@ -1014,11 +1017,11 @@ class MatchCommands(commands.Cog):
         if not match_row:
             return None
         (round_number, home_team_id, away_team_id, home_score, away_score, season_number, regular_rounds,
-         home_name, home_emoji_id, away_name, away_emoji_id) = match_row
+         home_name, home_emoji_id, away_name, away_emoji_id, season_id) = match_row
 
         cursor = await db.execute(
             """SELECT pms.team_id, p.name, p.overall_rating, pms.disposals, pms.goals, pms.behinds,
-                      pms.marks, pms.tackles, pms.spoils, pms.hitouts
+                      pms.marks, pms.tackles, pms.spoils, pms.hitouts, pms.player_id
                FROM player_match_stats pms
                JOIN players p ON pms.player_id = p.player_id
                WHERE pms.match_id = ?""",
@@ -1042,19 +1045,22 @@ class MatchCommands(commands.Cog):
             away_team_id: get_team_emoji_str(self.bot, away_emoji_id),
         }
         players = []
-        for team_id, name, ovr, disposals, goals, behinds, marks, tackles, spoils, hitouts in stat_rows:
+        for team_id, name, ovr, disposals, goals, behinds, marks, tackles, spoils, hitouts, player_id in stat_rows:
             if team_id == home_team_id:
                 home_goals += goals
             else:
                 away_goals += goals
             players.append({
+                "player_id": player_id, "team_id": team_id,
                 "name": name, "ovr": ovr, "emoji": team_emoji_by_id[team_id],
                 "disposals": disposals, "goals": goals, "behinds": behinds,
                 "marks": marks, "tackles": tackles, "spoils": spoils, "hitouts": hitouts,
             })
 
         return {
+            "match_id": match_id, "season_id": season_id,
             "round_number": round_number, "season_number": season_number, "regular_rounds": regular_rounds,
+            "home_team_id": home_team_id, "away_team_id": away_team_id,
             "home_name": home_name, "away_name": away_name,
             "home_emoji": team_emoji_by_id[home_team_id], "away_emoji": team_emoji_by_id[away_team_id],
             "home_goals": home_goals, "home_behinds": home_score - home_goals * 6,
@@ -2129,7 +2135,7 @@ class MatchCommands(commands.Cog):
         """The fixture list + status shown by /matchsimulation - a status
         line explaining why simming is or isn't available yet, plus each
         match as "{home emoji} vs {away emoji}" (emojis only, no team
-        names), with "(completed)" appended once simulated. No scores here
+        names), with a ✅ appended once simulated. No scores here
         - see the results channel for those. For a finals round, each
         match line is prefixed with its own full bracket-slot name (e.g.
         "Qualifying Final 1") instead of being unlabeled - a finals week
@@ -2142,7 +2148,7 @@ class MatchCommands(commands.Cog):
         is_finals_round = current_round > regular_rounds
 
         cursor = await db.execute(
-            """SELECT h.emoji_id, a.emoji_id, m.simulated, fb.slot_code
+            """SELECT h.emoji_id, a.emoji_id, m.simulated, fb.slot_code, m.timeslot, m.match_name, m.ground
                FROM matches m
                JOIN teams h ON m.home_team_id = h.team_id
                JOIN teams a ON m.away_team_id = a.team_id
@@ -2155,21 +2161,32 @@ class MatchCommands(commands.Cog):
 
         if matches:
             lines = []
-            for home_emoji_id, away_emoji_id, simulated, slot_code in matches:
+            for home_emoji_id, away_emoji_id, simulated, slot_code, timeslot, match_name, ground in matches:
                 home_emoji = get_team_emoji_str(self.bot, home_emoji_id)
                 away_emoji = get_team_emoji_str(self.bot, away_emoji_id)
-                prefix = ""
+                prefix = suffix = ""
                 if is_finals_round and slot_code:
                     prefix = f"**{FINALS_SLOT_LABELS.get(slot_code, slot_code)}**: "
-                line = f"{prefix}{home_emoji} vs {away_emoji}"
+                    if timeslot:
+                        suffix += f" · `{short_timeslot(timeslot)}`"
+                    if ground:
+                        suffix += f" · {ground}"
+                else:
+                    if timeslot:
+                        suffix += f" · `{short_timeslot(timeslot)}`"
+                    if ground:
+                        suffix += f" · {ground}"
+                    if match_name:
+                        suffix += f" · **{match_name}**"
+                line = f"{prefix}{home_emoji} vs {away_emoji}{suffix}"
                 if simulated:
-                    line += " (completed)"
+                    line += " :white_check_mark:"
                 lines.append(line)
             description = "\n".join(lines)
         elif is_finals_round:
             description = "*This finals round's fixture hasn't been generated yet - it's created automatically once the previous round is fully simulated and advanced past.*"
         else:
-            description = "*No fixture set for this round yet - import one via `/importdata`.*"
+            description = "*No fixture set for this round yet.*"
 
         if lineups_locked:
             status = "✅ Lineups are locked in - matches can be simulated."
@@ -2600,6 +2617,7 @@ async def build_match_centre_view(cog, db, season_id, season_number, open_on_rou
             default_round = available_rounds[0]
 
     view = MatchCentreView(cog, season_id, season_number, regular_rounds, available_rounds, default_round)
+    view.seasons = await fetch_stat_seasons(db)
     await view.refresh(db)
     # Build the components here too, so the returned view is renderable as-is.
     # Callers that only stash it as a "back" target (the round summary's
@@ -2626,38 +2644,38 @@ class MatchCentreView(discord.ui.View):
         self.regular_rounds = regular_rounds
         self.available_rounds = available_rounds  # every round_number with a fixture so far
         self.current_round = current_round
-        # Start index of the visible slice of available_rounds. Discord's
+        # Which page of available_rounds the round dropdown offers. Discord's
         # Select caps at ROUND_WINDOW_SIZE options, so when a season has more
-        # rounds than that the dropdown scrolls (via the arrow buttons)
-        # instead of the extra rounds being dropped.
-        self.round_window_start = self._window_start_for(current_round)
+        # rounds than that the dropdown pages (standard page buttons -
+        # utils.add_page_buttons) instead of the extra rounds being dropped.
+        # Opens on the page holding the current round.
+        self.round_page = self._page_for(current_round)
         self.message = None
-        self.matches = []  # (match_id, home_team_id, home_name, home_emoji_id, away_team_id, away_name, away_emoji_id, simulated, home_score, away_score)
+        self.matches = []  # (match_id, home_team_id, home_name, home_emoji_id, away_team_id, away_name, away_emoji_id, simulated, home_score, away_score, match_name, ground)
+        self.all_teams = None  # [(team_id, team_name, emoji_id)] for the team dropdown - loaded by refresh()
+        self.seasons = []  # fetch_stat_seasons rows, for the season dropdown - set by build_match_centre_view
 
-    def _window_start_for(self, round_number):
-        """Window start that keeps `round_number` visible, centred where
-        possible and clamped to the ends of available_rounds."""
-        total = len(self.available_rounds)
-        if total <= ROUND_WINDOW_SIZE:
-            return 0
+    def _page_for(self, round_number):
+        """The round dropdown page holding `round_number` (0 if absent)."""
         try:
-            index = self.available_rounds.index(round_number)
+            return self.available_rounds.index(round_number) // ROUND_WINDOW_SIZE
         except ValueError:
             return 0
-        start = index - ROUND_WINDOW_SIZE // 2
-        return max(0, min(start, total - ROUND_WINDOW_SIZE))
+
+    def _round_pages(self):
+        return max(1, -(-len(self.available_rounds) // ROUND_WINDOW_SIZE))
 
     def _visible_rounds(self):
-        return self.available_rounds[
-            self.round_window_start:self.round_window_start + ROUND_WINDOW_SIZE
-        ]
+        start = self.round_page * ROUND_WINDOW_SIZE
+        return self.available_rounds[start:start + ROUND_WINDOW_SIZE]
 
     async def refresh(self, db):
         """Re-populates self.matches for self.current_round - called after
         the round dropdown changes, before rebuilding components/embed."""
         cursor = await db.execute(
             """SELECT m.match_id, h.team_id, h.team_name, h.emoji_id,
-                      a.team_id, a.team_name, a.emoji_id, m.simulated, m.home_score, m.away_score
+                      a.team_id, a.team_name, a.emoji_id, m.simulated, m.home_score, m.away_score,
+                      m.match_name, m.ground
                FROM matches m
                JOIN teams h ON m.home_team_id = h.team_id
                JOIN teams a ON m.away_team_id = a.team_id
@@ -2666,6 +2684,8 @@ class MatchCentreView(discord.ui.View):
             (self.season_id, self.current_round)
         )
         self.matches = await cursor.fetchall()
+        if self.all_teams is None:
+            self.all_teams = await fetch_teams_for_dropdown(db)
 
     def update_components(self):
         from commands.season_commands import get_round_name
@@ -2681,33 +2701,22 @@ class MatchCentreView(discord.ui.View):
             )
             for r in visible_rounds
         ]
+        # Rows: round-window page buttons at the top, then the round
+        # dropdown, match dropdown, the team filter - picking a team opens
+        # that team's whole-season fixture (_TeamMatchesView) - and the
+        # season dropdown at the bottom.
         self.add_item(_RoundSelect(self, round_options))
         if self.matches:
             self.add_item(_MatchCentreSelect(self))
+        if self.all_teams:
+            self.add_item(_MainMenuTeamSelect(self))
+        add_season_select(self, self.seasons, self.season_id, self.season_number,
+                          self._switch_season, row=4)
 
-        # Arrows only appear when there are rounds outside the window; with a
-        # season of 25 rounds or fewer the dropdown holds everything and they
-        # would be dead controls.
-        if len(self.available_rounds) > ROUND_WINDOW_SIZE:
-            earlier_button = discord.ui.Button(
-                label="◀ Earlier Rounds",
-                style=discord.ButtonStyle.primary,
-                disabled=(self.round_window_start == 0),
-            )
-            earlier_button.callback = self._earlier_rounds
-            self.add_item(earlier_button)
-
-            later_button = discord.ui.Button(
-                label="Later Rounds ▶",
-                style=discord.ButtonStyle.primary,
-                disabled=(self.round_window_start + ROUND_WINDOW_SIZE >= len(self.available_rounds)),
-            )
-            later_button.callback = self._later_rounds
-            self.add_item(later_button)
-
-        filter_button = discord.ui.Button(label="Filter by Team", style=discord.ButtonStyle.secondary)
-        filter_button.callback = self._open_team_filter
-        self.add_item(filter_button)
+        # Only when there are rounds beyond one dropdown's worth - with 25
+        # rounds or fewer it holds them all (add_page_buttons adds nothing).
+        add_page_buttons(self, self.round_page, self._round_pages(), self._go_to_round_page, row=0,
+                         prev_label="◀ Earlier Rounds", next_label="Later Rounds ▶")
 
     def create_embed(self):
         from commands.season_commands import get_round_name
@@ -2723,13 +2732,14 @@ class MatchCentreView(discord.ui.View):
         else:
             lines = []
             for (match_id, home_id, home_name, home_emoji_id, away_id, away_name, away_emoji_id,
-                 simulated, home_score, away_score) in self.matches:
+                 simulated, home_score, away_score, match_name, ground) in self.matches:
                 home_emoji = get_team_emoji_str(self.cog.bot, home_emoji_id)
                 away_emoji = get_team_emoji_str(self.cog.bot, away_emoji_id)
+                named = (f" · {ground}" if ground else "") + (f" · **{match_name}**" if match_name else "")
                 if simulated:
-                    lines.append(f"{home_emoji} {home_score} - {away_score} {away_emoji}")
+                    lines.append(f"{home_emoji} {home_score} - {away_score} {away_emoji}{named}")
                 else:
-                    lines.append(f"{home_emoji} vs {away_emoji}")
+                    lines.append(f"{home_emoji} vs {away_emoji}{named}")
             body = "\n".join(lines)
 
         embed.description = body
@@ -2741,35 +2751,48 @@ class MatchCentreView(discord.ui.View):
         self.update_components()
         await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
-    async def _shift_round_window(self, interaction: discord.Interaction, delta):
-        """Scrolls the round dropdown's window. The SELECTED round doesn't
-        change - only which rounds are offered - so the fixture on screen
-        stays put and no re-query is needed."""
-        max_start = max(0, len(self.available_rounds) - ROUND_WINDOW_SIZE)
-        self.round_window_start = max(0, min(self.round_window_start + delta, max_start))
+    async def _switch_season(self, interaction: discord.Interaction, season_id, season_number):
+        """Swaps this message over to a fresh Match Centre for another
+        season, opening on its last completed round."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            view = await build_match_centre_view(self.cog, db, season_id, season_number)
+        if view is None:
+            await interaction.response.send_message(f"❌ Season {season_number} has no fixture.", ephemeral=True)
+            return
+        view.message = self.message
+        await interaction.response.edit_message(content=None, embed=view.create_embed(), view=view)
+
+    async def _go_to_round_page(self, interaction: discord.Interaction, page):
+        """Pages the round dropdown. The SELECTED round doesn't change - only
+        which rounds are offered - so the fixture on screen stays put and no
+        re-query is needed."""
+        self.round_page = page
         self.update_components()
         await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
-    async def _earlier_rounds(self, interaction: discord.Interaction):
-        await self._shift_round_window(interaction, -ROUND_WINDOW_SIZE)
 
-    async def _later_rounds(self, interaction: discord.Interaction):
-        await self._shift_round_window(interaction, ROUND_WINDOW_SIZE)
 
-    async def _open_team_filter(self, interaction: discord.Interaction):
+class _MainMenuTeamSelect(discord.ui.Select):
+    """The main menu's team dropdown - opens that team's season fixture."""
+    def __init__(self, parent_view: MatchCentreView):
+        self.parent_view = parent_view
+        options = build_team_options(parent_view.cog.bot, parent_view.all_teams)
+        super().__init__(placeholder="Filter by team", options=options, row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        team_id = int(self.values[0])
+        team_name = next(o.label for o in self.options if o.value == self.values[0])
+        team_view = _TeamMatchesView(self.parent_view, self.parent_view.all_teams, team_id, team_name)
         async with aiosqlite.connect(DB_PATH) as db:
-            all_teams = await fetch_teams_for_dropdown(db)
-        team_view = _TeamMatchesView(self, all_teams)
+            await team_view.refresh(db)
         team_view.update_components()
-        await interaction.response.edit_message(
-            content=None, embed=team_view.create_embed(), view=team_view
-        )
+        await interaction.response.edit_message(content=None, embed=team_view.create_embed(), view=team_view)
 
 
 class _RoundSelect(discord.ui.Select):
     def __init__(self, parent_view: MatchCentreView, options):
         self.parent_view = parent_view
-        super().__init__(placeholder="Select a round...", options=options)
+        super().__init__(placeholder="Select a round...", options=options, row=1)
 
     async def callback(self, interaction: discord.Interaction):
         self.parent_view.current_round = int(self.values[0])
@@ -2782,12 +2805,16 @@ class _MatchCentreSelect(discord.ui.Select):
         self.parent_view = parent_view
         options = []
         for (match_id, home_id, home_name, home_emoji_id, away_id, away_name, away_emoji_id,
-             simulated, home_score, away_score) in parent_view.matches:
+             simulated, home_score, away_score, match_name, ground) in parent_view.matches:
             label = f"{home_name} vs {away_name}"
             if simulated:
                 label += f" ({home_score}-{away_score})"
-            options.append(discord.SelectOption(label=label, value=str(match_id)))
-        super().__init__(placeholder="Select match", options=options[:25])
+            if ground:
+                label += f" · {ground}"
+            if match_name:
+                label += f" · {match_name}"
+            options.append(discord.SelectOption(label=label[:100], value=str(match_id)))
+        super().__init__(placeholder="Select match", options=options[:25], row=2)
 
     async def callback(self, interaction: discord.Interaction):
         match_id = int(self.values[0])
@@ -2807,14 +2834,25 @@ class _MatchCentreSelect(discord.ui.Select):
         )
 
 
+def short_round_name(round_number, regular_rounds, slot_code=None):
+    """"R5" for a regular-season round, or a final's code - WC, QF, EF, SF,
+    PF or GF, from its finals_bracket slot_code (e.g. "QF1") - for lists
+    where every line starts with its round. A final with no slot code falls
+    back to its full name (see season_commands.get_round_name)."""
+    from commands.season_commands import get_round_name
+    if round_number <= regular_rounds:
+        return f"R{round_number}"
+    if slot_code:
+        return slot_code[:2]
+    return get_round_name(round_number, regular_rounds)
+
+
 class _TeamMatchesView(discord.ui.View):
-    """"Filter by Team" - a team-picker dropdown stays on the message at
-    all times (so switching teams never needs a "Back" round-trip), plus,
-    once a team is picked, a second dropdown of that team's whole-season
-    fixture in round order. "Main menu" returns straight to the
-    round-based MatchCentreView (no intermediate "team picker" step to
-    step back through - the team dropdown IS this view, not a separate
-    one before it)."""
+    """One team's whole-season fixture - opened from the main menu's team
+    dropdown. Its own team dropdown stays on the message (so switching
+    teams never needs a "Back" round-trip), plus a dropdown of that team's
+    matches in round order. "Main menu" returns to the round-based
+    MatchCentreView."""
     def __init__(self, round_view: MatchCentreView, all_teams, team_id=None, team_name=None):
         super().__init__(timeout=1800)
         self.round_view = round_view
@@ -2824,7 +2862,11 @@ class _TeamMatchesView(discord.ui.View):
         self.season_id = round_view.season_id
         self.season_number = round_view.season_number
         self.regular_rounds = round_view.regular_rounds
-        self.matches = []  # (match_id, round_number, home_team_id, home_name, home_emoji_id, away_team_id, away_name, away_emoji_id, simulated, home_score, away_score)
+        self.matches = []  # (match_id, round_number, home_team_id, home_name, home_emoji_id, away_team_id, away_name, away_emoji_id, simulated, home_score, away_score, match_name, ground, slot_code)
+        # Which page of self.matches the match dropdown offers - a dropdown
+        # holds ROUND_WINDOW_SIZE options, and a team can play more games
+        # than that, so it pages like the round view. Set by refresh().
+        self.match_page = 0
 
     async def refresh(self, db):
         """No-ops (leaves self.matches empty) until a team has been picked."""
@@ -2834,25 +2876,47 @@ class _TeamMatchesView(discord.ui.View):
 
         cursor = await db.execute(
             """SELECT m.match_id, m.round_number, h.team_id, h.team_name, h.emoji_id,
-                      a.team_id, a.team_name, a.emoji_id, m.simulated, m.home_score, m.away_score
+                      a.team_id, a.team_name, a.emoji_id, m.simulated, m.home_score, m.away_score,
+                      m.match_name, m.ground, fb.slot_code
                FROM matches m
                JOIN teams h ON m.home_team_id = h.team_id
                JOIN teams a ON m.away_team_id = a.team_id
+               LEFT JOIN finals_bracket fb ON fb.match_id = m.match_id
                WHERE m.season_id = ? AND (m.home_team_id = ? OR m.away_team_id = ?)
                ORDER BY m.round_number""",
             (self.season_id, self.team_id, self.team_id)
         )
         self.matches = await cursor.fetchall()
+        # Open on the games around the team's most recent played one, like
+        # the round view opening on the latest completed round.
+        played = [i for i, m in enumerate(self.matches) if m[8]]
+        focus = played[-1] if played else 0
+        self.match_page = focus // ROUND_WINDOW_SIZE
+
+    def visible_matches(self):
+        start = self.match_page * ROUND_WINDOW_SIZE
+        return self.matches[start:start + ROUND_WINDOW_SIZE]
 
     def update_components(self):
+        # Rows: page buttons at the top, match dropdown, team filter, Clear filter.
         self.clear_items()
-        self.add_item(_TeamPickSelect(self))
         if self.matches:
             self.add_item(_TeamMatchPickSelect(self))
 
-        main_menu_button = discord.ui.Button(label="Main menu", style=discord.ButtonStyle.secondary)
-        main_menu_button.callback = self._main_menu
-        self.add_item(main_menu_button)
+        add_page_buttons(self, self.match_page, max(1, -(-len(self.matches) // ROUND_WINDOW_SIZE)),
+                         self._go_to_match_page, row=0,
+                         prev_label="◀ Earlier Rounds", next_label="Later Rounds ▶")
+
+        self.add_item(_TeamPickSelect(self))
+
+        clear_button = discord.ui.Button(label="Clear filter", style=discord.ButtonStyle.secondary, row=3)
+        clear_button.callback = self._main_menu
+        self.add_item(clear_button)
+
+    async def _go_to_match_page(self, interaction: discord.Interaction, page):
+        self.match_page = page
+        self.update_components()
+        await interaction.response.edit_message(content=None, embed=self.create_embed(), view=self)
 
     def create_embed(self):
         if self.team_id is None:
@@ -2870,18 +2934,17 @@ class _TeamMatchesView(discord.ui.View):
         if not self.matches:
             body = "No fixture for this team yet."
         else:
-            from commands.season_commands import get_round_name
-
             lines = []
             for (match_id, round_number, home_id, home_name, home_emoji_id, away_id, away_name, away_emoji_id,
-                 simulated, home_score, away_score) in self.matches:
+                 simulated, home_score, away_score, match_name, ground, slot_code) in self.matches:
                 home_emoji = get_team_emoji_str(self.round_view.cog.bot, home_emoji_id)
                 away_emoji = get_team_emoji_str(self.round_view.cog.bot, away_emoji_id)
-                round_display = get_round_name(round_number, self.regular_rounds)
+                round_display = short_round_name(round_number, self.regular_rounds, slot_code)
+                named = (f" · {ground}" if ground else "") + (f" · **{match_name}**" if match_name else "")
                 if simulated:
-                    lines.append(f"{round_display}: {home_emoji} {home_score} - {away_score} {away_emoji}")
+                    lines.append(f"{round_display}: {home_emoji} {home_score} - {away_score} {away_emoji}{named}")
                 else:
-                    lines.append(f"{round_display}: {home_emoji} vs {away_emoji}")
+                    lines.append(f"{round_display}: {home_emoji} vs {away_emoji}{named}")
             body = "\n".join(lines)
 
         embed.description = body
@@ -2903,7 +2966,7 @@ class _TeamPickSelect(discord.ui.Select):
             parent_view.round_view.cog.bot, parent_view.all_teams,
             selected=parent_view.team_id,
         )
-        super().__init__(placeholder="Select a team...", options=options)
+        super().__init__(placeholder="Filter by team", options=options, row=2)
 
     async def callback(self, interaction: discord.Interaction):
         self.parent_view.team_id = int(self.values[0])
@@ -2922,13 +2985,16 @@ class _TeamMatchPickSelect(discord.ui.Select):
         self.parent_view = parent_view
         options = []
         for (match_id, round_number, home_id, home_name, home_emoji_id, away_id, away_name, away_emoji_id,
-             simulated, home_score, away_score) in parent_view.matches:
-            from commands.season_commands import get_round_name
-            label = f"{get_round_name(round_number, parent_view.regular_rounds)}: {home_name} vs {away_name}"
+             simulated, home_score, away_score, match_name, ground, slot_code) in parent_view.visible_matches():
+            label = f"{short_round_name(round_number, parent_view.regular_rounds, slot_code)}: {home_name} vs {away_name}"
             if simulated:
                 label += f" ({home_score}-{away_score})"
-            options.append(discord.SelectOption(label=label, value=str(match_id)))
-        super().__init__(placeholder="Select match", options=options[:25])
+            if ground:
+                label += f" · {ground}"
+            if match_name:
+                label += f" · {match_name}"
+            options.append(discord.SelectOption(label=label[:100], value=str(match_id)))
+        super().__init__(placeholder="Select match", options=options, row=1)
 
     async def callback(self, interaction: discord.Interaction):
         match_id = int(self.values[0])
@@ -2987,35 +3053,36 @@ class _MatchStatsView(discord.ui.View):
         return max(1, -(-count // BOX_SCORE_PLAYERS_PER_PAGE))
 
     def update_components(self):
+        # Rows: page buttons at the top, then the stat buttons, Main menu,
+        # and the player dropdown.
         self.clear_items()
-        for stat_key, label in STAT_LABELS.items():
+        add_page_buttons(self, self.page, self._total_pages(), self._go_to_page, row=0)
+
+        for index, (stat_key, label) in enumerate(STAT_LABELS.items()):
             button = discord.ui.Button(
                 label=label,
                 style=discord.ButtonStyle.success if stat_key == self.selected_stat else discord.ButtonStyle.secondary,
+                row=1 if index < 5 else 2,  # five to a row
             )
             button.callback = self._make_stat_callback(stat_key)
             self.add_item(button)
-
-        total_pages = self._total_pages()
-        prev_button = discord.ui.Button(
-            label="◀ Previous", style=discord.ButtonStyle.primary, disabled=(self.page == 0)
-        )
-        prev_button.callback = self._previous_page
-        self.add_item(prev_button)
-
-        next_button = discord.ui.Button(
-            label="Next ▶", style=discord.ButtonStyle.primary, disabled=(self.page >= total_pages - 1)
-        )
-        next_button.callback = self._next_page
-        self.add_item(next_button)
 
         # No parent means there's nowhere to go back TO (the match's season
         # or fixture couldn't be resolved), so the button is left off rather
         # than offered and then failing on click.
         if self.parent_view is not None:
-            back_button = discord.ui.Button(label="Main menu", style=discord.ButtonStyle.secondary)
+            back_button = discord.ui.Button(label="Main menu", style=discord.ButtonStyle.secondary, row=2)
             back_button.callback = self._back
             self.add_item(back_button)
+
+        # The players on this page, in the same order as the embed lists
+        # them, opening that player's full line for the game. Older data
+        # without player ids (pre-dates this) gets no dropdown.
+        ranked = _rank_box_score_players(self.data, self.selected_stat)
+        start = self.page * BOX_SCORE_PLAYERS_PER_PAGE
+        page_players = [p for p in ranked[start:start + BOX_SCORE_PLAYERS_PER_PAGE] if p.get("player_id")]
+        if page_players:
+            self.add_item(_MatchPlayerSelect(self, page_players))
 
     def _make_stat_callback(self, stat_key):
         async def callback(interaction: discord.Interaction):
@@ -3025,13 +3092,8 @@ class _MatchStatsView(discord.ui.View):
             await interaction.response.edit_message(embed=self.create_embed(), view=self)
         return callback
 
-    async def _previous_page(self, interaction: discord.Interaction):
-        self.page -= 1
-        self.update_components()
-        await interaction.response.edit_message(embed=self.create_embed(), view=self)
-
-    async def _next_page(self, interaction: discord.Interaction):
-        self.page += 1
+    async def _go_to_page(self, interaction: discord.Interaction, page):
+        self.page = page
         self.update_components()
         await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
@@ -3039,6 +3101,85 @@ class _MatchStatsView(discord.ui.View):
         await interaction.response.edit_message(
             content=None, embed=self.parent_view.create_embed(), view=self.parent_view
         )
+
+
+def player_game_line(p):
+    """One player's whole stat line for a game, as (label, value) pairs."""
+    return [("Disposals", p["disposals"]), ("Goals", p["goals"]), ("Behinds", p["behinds"]),
+            ("Marks", p["marks"]), ("Tackles", p["tackles"]), ("Spoils", p["spoils"]),
+            ("Hitouts", p["hitouts"])]
+
+
+class _MatchPlayerSelect(discord.ui.Select):
+    """The players on the match stats screen's current page, in the order
+    the embed shows them - picking one shows their full line for that game
+    (_PlayerGameView)."""
+
+    def __init__(self, stats_view, players):
+        self.stats_view = stats_view
+        options = [
+            discord.SelectOption(
+                label=f"{p['name']} ({p['ovr']})"[:100], value=str(p["player_id"]),
+                description=f"{p['disposals']} disposals · {p['goals']}.{p['behinds']} · {p['marks']} marks"[:100],
+            )
+            for p in players[:25]
+        ]
+        super().__init__(placeholder="View a player's stats for this match...", options=options, row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        player = next(p for p in self.stats_view.data["players"] if str(p.get("player_id")) == self.values[0])
+        view = _PlayerGameView(self.stats_view, player)
+        await interaction.response.edit_message(content=None, embed=view.create_embed(), view=view)
+
+
+class _PlayerGameView(discord.ui.View):
+    """One player's full stat line for one game, opened from the match
+    stats screen's player dropdowns. Links back to the match stats, and on
+    to the player's profile (player_commands.PlayerProfileView)."""
+
+    def __init__(self, stats_view, player):
+        super().__init__(timeout=1800)
+        self.stats_view = stats_view
+        self.player = player
+        back = discord.ui.Button(label="◀ Back to Match Stats", style=discord.ButtonStyle.secondary)
+        back.callback = self._back
+        self.add_item(back)
+        profile = discord.ui.Button(label="👤 View Player Profile", style=discord.ButtonStyle.primary)
+        profile.callback = self._profile
+        self.add_item(profile)
+
+    def create_embed(self):
+        from commands.season_commands import get_round_name
+        data, p = self.stats_view.data, self.player
+        home_score = data["home_goals"] * 6 + data["home_behinds"]
+        away_score = data["away_goals"] * 6 + data["away_behinds"]
+        embed = discord.Embed(
+            title=f"{p['emoji']}{p['name']} ({p['ovr']})",
+            description=(f"{get_round_name(data['round_number'], data['regular_rounds'])}, Season {data['season_number']}\n"
+                         f"{data['home_emoji']}{home_score} - {away_score} {data['away_emoji']}"),
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Stats", value="\n".join(f"{label}: **{value}**" for label, value in player_game_line(p)),
+                        inline=False)
+        return embed
+
+    async def _back(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content=None, embed=self.stats_view.create_embed(), view=self.stats_view)
+
+    async def _profile(self, interaction: discord.Interaction):
+        """The player's profile, for the season this match was in - its own
+        View Per-Match Stats button goes on from there. Back returns here."""
+        from commands.player_commands import fetch_player_profile_data, PlayerProfileView
+        player_cog = interaction.client.get_cog('PlayerCommands')
+        async with aiosqlite.connect(DB_PATH) as db:
+            data = await fetch_player_profile_data(db, self.player["player_id"], self.stats_view.data["season_id"])
+        if data is None or player_cog is None:
+            await interaction.response.send_message("❌ That player's profile isn't available.", ephemeral=True)
+            return
+        view = PlayerProfileView(player_cog, data, self.stats_view.data["season_number"],
+                                 back_view=self, back_embed=self.create_embed())
+        await interaction.response.edit_message(content=None, embed=view.create_embed(), view=view)
 
 
 async def setup(bot):

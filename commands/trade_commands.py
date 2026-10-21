@@ -5,6 +5,8 @@ import aiosqlite
 import json
 from config import DB_PATH
 from utils import is_admin_user, get_team_emoji, get_team_emoji_str
+# Aliased - PendingTradesView has its own method called add_page_buttons.
+from utils import add_page_buttons as add_standard_page_buttons
 from commands.lineup_commands import clear_departed_players_from_lineups
 
 # Canonical embed color per trade state, used by build_trade_embed() so every
@@ -14,6 +16,53 @@ TRADE_COLOR_PENDING_APPROVAL = discord.Color.orange()  # awaiting moderator appr
 TRADE_COLOR_APPROVED = discord.Color.green()    # accepted / approved
 TRADE_COLOR_REJECTED = discord.Color.red()      # declined / vetoed
 TRADE_COLOR_WITHDRAWN = discord.Color.dark_gray()  # cancelled by the offering team
+
+# Trades a button click is acting on right now - see claim_trade.
+_TRADES_IN_PROGRESS = set()
+
+# What claim_trade says when a trade has moved on from the status a button
+# needs, keyed by the status it's in now.
+_TRADE_STATUS_TEXT = {
+    'pending': "is still waiting for a response",
+    'accepted': "has already been accepted and is awaiting approval",
+    'declined': "has already been declined",
+    'approved': "has already been approved",
+    'vetoed': "has already been vetoed",
+    'withdrawn': "was withdrawn",
+    'countered': "was replaced by a counter-offer",
+    'expired': "has expired",
+    'voided': "was voided - something in it has changed clubs since it was offered",
+}
+
+
+async def claim_trade(trade_id, required_status):
+    """Lets one click at a time act on a trade, and only while it's still in
+    required_status ('pending' to accept/decline, 'accepted' to approve/
+    veto). Without this, a double-click - or a click on an old message's
+    button - ran a whole accept/approve/veto twice: a second set of
+    notifications, a second post to the moderators, or the trade itself
+    executed twice. Returns None if the caller may go ahead (it must then
+    call release_trade(trade_id) when done, even on error), else a message
+    saying why not.
+
+    The id is reserved before the status is read, so a second click
+    arriving mid-check is turned away rather than also passing it."""
+    if trade_id in _TRADES_IN_PROGRESS:
+        return "⏳ This trade is already being processed."
+    _TRADES_IN_PROGRESS.add(trade_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT status FROM trades WHERE trade_id = ?", (trade_id,))
+        row = await cursor.fetchone()
+    if row is None or row[0] != required_status:
+        _TRADES_IN_PROGRESS.discard(trade_id)
+        if row is None:
+            return "❌ Trade not found!"
+        return f"❌ This trade {_TRADE_STATUS_TEXT.get(row[0], f'is {row[0]}')}."
+    return None
+
+
+def release_trade(trade_id):
+    _TRADES_IN_PROGRESS.discard(trade_id)
 
 class TradeCommands(commands.Cog):
     def __init__(self, bot):
@@ -59,6 +108,135 @@ class TradeCommands(commands.Cog):
             round_suffix = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(round_number, f"{round_number}th")
             emoji_str = get_team_emoji_str(self.bot, emoji_id)
             return f"Future {round_suffix} ({emoji_str}S{season_number - 1})"
+
+    async def void_stale_trades(self, approved_trade_id, player_ids, pick_ids):
+        """Called once a trade has been approved and executed (or, with
+        approved_trade_id None, once draft picks have been used or spent in
+        a live draft - see draft_commands.void_trades_for_picks): voids
+        every other open offer (pending, or accepted and awaiting approval)
+        that shares a player or pick with it AND can no longer go ahead -
+        some player isn't with the team offering him any more, or some pick
+        has changed hands, been used, or no longer exists. Offers that still
+        work (e.g. the new club offering the same player on) are left alone.
+        Both teams in each voided offer are told what happened. Best-effort
+        - whatever caused it is already committed, so this never raises."""
+        moved_players, moved_picks = set(player_ids), set(pick_ids)
+        if not moved_players and not moved_picks:
+            return
+        voided = []  # (trade_id, init_team_id, recv_team_id, players/picks json x4, reasons)
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    """SELECT trade_id, initiating_team_id, receiving_team_id, initiating_players,
+                              receiving_players, initiating_picks, receiving_picks, status
+                       FROM trades WHERE status IN ('pending', 'accepted') AND trade_id != ?""",
+                    (approved_trade_id or 0,)
+                )
+                open_trades = await cursor.fetchall()
+
+                for (trade_id, init_team_id, recv_team_id, init_players_json, recv_players_json,
+                     init_picks_json, recv_picks_json, status) in open_trades:
+                    sides = (
+                        (init_team_id, json.loads(init_players_json or "[]"), json.loads(init_picks_json or "[]")),
+                        (recv_team_id, json.loads(recv_players_json or "[]"), json.loads(recv_picks_json or "[]")),
+                    )
+                    if not any(moved_players & set(players) or moved_picks & set(picks) for _, players, picks in sides):
+                        continue
+
+                    reasons = []
+                    for team_id, players, picks in sides:
+                        for player_id in players:
+                            cursor = await db.execute(
+                                """SELECT p.name, p.team_id, t.team_name FROM players p
+                                   LEFT JOIN teams t ON p.team_id = t.team_id WHERE p.player_id = ?""",
+                                (player_id,)
+                            )
+                            row = await cursor.fetchone()
+                            if row is None:
+                                reasons.append("A player in it is no longer in the league")
+                            elif row[1] != team_id:
+                                reasons.append(f"**{row[0]}** has since moved to "
+                                               + (f"**{row[2]}**" if row[2] else "the delisted list"))
+                        for pick_id in picks:
+                            cursor = await db.execute(
+                                """SELECT dp.current_team_id, dp.player_selected_id, dp.passed, t.team_name
+                                   FROM draft_picks dp LEFT JOIN teams t ON dp.current_team_id = t.team_id
+                                   WHERE dp.pick_id = ?""",
+                                (pick_id,)
+                            )
+                            row = await cursor.fetchone()
+                            shown = (await self.format_picks_for_display(db, json.dumps([pick_id])) or ["A pick"])[0]
+                            if row is None:
+                                reasons.append(f"{shown} no longer exists")
+                            elif row[1] is not None or row[2]:
+                                reasons.append(f"{shown} has been used")
+                            elif row[0] != team_id:
+                                reasons.append(f"{shown} now belongs to **{row[3]}**")
+
+                    if reasons:
+                        cursor = await db.execute(
+                            "UPDATE trades SET status = 'voided' WHERE trade_id = ? AND status = ?",
+                            (trade_id, status)
+                        )
+                        if cursor.rowcount:
+                            voided.append((trade_id, init_team_id, recv_team_id, init_players_json,
+                                           recv_players_json, init_picks_json, recv_picks_json, reasons))
+                await db.commit()
+
+                for (trade_id, init_team_id, recv_team_id, init_players_json, recv_players_json,
+                     init_picks_json, recv_picks_json, reasons) in voided:
+                    teams = {}
+                    for team_id in (init_team_id, recv_team_id):
+                        cursor = await db.execute(
+                            "SELECT channel_id, emoji_id FROM teams WHERE team_id = ?", (team_id,)
+                        )
+                        teams[team_id] = await cursor.fetchone() or (None, None)
+
+                    async def items(players_json, picks_json):
+                        found = list(await self.format_picks_for_display(db, picks_json)) if picks_json else []
+                        players = json.loads(players_json or "[]")
+                        if players:
+                            placeholders = ','.join('?' * len(players))
+                            cursor = await db.execute(
+                                f"SELECT name, position, overall_rating, age FROM players WHERE player_id IN ({placeholders})",
+                                players
+                            )
+                            found += [f"{name} ({pos}, {age}, {ovr})" for name, pos, ovr, age in await cursor.fetchall()]
+                        return found
+
+                    init_emoji_str = get_team_emoji_str(self.bot, teams[init_team_id][1])
+                    recv_emoji_str = get_team_emoji_str(self.bot, teams[recv_team_id][1])
+                    embed = self.build_trade_embed(
+                        title="Trade offer voided",
+                        color=TRADE_COLOR_WITHDRAWN,
+                        init_emoji_str=init_emoji_str,
+                        recv_emoji_str=recv_emoji_str,
+                        init_items=await items(init_players_json, init_picks_json),
+                        recv_items=await items(recv_players_json, recv_picks_json),
+                        trade_id=trade_id,
+                        description="This offer can no longer go ahead:\n" + "\n".join(f"• {r}" for r in reasons),
+                    )
+                    for team_id in (init_team_id, recv_team_id):
+                        channel_id = teams[team_id][0]
+                        channel = self.bot.get_channel(int(channel_id)) if channel_id else None
+                        if channel:
+                            try:
+                                await channel.send(embed=embed)
+                            except Exception as e:
+                                print(f"Failed to notify a team of voided trade {trade_id}: {e}")
+
+                if voided:
+                    log_channel = await self.get_bot_logs_channel(db)
+                    if log_channel:
+                        ids = ", ".join(str(v[0]) for v in voided)
+                        await log_channel.send(
+                            f"Voided {len(voided)} out-of-date trade offer(s) "
+                            + (f"after trade {approved_trade_id} was approved" if approved_trade_id
+                               else "after draft picks in them were used")
+                            + f" (Trade ID: {ids})"
+                        )
+        except Exception as e:
+            print(f"Failed to void out-of-date trades after trade {approved_trade_id}: {e}")
 
     async def format_picks_for_display(self, db, pick_ids_json):
         """
@@ -1048,14 +1226,8 @@ class TradeMenuView(discord.ui.View):
     async def add_incoming_page_buttons(self):
         """Add buttons for incoming offers page view"""
         # Navigation buttons
-        if len(self.incoming_trades) > 1:
-            prev_btn = discord.ui.Button(label="◀ Previous", style=discord.ButtonStyle.secondary, row=0)
-            prev_btn.callback = self.prev_incoming_callback
-            self.add_item(prev_btn)
-
-            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, row=0)
-            next_btn.callback = self.next_incoming_callback
-            self.add_item(next_btn)
+        add_standard_page_buttons(self, self.incoming_page, len(self.incoming_trades), self._go_to_incoming, row=0,
+                                  count_label="Offer")
 
         # Action buttons
         if self.incoming_trades:
@@ -1079,14 +1251,8 @@ class TradeMenuView(discord.ui.View):
     async def add_outgoing_page_buttons(self):
         """Add buttons for outgoing offers page view"""
         # Navigation buttons
-        if len(self.outgoing_trades) > 1:
-            prev_btn = discord.ui.Button(label="◀ Previous", style=discord.ButtonStyle.secondary, row=0)
-            prev_btn.callback = self.prev_outgoing_callback
-            self.add_item(prev_btn)
-
-            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, row=0)
-            next_btn.callback = self.next_outgoing_callback
-            self.add_item(next_btn)
+        add_standard_page_buttons(self, self.outgoing_page, len(self.outgoing_trades), self._go_to_outgoing, row=0,
+                                  count_label="Offer")
 
         # Withdraw button
         if self.outgoing_trades:
@@ -1102,42 +1268,24 @@ class TradeMenuView(discord.ui.View):
     async def add_approval_page_buttons(self):
         """Add buttons for approval page view"""
         # Navigation buttons
-        if len(self.approval_trades) > 1:
-            prev_btn = discord.ui.Button(label="◀ Previous", style=discord.ButtonStyle.secondary, row=0)
-            prev_btn.callback = self.prev_approval_callback
-            self.add_item(prev_btn)
-
-            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, row=0)
-            next_btn.callback = self.next_approval_callback
-            self.add_item(next_btn)
+        add_standard_page_buttons(self, self.approval_page, len(self.approval_trades), self._go_to_approval, row=0,
+                                  count_label="Trade")
 
         # Back button
         back_btn = discord.ui.Button(label="← Back to Main Menu", style=discord.ButtonStyle.secondary, row=1)
         back_btn.callback = self.back_callback
         self.add_item(back_btn)
 
-    async def prev_incoming_callback(self, interaction: discord.Interaction):
-        self.incoming_page = (self.incoming_page - 1) % len(self.incoming_trades)
+    async def _go_to_incoming(self, interaction: discord.Interaction, page):
+        self.incoming_page = page
         await self.update_view(interaction)
 
-    async def next_incoming_callback(self, interaction: discord.Interaction):
-        self.incoming_page = (self.incoming_page + 1) % len(self.incoming_trades)
+    async def _go_to_outgoing(self, interaction: discord.Interaction, page):
+        self.outgoing_page = page
         await self.update_view(interaction)
 
-    async def prev_outgoing_callback(self, interaction: discord.Interaction):
-        self.outgoing_page = (self.outgoing_page - 1) % len(self.outgoing_trades)
-        await self.update_view(interaction)
-
-    async def next_outgoing_callback(self, interaction: discord.Interaction):
-        self.outgoing_page = (self.outgoing_page + 1) % len(self.outgoing_trades)
-        await self.update_view(interaction)
-
-    async def prev_approval_callback(self, interaction: discord.Interaction):
-        self.approval_page = (self.approval_page - 1) % len(self.approval_trades)
-        await self.update_view(interaction)
-
-    async def next_approval_callback(self, interaction: discord.Interaction):
-        self.approval_page = (self.approval_page + 1) % len(self.approval_trades)
+    async def _go_to_approval(self, interaction: discord.Interaction, page):
+        self.approval_page = page
         await self.update_view(interaction)
 
     async def accept_incoming_callback(self, interaction: discord.Interaction):
@@ -1147,7 +1295,16 @@ class TradeMenuView(discord.ui.View):
             return
 
         trade_id = self.incoming_trades[self.incoming_page]
+        problem = await claim_trade(trade_id, 'pending')
+        if problem:
+            await interaction.response.send_message(problem, ephemeral=True)
+            return
+        try:
+            await self._accept_incoming(interaction, trade_id)
+        finally:
+            release_trade(trade_id)
 
+    async def _accept_incoming(self, interaction: discord.Interaction, trade_id):
         # Get trade and team info for notification
         async with aiosqlite.connect(DB_PATH) as db:
             # Get trade details
@@ -1259,7 +1416,16 @@ class TradeMenuView(discord.ui.View):
             return
 
         trade_id = self.incoming_trades[self.incoming_page]
+        problem = await claim_trade(trade_id, 'pending')
+        if problem:
+            await interaction.response.send_message(problem, ephemeral=True)
+            return
+        try:
+            await self._decline_incoming(interaction, trade_id)
+        finally:
+            release_trade(trade_id)
 
+    async def _decline_incoming(self, interaction: discord.Interaction, trade_id):
         # Get trade and team info for notification
         async with aiosqlite.connect(DB_PATH) as db:
             # Get trade details
@@ -1638,14 +1804,8 @@ class PendingTradesView(discord.ui.View):
     async def add_page_buttons(self):
         """Add buttons for pending trades page view"""
         # Navigation buttons
-        if len(self.pending_trades) > 1:
-            prev_btn = discord.ui.Button(label="◀ Previous", style=discord.ButtonStyle.secondary, row=0)
-            prev_btn.callback = self.prev_callback
-            self.add_item(prev_btn)
-
-            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, row=0)
-            next_btn.callback = self.next_callback
-            self.add_item(next_btn)
+        add_standard_page_buttons(self, self.current_page, len(self.pending_trades), self._go_to_page, row=0,
+                                  count_label="Trade")
 
         # Action buttons
         if self.pending_trades:
@@ -1672,12 +1832,8 @@ class PendingTradesView(discord.ui.View):
         else:
             await interaction.response.edit_message(embed=embed, view=self)
 
-    async def prev_callback(self, interaction: discord.Interaction):
-        self.current_page = (self.current_page - 1) % len(self.pending_trades)
-        await self.update_view(interaction)
-
-    async def next_callback(self, interaction: discord.Interaction):
-        self.current_page = (self.current_page + 1) % len(self.pending_trades)
+    async def _go_to_page(self, interaction: discord.Interaction, page):
+        self.current_page = page
         await self.update_view(interaction)
 
     async def refresh_callback(self, interaction: discord.Interaction):
@@ -1695,7 +1851,8 @@ class PendingTradesView(discord.ui.View):
 
         # Use the existing ModeratorApprovalView's execute_trade logic
         approval_view = ModeratorApprovalView(trade_id, self.bot)
-        await approval_view.execute_trade(interaction)
+        if not await approval_view.execute_trade(interaction):
+            return
 
         # Remove from list and update view
         self.pending_trades.pop(self.current_page)
@@ -1718,7 +1875,8 @@ class PendingTradesView(discord.ui.View):
 
         # Use the existing ModeratorApprovalView's veto logic
         approval_view = ModeratorApprovalView(trade_id, self.bot)
-        await approval_view.veto_trade_action(interaction)
+        if not await approval_view.veto_trade_action(interaction):
+            return
 
         # Remove from list and update view
         self.pending_trades.pop(self.current_page)
@@ -1811,6 +1969,8 @@ class TradeOfferView(discord.ui.View):
                    LEFT JOIN seasons s ON dp.season_number = s.season_number
                    WHERE dp.current_team_id = ?
                      AND dp.player_selected_id IS NULL
+                     AND COALESCE(dp.passed, 0) = 0
+                     AND dp.draft_id NOT IN (SELECT draft_id FROM drafts WHERE status = 'completed')
                      AND (dp.season_number IS NULL OR dp.season_number <= ?)
                    ORDER BY dp.season_number ASC NULLS FIRST,
                             dp.pick_number ASC NULLS LAST,
@@ -1846,6 +2006,8 @@ class TradeOfferView(discord.ui.View):
                        LEFT JOIN seasons s ON dp.season_number = s.season_number
                        WHERE dp.current_team_id = ?
                          AND dp.player_selected_id IS NULL
+                         AND COALESCE(dp.passed, 0) = 0
+                         AND dp.draft_id NOT IN (SELECT draft_id FROM drafts WHERE status = 'completed')
                          AND (dp.season_number IS NULL OR dp.season_number <= ?)
                        ORDER BY dp.season_number ASC NULLS FIRST,
                                 dp.pick_number ASC NULLS LAST,
@@ -1875,13 +2037,8 @@ class TradeOfferView(discord.ui.View):
                 # Calculate total pages (25 items per page)
                 total_pages = (total_items - 1) // 25 + 1
 
-                next_page_btn = discord.ui.Button(
-                    label=f"Page {self.initiating_page + 1}/{total_pages}",
-                    style=discord.ButtonStyle.secondary,
-                    row=current_row
-                )
-                next_page_btn.callback = self.next_initiating_page
-                self.add_item(next_page_btn)
+                add_standard_page_buttons(self, self.initiating_page, total_pages, self._go_to_initiating_page,
+                                          row=current_row)
                 current_row += 1
 
         # Combined picks+players dropdown for receiving team
@@ -1896,13 +2053,8 @@ class TradeOfferView(discord.ui.View):
                 # Calculate total pages (25 items per page)
                 total_pages = (total_items - 1) // 25 + 1
 
-                next_page_btn = discord.ui.Button(
-                    label=f"Page {self.receiving_page + 1}/{total_pages}",
-                    style=discord.ButtonStyle.secondary,
-                    row=current_row
-                )
-                next_page_btn.callback = self.next_receiving_page
-                self.add_item(next_page_btn)
+                add_standard_page_buttons(self, self.receiving_page, total_pages, self._go_to_receiving_page,
+                                          row=current_row)
                 current_row += 1
 
         # Action buttons (last row)
@@ -2003,20 +2155,12 @@ class TradeOfferView(discord.ui.View):
         else:
             await interaction.response.edit_message(embed=embed, view=self)
 
-    async def next_initiating_page(self, interaction: discord.Interaction):
-        """Go to next page of initiating team roster"""
-        # Calculate max pages (25 items per page)
-        total_items = len(self.initiating_draft_picks) + len(self.initiating_roster)
-        max_page = max(0, (total_items - 1) // 25)
-        self.initiating_page = (self.initiating_page + 1) % (max_page + 1)
+    async def _go_to_initiating_page(self, interaction: discord.Interaction, page):
+        self.initiating_page = page
         await self.update_view(interaction)
 
-    async def next_receiving_page(self, interaction: discord.Interaction):
-        """Go to next page of receiving team roster"""
-        # Calculate max pages (25 items per page)
-        total_items = len(self.receiving_draft_picks) + len(self.receiving_roster)
-        max_page = max(0, (total_items - 1) // 25)
-        self.receiving_page = (self.receiving_page + 1) % (max_page + 1)
+    async def _go_to_receiving_page(self, interaction: discord.Interaction, page):
+        self.receiving_page = page
         await self.update_view(interaction)
 
     async def clear_callback(self, interaction: discord.Interaction):
@@ -2041,6 +2185,23 @@ class TradeOfferView(discord.ui.View):
         if not self.initiating_players and not self.receiving_players and not self.initiating_picks and not self.receiving_picks:
             await interaction.response.send_message("❌ Please add at least one player or pick to the trade!", ephemeral=True)
             return
+
+        # Guard against double-sending. Everything below (saving, posting to
+        # the other team's channel, logging) used to run BEFORE the click was
+        # answered, with Send Offer still live the whole time - a second
+        # click in that window sent the offer twice, and if it all took over
+        # Discord's 3 seconds the first click showed "interaction failed"
+        # despite working, inviting another click. The builder also stayed
+        # on screen afterwards with a live Send Offer button. Now the flag
+        # stops a near-simultaneous click (set before any await, so a second
+        # click always sees it), and the builder is swapped for "Sending..."
+        # with no buttons straight away.
+        if getattr(self, "sending", False):
+            await interaction.response.send_message("⏳ This offer is already being sent.", ephemeral=True)
+            return
+        self.sending = True
+        self.stop()
+        await interaction.response.edit_message(content="⏳ Sending trade offer...", embed=self.create_embed(), view=None)
 
         # Store trade in database
         async with aiosqlite.connect(DB_PATH) as db:
@@ -2163,7 +2324,7 @@ class TradeOfferView(discord.ui.View):
                 log_message = f"{initiating_emoji_str}sent {receiving_emoji_str}a {action_type} (Trade ID: {trade_id}) - {interaction.user.mention}"
                 await log_channel.send(log_message)
 
-        await interaction.response.send_message("✅ **Trade offer sent!**", ephemeral=True)
+        await interaction.edit_original_response(content="✅ **Trade offer sent!**", embed=self.create_embed(), view=None)
 
 
 class OfferingPlayerSelect(discord.ui.Select):
@@ -2614,7 +2775,20 @@ class ModeratorApprovalView(discord.ui.View):
         await self.veto_trade_action(interaction)
 
     async def veto_trade_action(self, interaction: discord.Interaction):
-        """Veto this trade. Callable directly (e.g. from PendingTradesView) without the button's own permission check."""
+        """Veto this trade. Callable directly (e.g. from PendingTradesView) without the button's own permission check.
+        Returns False (having told the user why) if the trade can't be vetoed
+        - already approved/vetoed, or another click is handling it."""
+        problem = await claim_trade(self.trade_id, 'accepted')
+        if problem:
+            await interaction.response.send_message(problem, ephemeral=True)
+            return False
+        try:
+            await self._veto_trade(interaction)
+        finally:
+            release_trade(self.trade_id)
+        return True
+
+    async def _veto_trade(self, interaction: discord.Interaction):
         # Get parent_cog for helper methods
         parent_cog = self.bot.get_cog('TradeCommands')
 
@@ -2723,13 +2897,26 @@ class ModeratorApprovalView(discord.ui.View):
         await interaction.followup.send("✅ Trade vetoed and teams notified.", ephemeral=True)
 
     async def execute_trade(self, interaction: discord.Interaction):
-        """Execute the approved trade"""
+        """Execute the approved trade. Returns False (having told the user
+        why) if it can't be - already approved/vetoed, or another click is
+        handling it."""
         # Defer immediately: this does multiple DB queries and Discord API calls
         # (log channel, team channels) before responding, which can easily exceed
         # the 3-second window Discord allows for an initial interaction response.
         if not interaction.response.is_done():
             await interaction.response.defer()
 
+        problem = await claim_trade(self.trade_id, 'accepted')
+        if problem:
+            await interaction.followup.send(problem, ephemeral=True)
+            return False
+        try:
+            await self._execute_trade(interaction)
+        finally:
+            release_trade(self.trade_id)
+        return True
+
+    async def _execute_trade(self, interaction: discord.Interaction):
         # Get parent_cog for helper methods
         parent_cog = self.bot.get_cog('TradeCommands')
 
@@ -2788,7 +2975,8 @@ class ModeratorApprovalView(discord.ui.View):
             if init_picks:
                 placeholders = ','.join('?' * len(init_picks))
                 cursor = await db.execute(
-                    f"SELECT pick_id FROM draft_picks WHERE pick_id IN ({placeholders}) AND current_team_id = ? AND player_selected_id IS NULL",
+                    f"SELECT pick_id FROM draft_picks WHERE pick_id IN ({placeholders}) AND current_team_id = ? AND player_selected_id IS NULL "
+                    "AND COALESCE(passed, 0) = 0 AND draft_id NOT IN (SELECT draft_id FROM drafts WHERE status = 'completed')",
                     init_picks + [init_team_id]
                 )
                 valid_init_picks = [row[0] for row in await cursor.fetchall()]
@@ -2802,7 +2990,8 @@ class ModeratorApprovalView(discord.ui.View):
             if recv_picks:
                 placeholders = ','.join('?' * len(recv_picks))
                 cursor = await db.execute(
-                    f"SELECT pick_id FROM draft_picks WHERE pick_id IN ({placeholders}) AND current_team_id = ? AND player_selected_id IS NULL",
+                    f"SELECT pick_id FROM draft_picks WHERE pick_id IN ({placeholders}) AND current_team_id = ? AND player_selected_id IS NULL "
+                    "AND COALESCE(passed, 0) = 0 AND draft_id NOT IN (SELECT draft_id FROM drafts WHERE status = 'completed')",
                     recv_picks + [recv_team_id]
                 )
                 valid_recv_picks = [row[0] for row in await cursor.fetchall()]
@@ -2967,6 +3156,20 @@ class ModeratorApprovalView(discord.ui.View):
                         await channel.send(embed=embed)
         except Exception as e:
             print(f"Failed to send trade approval announcement: {e}")
+
+        # Any other offer that included these players or picks, and so can no
+        # longer go ahead, is voided now rather than lingering until someone
+        # tries to approve it.
+        await parent_cog.void_stale_trades(self.trade_id, init_players + recv_players, init_picks + recv_picks)
+
+        # If one of the traded picks is on the clock in a live draft, it moves
+        # to its new owner there and then.
+        draft_cog = self.bot.get_cog('DraftCommands')
+        if draft_cog and (init_picks or recv_picks):
+            try:
+                await draft_cog.announce_traded_live_picks(init_picks + recv_picks)
+            except Exception as e:
+                print(f"Failed to move a traded on-the-clock pick: {e}")
 
         # Disable buttons
         for item in self.children:

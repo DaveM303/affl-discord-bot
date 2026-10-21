@@ -252,6 +252,107 @@ async def fetch_teams_for_dropdown(db, include_draft_pool=False):
     return await cursor.fetchall()
 
 
+def add_page_buttons(view, page, total_pages, on_page, row=None,
+                     prev_label="◀", next_label="▶", count_label="Page"):
+    """Adds the bot's standard page controls to `view`: a grey ◀, a
+    greyed-out "Page 2/5" counter, and a grey ▶. The arrows are disabled
+    on the first/last page, and nothing is added at all when there's only
+    one page. Every paginated menu uses this, so they look and behave the
+    same everywhere.
+
+    Args:
+        view: the discord.ui.View to add the buttons to.
+        page: the current page, 0-based.
+        total_pages: how many pages there are.
+        on_page: async callable(interaction, new_page), awaited when an
+            arrow is pressed - the menu sets its page and redraws itself.
+        row: the action row to put the buttons on (None = automatic).
+        prev_label / next_label: the arrows' labels, for menus that page
+            through something specific - e.g. "◀ Earlier Rounds".
+        count_label: the counter's word - "Page 2/5", "Round 2/4"...
+            None leaves the counter out (e.g. when the menu's footer or
+            title already says where you are).
+    """
+    import discord  # local: utils is imported by non-discord tooling too
+
+    if total_pages <= 1:
+        return
+
+    def arrow(label, target, disabled):
+        button = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary,
+                                   disabled=disabled, row=row)
+
+        async def callback(interaction):
+            await on_page(interaction, target)
+        button.callback = callback
+        return button
+
+    view.add_item(arrow(prev_label, page - 1, page <= 0))
+    if count_label:
+        view.add_item(discord.ui.Button(label=f"{count_label} {page + 1}/{total_pages}",
+                                        style=discord.ButtonStyle.secondary, disabled=True, row=row))
+    view.add_item(arrow(next_label, page + 1, page >= total_pages - 1))
+
+
+async def fetch_stat_seasons(db, player_id=None):
+    """Seasons with stats to look back on, for a season dropdown (see
+    add_season_select): started (active, offseason or completed) and with
+    at least one fixture, newest first. With player_id, only the seasons
+    that player played a game in. Rows are (season_id, season_number)."""
+    if player_id is None:
+        cursor = await db.execute(
+            """SELECT s.season_id, s.season_number FROM seasons s
+               WHERE s.status IN ('active', 'offseason', 'completed')
+                 AND EXISTS (SELECT 1 FROM matches m WHERE m.season_id = s.season_id)
+               ORDER BY s.season_number DESC"""
+        )
+    else:
+        cursor = await db.execute(
+            """SELECT s.season_id, s.season_number FROM seasons s
+               WHERE EXISTS (SELECT 1 FROM player_match_stats pms
+                             JOIN matches m ON pms.match_id = m.match_id
+                             WHERE m.season_id = s.season_id AND pms.player_id = ?)
+               ORDER BY s.season_number DESC""",
+            (player_id,)
+        )
+    return [tuple(row) for row in await cursor.fetchall()]
+
+
+def add_season_select(view, seasons, season_id, season_number, on_select, row=None):
+    """Adds the standard "Season N" dropdown to `view`, for browsing
+    previous seasons. `seasons` is fetch_stat_seasons' rows; the season on
+    screen (season_id/season_number) is always offered and marked as
+    selected, even if it isn't in `seasons` yet (e.g. a season with no games
+    played). Nothing is added when there's only that one season to show.
+    Holds the newest 25 seasons (a dropdown's limit).
+
+    on_select: async callable(interaction, season_id, season_number),
+    awaited when a different season is picked - the menu loads that
+    season and redraws itself."""
+    import discord  # local: utils is imported by non-discord tooling too
+
+    options = {sid: number for sid, number in seasons}
+    if season_id is not None:
+        options[season_id] = season_number
+    if len(options) <= 1:
+        return
+    ordered = sorted(options.items(), key=lambda item: -item[1])[:25]
+    select = discord.ui.Select(
+        placeholder="Switch season...",
+        options=[
+            discord.SelectOption(label=f"Season {number}", value=str(sid), default=(sid == season_id))
+            for sid, number in ordered
+        ],
+        row=row,
+    )
+
+    async def callback(interaction):
+        sid = int(select.values[0])
+        await on_select(interaction, sid, options[sid])
+    select.callback = callback
+    view.add_item(select)
+
+
 def build_team_options(bot, teams, selected=None, extra_options=None,
                        include_draft_pool=False):
     """Build a team dropdown's SelectOption list.
@@ -338,3 +439,269 @@ async def get_games_played(db, player_id, season_number=None):
     result = await cursor.fetchone()
     return result[0] if result else 0
 
+
+async def ensure_fixture_schema(db):
+    """Creates or upgrades everything /generatefixture stores - shared by
+    bot.py's init_db and /migratedb so the two can't drift apart.
+
+    - matches.timeslot: e.g. "Thursday night". /generatefixture saves each
+      round in play order, so everything listing matches by match_id
+      already shows them in timeslot order. NULL for finals.
+    - matches.match_name: a marquee game's or forced double-up's name, e.g.
+      "Anzac Day Clash", fixed when its fixture is saved. NULL for every
+      other game, including finals (which have their own names).
+    - fixture_derbies: forced double-ups - league-wide pairs that play twice
+      every season (team_a_id < team_b_id), with an optional name for both
+      of their games.
+    - fixture_marquees: league-wide marquee games, each with a home team and
+      an optional name. round_number pins the game to a round (with an
+      optional timeslot); NULL means no set round - the pair's first
+      meeting, wherever the generator puts it. ground_id optionally pins
+      its ground. random_host = 1 lets the generator pick which of the two
+      teams hosts it (home_team_id/away_team_id are then just the pair).
+    - matches.ground: the ground's name, fixed when the fixture is saved
+      (or the final is created). NULL when no grounds are set up.
+    - grounds: name, capacity (picks a blockbuster's ground) and an
+      optional state, e.g. "VIC".
+    - team_grounds: each team's home ground, optional alternate ground,
+      crowd draw (1-5), and how many home games a season to play at the
+      alternate ground, against opponents of which crowd draws ("1,2,3,4,5").
+    - state_finals_grounds: a state's finals ground - finals hosted by a
+      team from that state are played there. States without one use the
+      host's home ground.
+    - settings 'grand_final_ground_id' and 'blockbuster_draw' (see
+      commands.fixture_commands)."""
+    cursor = await db.execute("PRAGMA table_info(matches)")
+    match_columns = [column[1] for column in await cursor.fetchall()]
+    if 'timeslot' not in match_columns:
+        await db.execute("ALTER TABLE matches ADD COLUMN timeslot TEXT")
+    if 'match_name' not in match_columns:
+        await db.execute("ALTER TABLE matches ADD COLUMN match_name TEXT")
+    if 'ground' not in match_columns:
+        await db.execute("ALTER TABLE matches ADD COLUMN ground TEXT")
+
+    await db.execute('''
+        CREATE TABLE IF NOT EXISTS fixture_derbies (
+            derby_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_a_id INTEGER NOT NULL,
+            team_b_id INTEGER NOT NULL,
+            UNIQUE(team_a_id, team_b_id),
+            FOREIGN KEY (team_a_id) REFERENCES teams(team_id),
+            FOREIGN KEY (team_b_id) REFERENCES teams(team_id)
+        )
+    ''')
+    cursor = await db.execute("PRAGMA table_info(fixture_derbies)")
+    if 'name' not in [column[1] for column in await cursor.fetchall()]:
+        await db.execute("ALTER TABLE fixture_derbies ADD COLUMN name TEXT")
+    await db.execute(_FIXTURE_MARQUEES_TABLE.format(name="fixture_marquees"))
+    await _upgrade_fixture_marquees(db)
+    cursor = await db.execute("PRAGMA table_info(fixture_marquees)")
+    marquee_columns = [column[1] for column in await cursor.fetchall()]
+    if 'ground_id' not in marquee_columns:
+        await db.execute("ALTER TABLE fixture_marquees ADD COLUMN ground_id INTEGER REFERENCES grounds(ground_id)")
+    if 'random_host' not in marquee_columns:
+        await db.execute("ALTER TABLE fixture_marquees ADD COLUMN random_host INTEGER NOT NULL DEFAULT 0")
+
+    await db.execute('''
+        CREATE TABLE IF NOT EXISTS grounds (
+            ground_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            capacity INTEGER,
+            state TEXT
+        )
+    ''')
+    await db.execute('''
+        CREATE TABLE IF NOT EXISTS team_grounds (
+            team_id INTEGER PRIMARY KEY,
+            home_ground_id INTEGER,
+            alternate_ground_id INTEGER,
+            crowd_draw INTEGER NOT NULL DEFAULT 3,
+            alternate_games INTEGER NOT NULL DEFAULT 0,
+            alternate_opponents TEXT NOT NULL DEFAULT '1,2,3,4,5',
+            FOREIGN KEY (team_id) REFERENCES teams(team_id),
+            FOREIGN KEY (home_ground_id) REFERENCES grounds(ground_id),
+            FOREIGN KEY (alternate_ground_id) REFERENCES grounds(ground_id)
+        )
+    ''')
+    await db.execute('''
+        CREATE TABLE IF NOT EXISTS state_finals_grounds (
+            state TEXT PRIMARY KEY,
+            ground_id INTEGER NOT NULL,
+            FOREIGN KEY (ground_id) REFERENCES grounds(ground_id)
+        )
+    ''')
+
+    # Named matchups were replaced by marquee games with no set round.
+    await db.execute("DROP TABLE IF EXISTS fixture_matchup_names")
+
+
+# Length of an offseason when /endseason isn't told otherwise.
+DEFAULT_OFFSEASON_WEEKS = 23
+
+
+async def ensure_season_schema(db):
+    """Adds seasons.offseason_weeks - shared by bot.py's init_db and
+    /migratedb. Set by /endseason on the season that's ending: how many
+    weeks the offseason that follows it lasts. /startseason uses it to carry
+    injuries into the new season, and the offseason injury lists use it to
+    show the round of next season each player is back for. NULL (seasons
+    ended before this existed) means DEFAULT_OFFSEASON_WEEKS."""
+    cursor = await db.execute("PRAGMA table_info(seasons)")
+    if 'offseason_weeks' not in [column[1] for column in await cursor.fetchall()]:
+        await db.execute("ALTER TABLE seasons ADD COLUMN offseason_weeks INTEGER")
+
+
+async def ensure_draft_pick_schema(db):
+    """Adds draft_picks.pick_type - shared by bot.py's init_db and /migratedb.
+
+    pick_type says what a pick IS, so nothing has to work it out from the
+    pick_origin text (which admins can edit in /editdraft, and which went
+    stale whenever a team was renamed):
+      - 'ladder': a team's own pick in a round, positioned by the ladder.
+        Free agency compensation finds a team's natural pick by this (see
+        free_agency_commands.end_matching_period). Its origin label is
+        built when shown - "R1 tied to <original team>" (see
+        pick_origin_label) - so pick_origin is normally NULL; text typed in
+        /editdraft overrides the label.
+      - 'compensation': a free agency compensation pick.
+      - 'father_son': a father-son match or its compensation pick.
+      - 'custom': added by hand in /editdraft.
+    Rows from before pick_type existed are backfilled from their origin
+    text; a ladder pick still showing the old "<team> R<n>" text switches to
+    the live label."""
+    cursor = await db.execute("PRAGMA table_info(draft_picks)")
+    if 'pick_type' not in [column[1] for column in await cursor.fetchall()]:
+        await db.execute("ALTER TABLE draft_picks ADD COLUMN pick_type TEXT")
+    await db.execute(
+        """UPDATE draft_picks SET pick_type = 'compensation'
+           WHERE pick_type IS NULL AND pick_origin LIKE '%Compensation'"""
+    )
+    await db.execute(
+        """UPDATE draft_picks SET pick_type = 'father_son'
+           WHERE pick_type IS NULL AND (pick_origin LIKE '% F/S Match' OR pick_origin LIKE '% F/S Comp')"""
+    )
+    await db.execute(
+        """UPDATE draft_picks SET pick_type = 'ladder', pick_origin = NULL
+           WHERE pick_type IS NULL AND pick_origin =
+                 (SELECT team_name FROM teams WHERE team_id = draft_picks.original_team_id)
+                 || ' R' || round_number"""
+    )
+    await db.execute("UPDATE draft_picks SET pick_type = 'custom' WHERE pick_type IS NULL")
+
+    # What a live draft looked like each time a pick came on the clock, so
+    # the draft control panel can rewind to any pick or abandon the draft
+    # (see draft_commands.py's snapshot_draft / restore_draft_snapshot):
+    # every pick row, and every Draft Pool player with their
+    # contract_expiry. pick_number 1 is the state before the draft began.
+    cursor = await db.execute("PRAGMA table_info(draft_snapshots)")
+    snapshot_columns = [column[1] for column in await cursor.fetchall()]
+    if snapshot_columns and 'pick_number' not in snapshot_columns:
+        # The first version kept one snapshot per draft, taken at its start -
+        # the same thing as the new pick 1 snapshot.
+        await db.execute("ALTER TABLE draft_snapshots RENAME TO draft_snapshots_old")
+    await db.execute('''
+        CREATE TABLE IF NOT EXISTS draft_snapshots (
+            draft_id INTEGER NOT NULL,
+            pick_number INTEGER NOT NULL,
+            picks TEXT NOT NULL,
+            pool_players TEXT NOT NULL,
+            taken_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (draft_id, pick_number),
+            FOREIGN KEY (draft_id) REFERENCES drafts(draft_id)
+        )
+    ''')
+    if snapshot_columns and 'pick_number' not in snapshot_columns:
+        await db.execute(
+            '''INSERT INTO draft_snapshots (draft_id, pick_number, picks, pool_players, taken_at)
+               SELECT draft_id, 1, picks, pool_players, taken_at FROM draft_snapshots_old'''
+        )
+        await db.execute("DROP TABLE draft_snapshots_old")
+
+    # Where a live draft's control panel was posted (see draft_commands.py's
+    # post_draft_panel), so it can be kept up to date and its buttons
+    # re-registered after a restart.
+    cursor = await db.execute("PRAGMA table_info(drafts)")
+    draft_columns = [column[1] for column in await cursor.fetchall()]
+    for column in ('control_channel_id', 'control_message_id'):
+        if column not in draft_columns:
+            await db.execute(f"ALTER TABLE drafts ADD COLUMN {column} TEXT")
+
+
+def pick_origin_label(pick_type, pick_origin, round_number, original_team):
+    """The origin text to show for a pick: its own pick_origin if it has
+    one, else for a ladder pick "R1 tied to <original_team>" - pass the
+    team's emoji where custom emojis render, or its name where they don't
+    (dropdowns). None if there's nothing to show."""
+    if pick_origin:
+        return pick_origin
+    if pick_type == 'ladder' and original_team:
+        return f"R{round_number} tied to {original_team}"
+    return None
+
+
+async def finals_ground_name(db, home_team_id, grand_final=False):
+    """Where a final is played, as a ground name - or None if grounds
+    aren't set up for it. The Grand Final is at the 'grand_final_ground_id'
+    setting's ground. Any other final is at the host's state finals ground
+    (state_finals_grounds, by its home ground's state) if that state has
+    one, else at the host's home ground."""
+    if grand_final:
+        cursor = await db.execute(
+            """SELECT g.name FROM settings s JOIN grounds g ON g.ground_id = CAST(s.setting_value AS INTEGER)
+               WHERE s.setting_key = 'grand_final_ground_id'"""
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+    cursor = await db.execute(
+        """SELECT home.name, finals.name FROM team_grounds tg
+           JOIN grounds home ON home.ground_id = tg.home_ground_id
+           LEFT JOIN state_finals_grounds sf ON sf.state = home.state
+           LEFT JOIN grounds finals ON finals.ground_id = sf.ground_id
+           WHERE tg.team_id = ?""",
+        (home_team_id,)
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    return row[1] or row[0]
+
+
+_FIXTURE_MARQUEES_TABLE = '''
+    CREATE TABLE IF NOT EXISTS {name} (
+        marquee_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        round_number INTEGER,
+        home_team_id INTEGER NOT NULL,
+        away_team_id INTEGER NOT NULL,
+        timeslot TEXT,
+        name TEXT,
+        FOREIGN KEY (home_team_id) REFERENCES teams(team_id),
+        FOREIGN KEY (away_team_id) REFERENCES teams(team_id)
+    )
+'''
+
+
+async def _upgrade_fixture_marquees(db):
+    """Rebuilds a fixture_marquees table from an earlier version of the bot:
+    one that saved marquee games per season (a season_id column), or one
+    that required every marquee game to have a round (round_number NOT
+    NULL). Each distinct marquee game is kept once, with its name if the
+    old table had one."""
+    cursor = await db.execute("PRAGMA table_info(fixture_marquees)")
+    columns = {column[1]: column for column in await cursor.fetchall()}
+    round_required = columns["round_number"][3] == 1
+    if 'season_id' not in columns and not round_required:
+        return
+    name_column = "name" if "name" in columns else "NULL"
+    await db.execute(_FIXTURE_MARQUEES_TABLE.format(name="fixture_marquees_new"))
+    await db.execute(f'''
+        INSERT INTO fixture_marquees_new (round_number, home_team_id, away_team_id, timeslot, name)
+        SELECT round_number, home_team_id, away_team_id, timeslot, {name_column} FROM fixture_marquees
+        WHERE marquee_id IN (
+            SELECT MIN(marquee_id) FROM fixture_marquees
+            GROUP BY round_number, home_team_id, away_team_id
+        )
+        ORDER BY marquee_id
+    ''')
+    await db.execute("DROP TABLE fixture_marquees")
+    await db.execute("ALTER TABLE fixture_marquees_new RENAME TO fixture_marquees")
+    print("Upgraded fixture_marquees (league-wide, round optional)")

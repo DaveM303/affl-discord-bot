@@ -3,7 +3,8 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH, ADMIN_ROLE_ID
-from utils import is_admin_user, get_team_emoji, get_team_emoji_str, build_team_options
+from utils import (is_admin_user, get_team_emoji, get_team_emoji_str, build_team_options, add_page_buttons,
+                   fetch_stat_seasons, add_season_select)
 
 AWARDS_PLAYERS_PER_PAGE = 15
 
@@ -38,8 +39,8 @@ class AwardsCommands(commands.Cog):
         rounds (see _fetch_brownlow_totals/_fetch_coleman_totals).
 
         Scoped to status IN ('active', 'offseason'), active preferred -
-        same convention as resolve_profile_season (player_commands.py) and
-        /exportdata, so /awards keeps showing the season that just finished
+        same convention as resolve_profile_season (player_commands.py), so
+        /awards keeps showing the season that just finished
         throughout the offseason instead of falling through to an empty
         'future' placeholder season."""
         cursor = await db.execute(
@@ -173,10 +174,13 @@ class AwardsMenuView(discord.ui.View):
         self.all_teams = all_teams
         self.brownlow = []
         self.coleman = []
+        self.seasons = None  # fetch_stat_seasons rows, for the season dropdown - loaded by refresh()
 
     async def refresh(self, db):
         self.brownlow = await _fetch_brownlow_totals(db, self.season_id, self.regular_rounds)
         self.coleman = await _fetch_coleman_totals(db, self.season_id, self.regular_rounds)
+        if self.seasons is None:
+            self.seasons = await fetch_stat_seasons(db)
         self.update_components()
 
     def update_components(self):
@@ -184,6 +188,17 @@ class AwardsMenuView(discord.ui.View):
         self.add_item(_ViewBrownlowButton(self))
         self.add_item(_ViewColemanButton(self))
         self.add_item(_ViewBestAndFairestButton(self))
+        add_season_select(self, self.seasons or [], self.season_id, self.season_number,
+                          self._switch_season, row=1)
+
+    async def _switch_season(self, interaction: discord.Interaction, season_id, season_number):
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT regular_rounds FROM seasons WHERE season_id = ?", (season_id,))
+            self.regular_rounds = (await cursor.fetchone())[0]
+            self.season_id = season_id
+            self.season_number = season_number
+            await self.refresh(db)
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
     def create_embed(self):
         embed = discord.Embed(
@@ -217,7 +232,7 @@ class AwardsMenuView(discord.ui.View):
 
 class _ViewBrownlowButton(discord.ui.Button):
     def __init__(self, parent_view: AwardsMenuView):
-        super().__init__(label="View Full Brownlow Votes", style=discord.ButtonStyle.primary)
+        super().__init__(label="View Full Brownlow Votes", style=discord.ButtonStyle.primary, row=0)
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction):
@@ -230,7 +245,7 @@ class _ViewBrownlowButton(discord.ui.Button):
 
 class _ViewColemanButton(discord.ui.Button):
     def __init__(self, parent_view: AwardsMenuView):
-        super().__init__(label="View Full Coleman Leaderboard", style=discord.ButtonStyle.primary)
+        super().__init__(label="View Full Coleman Leaderboard", style=discord.ButtonStyle.primary, row=0)
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction):
@@ -243,7 +258,7 @@ class _ViewColemanButton(discord.ui.Button):
 
 class _ViewBestAndFairestButton(discord.ui.Button):
     def __init__(self, parent_view: AwardsMenuView):
-        super().__init__(label="View Club Best & Fairest", style=discord.ButtonStyle.primary)
+        super().__init__(label="View Club Best & Fairest", style=discord.ButtonStyle.primary, row=0)
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction):
@@ -255,10 +270,8 @@ class _ViewBestAndFairestButton(discord.ui.Button):
 
 
 class _AwardLeaderboardView(discord.ui.View):
-    """Full league-wide leaderboard for one award, paginated - same
-    Previous/Next convention as _StatLeaderboardView (stats_commands.py):
-    labels "◀ Previous"/"Next ▶", disabled (not hidden) at the edges, page
-    number shown in the embed field name. No team filter/mode toggle - both
+    """Full league-wide leaderboard for one award, paginated with the
+    standard page buttons (utils.add_page_buttons). No team filter/mode toggle - both
     awards are already league-wide and count-only (no total/average
     distinction, unlike a raw box-score stat).
 
@@ -312,25 +325,14 @@ class _AwardLeaderboardView(discord.ui.View):
         self.clear_items()
         total_pages = self._total_pages()
 
-        prev_button = discord.ui.Button(label="◀ Previous", style=discord.ButtonStyle.primary, disabled=(self.page == 0))
-        prev_button.callback = self._previous_page
-        self.add_item(prev_button)
-
-        next_button = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.primary, disabled=(self.page >= total_pages - 1))
-        next_button.callback = self._next_page
-        self.add_item(next_button)
+        add_page_buttons(self, self.page, total_pages, self._go_to_page)
 
         back_button = discord.ui.Button(label="Main menu", style=discord.ButtonStyle.secondary)
         back_button.callback = self._back
         self.add_item(back_button)
 
-    async def _previous_page(self, interaction: discord.Interaction):
-        self.page -= 1
-        self.update_components()
-        await interaction.response.edit_message(embed=self.create_embed(), view=self)
-
-    async def _next_page(self, interaction: discord.Interaction):
-        self.page += 1
+    async def _go_to_page(self, interaction: discord.Interaction, page):
+        self.page = page
         self.update_components()
         await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
@@ -389,25 +391,14 @@ class _BestAndFairestView(discord.ui.View):
 
         total_pages = self._total_pages()
 
-        prev_button = discord.ui.Button(label="◀ Previous", style=discord.ButtonStyle.primary, disabled=(self.page == 0))
-        prev_button.callback = self._previous_page
-        self.add_item(prev_button)
-
-        next_button = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.primary, disabled=(self.page >= total_pages - 1))
-        next_button.callback = self._next_page
-        self.add_item(next_button)
+        add_page_buttons(self, self.page, total_pages, self._go_to_page)
 
         back_button = discord.ui.Button(label="Main menu", style=discord.ButtonStyle.secondary)
         back_button.callback = self._back
         self.add_item(back_button)
 
-    async def _previous_page(self, interaction: discord.Interaction):
-        self.page -= 1
-        self.update_components()
-        await interaction.response.edit_message(embed=self.create_embed(), view=self)
-
-    async def _next_page(self, interaction: discord.Interaction):
-        self.page += 1
+    async def _go_to_page(self, interaction: discord.Interaction, page):
+        self.page = page
         self.update_components()
         await interaction.response.edit_message(embed=self.create_embed(), view=self)
 

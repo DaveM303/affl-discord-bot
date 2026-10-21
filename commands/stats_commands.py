@@ -3,7 +3,8 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 from config import DB_PATH
-from utils import get_team_emoji_str, build_team_options, fetch_teams_for_dropdown
+from utils import (get_team_emoji_str, build_team_options, fetch_teams_for_dropdown, add_page_buttons,
+                   fetch_stat_seasons, add_season_select)
 
 # Core box-score stats only - brownlow_votes/best_fairest_votes are
 # deliberately excluded from the leaderboard dropdown (those already have
@@ -121,14 +122,26 @@ class StatsMenuView(discord.ui.View):
         self.season_number = season_number
         self.all_teams = all_teams
         self.totals = []
+        self.seasons = None  # fetch_stat_seasons rows, for the season dropdown - loaded by refresh()
 
     async def refresh(self, db):
         self.totals = await _fetch_season_stat_totals(db, self.season_id)
+        if self.seasons is None:
+            self.seasons = await fetch_stat_seasons(db)
         self.update_components()
 
     def update_components(self):
         self.clear_items()
         self.add_item(_StatLeaderboardSelect(self))
+        add_season_select(self, self.seasons or [], self.season_id, self.season_number,
+                          self._switch_season, row=1)
+
+    async def _switch_season(self, interaction: discord.Interaction, season_id, season_number):
+        self.season_id = season_id
+        self.season_number = season_number
+        async with aiosqlite.connect(DB_PATH) as db:
+            await self.refresh(db)
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
     def create_embed(self):
         embed = discord.Embed(
@@ -167,7 +180,7 @@ class _StatLeaderboardSelect(discord.ui.Select):
     def __init__(self, parent_view: StatsMenuView):
         self.parent_view = parent_view
         options = [discord.SelectOption(label=label, value=key) for key, label in STAT_LABELS.items()]
-        super().__init__(placeholder="View a stat leaderboard...", options=options)
+        super().__init__(placeholder="View a stat leaderboard...", options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction):
         leaderboard_view = _StatLeaderboardView(self.parent_view, self.values[0])
@@ -175,10 +188,8 @@ class _StatLeaderboardSelect(discord.ui.Select):
 
 
 class _StatLeaderboardView(discord.ui.View):
-    """Full leaderboard for one stat, paginated - same Previous/Next
-    convention as _MatchStatsView (match_commands.py): labels "◀ Previous"/
-    "Next ▶", disabled (not hidden) at the edges, page number shown in the
-    embed field name rather than a separate page-indicator button.
+    """Full leaderboard for one stat, paginated with the standard page
+    buttons (utils.add_page_buttons).
 
     Owns its own stat dropdown, team-filter dropdown, and total/average
     toggle so a user can pivot between stats/teams/modes without ever
@@ -253,13 +264,7 @@ class _StatLeaderboardView(discord.ui.View):
 
         total_pages = self._total_pages(self._ranked())
 
-        prev_button = discord.ui.Button(label="◀ Previous", style=discord.ButtonStyle.primary, disabled=(self.page == 0))
-        prev_button.callback = self._previous_page
-        self.add_item(prev_button)
-
-        next_button = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.primary, disabled=(self.page >= total_pages - 1))
-        next_button.callback = self._next_page
-        self.add_item(next_button)
+        add_page_buttons(self, self.page, total_pages, self._go_to_page)
 
         # Toggle button labeled with the mode it switches TO.
         mode_button = discord.ui.Button(
@@ -273,13 +278,8 @@ class _StatLeaderboardView(discord.ui.View):
         back_button.callback = self._back
         self.add_item(back_button)
 
-    async def _previous_page(self, interaction: discord.Interaction):
-        self.page -= 1
-        self.update_components()
-        await interaction.response.edit_message(embed=self.create_embed(), view=self)
-
-    async def _next_page(self, interaction: discord.Interaction):
-        self.page += 1
+    async def _go_to_page(self, interaction: discord.Interaction, page):
+        self.page = page
         self.update_components()
         await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
