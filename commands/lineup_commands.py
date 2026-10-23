@@ -247,6 +247,30 @@ async def validate_lineup(db, team_id, current_round):
     return errors, player_ids
 
 
+async def fetch_unavailable_player_ids(db, current_round):
+    """Every player still actually out for current_round - injured or
+    suspended. Not just a raw status flag: a recovered/served player's row
+    can still say status='injured'/'suspended' until Advance to Next Round
+    clears it - the same test as validate_lineup. Suspensions use
+    games_remaining (ticks down only on rounds the team actually plays), not
+    a round-number comparison like injuries - a bye round doesn't serve any
+    of the suspension. A NULL return_round means recovery length is still
+    TBC (see _roll_pending_injury_recoveries) - definitely still out. Same
+    for a NULL games_remaining (see _roll_pending_report_suspensions) - a
+    still-TBC report."""
+    cursor = await db.execute(
+        "SELECT player_id, return_round FROM injuries WHERE status = 'injured'"
+    )
+    unavailable = {player_id for player_id, return_round in await cursor.fetchall()
+                   if return_round is None or return_round - current_round > 0}
+    cursor = await db.execute(
+        "SELECT player_id, games_remaining FROM suspensions WHERE status = 'suspended'"
+    )
+    unavailable |= {player_id for player_id, games_remaining in await cursor.fetchall()
+                    if games_remaining is None or games_remaining > 0}
+    return unavailable
+
+
 async def auto_fill_lineup(db, team_id, current_round, from_main_lineup=False):
     """from_main_lineup: first reset the team's live lineup to its saved
     main lineup (starting_lineups), if it has one, and build from that -
@@ -351,36 +375,10 @@ async def auto_fill_lineup(db, team_id, current_round, from_main_lineup=False):
     lineup_rows = await cursor.fetchall()
     slot_to_player = {position_name: player_id for _, position_name, player_id in lineup_rows}
 
-    cursor = await db.execute(
-        "SELECT player_id, return_round FROM injuries WHERE status = 'injured'"
-    )
-    injured_return = {row[0]: row[1] for row in await cursor.fetchall()}
-    cursor = await db.execute(
-        "SELECT player_id, games_remaining FROM suspensions WHERE status = 'suspended'"
-    )
-    suspended_games_remaining = {row[0]: row[1] for row in await cursor.fetchall()}
+    unavailable_ids = await fetch_unavailable_player_ids(db, current_round)
 
     def is_unavailable(player_id):
-        # "Still actually out" - same test as validate_lineup, not just a
-        # raw status flag (a recovered/served player's row can still say
-        # status='injured'/'suspended' until Advance to Next Round clears
-        # it). Suspensions use games_remaining (ticks down only on rounds
-        # the team actually plays), not a round-number comparison like
-        # injuries - a bye round doesn't serve any of the suspension.
-        # A NULL return_round means recovery length is still TBC (see
-        # _roll_pending_injury_recoveries) - definitely still unavailable
-        # either way, so that's treated as True with no round-number math.
-        # Same for a NULL games_remaining (see
-        # _roll_pending_report_suspensions) - a still-TBC report.
-        if player_id in injured_return:
-            player_return_round = injured_return[player_id]
-            if player_return_round is None or player_return_round - current_round > 0:
-                return True
-        if player_id in suspended_games_remaining:
-            player_games_remaining = suspended_games_remaining[player_id]
-            if player_games_remaining is None or player_games_remaining > 0:
-                return True
-        return False
+        return player_id in unavailable_ids
 
     starting_slots = AFL_POSITIONS[:18]
     interchange_slots = AFL_POSITIONS[18:]

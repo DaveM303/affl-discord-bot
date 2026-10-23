@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import aiosqlite
+import json
 from config import DB_PATH, ADMIN_ROLE_ID
 from utils import is_admin_user, get_team_emoji_str, finals_ground_name, DEFAULT_OFFSEASON_WEEKS
 from fixture_generator import finals_timeslots
@@ -3289,11 +3290,13 @@ class _AnnounceLineupsMissingView(discord.ui.View):
     """Offered by /announcelineups when one or more teams are blocking the
     round (never confirmed, or confirmed but no longer valid) - lets the
     admin force-submit them rather than waiting on every coach. A team whose
-    live lineup is valid is left as it is; an invalid one is reset to its
-    main lineup (if saved) and repaired by auto_fill_lineup
-    (lineup_commands.py) - the same as the Autofill button. Only a team
-    still invalid after that (e.g. the whole roster is exhausted) actually
-    blocks force-submit."""
+    live lineup is valid is left as it is - unless a player in its main
+    lineup is available but missing from it (e.g. back from injury or
+    suspension, since autofill took him out). That team, like one whose
+    lineup is invalid, is reset to its main lineup (if saved) and repaired
+    by auto_fill_lineup (lineup_commands.py) - the same as the Autofill
+    button. Only a team still invalid after that (e.g.
+    the whole roster is exhausted) actually blocks force-submit."""
     def __init__(self, cog, blocking_team_ids, panel_view=None):
         super().__init__(timeout=300)
         self.cog = cog
@@ -3305,7 +3308,7 @@ class _AnnounceLineupsMissingView(discord.ui.View):
 
     @discord.ui.button(label="Force-submit remaining team lineups", style=discord.ButtonStyle.primary)
     async def force_confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        from commands.lineup_commands import validate_lineup, auto_fill_lineup
+        from commands.lineup_commands import validate_lineup, auto_fill_lineup, fetch_unavailable_player_ids
 
         # Disable straight away (this answers the click too) - the buttons
         # used to stay live until every lineup had been posted, so a second
@@ -3323,17 +3326,32 @@ class _AnnounceLineupsMissingView(discord.ui.View):
                 await interaction.followup.send("❌ No active season!", ephemeral=True)
                 return
             current_round = season_row[0]
+            unavailable_ids = await fetch_unavailable_player_ids(db, current_round)
 
             still_invalid = []
             for team_id in self.blocking_team_ids:
                 cursor = await db.execute("SELECT team_name FROM teams WHERE team_id = ?", (team_id,))
                 team_name = (await cursor.fetchone())[0]
 
-                # A valid lineup is left exactly as it is. An invalid one goes
-                # through the same process as the Autofill button: reset to the
-                # team's main lineup (if saved), then repair from there.
+                # A valid lineup is left exactly as it is, unless a player in
+                # the team's main lineup is available (still on the team, not
+                # injured or suspended) but missing from it - e.g. back from
+                # injury or suspension. That team, and one whose lineup is
+                # invalid, goes through the same process as the Autofill
+                # button: reset to the team's main lineup (if saved), then
+                # repair from there.
                 errors, player_ids = await validate_lineup(db, team_id, current_round)
-                if errors:
+                main_player_missing = False
+                cursor = await db.execute("SELECT lineup_data FROM starting_lineups WHERE team_id = ?", (team_id,))
+                saved = await cursor.fetchone()
+                if saved:
+                    main_ids = {int(pid) for pid in json.loads(saved[0]).values() if pid is not None}
+                    cursor = await db.execute("SELECT player_id FROM players WHERE team_id = ?", (team_id,))
+                    roster_ids = {row[0] for row in await cursor.fetchall()}
+                    cursor = await db.execute("SELECT player_id FROM lineups WHERE team_id = ?", (team_id,))
+                    live_ids = {row[0] for row in await cursor.fetchall()}
+                    main_player_missing = bool((main_ids & roster_ids) - unavailable_ids - live_ids)
+                if errors or main_player_missing:
                     await auto_fill_lineup(db, team_id, current_round, from_main_lineup=True)
                     errors, player_ids = await validate_lineup(db, team_id, current_round)
 
