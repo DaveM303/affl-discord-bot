@@ -319,28 +319,35 @@ def add_share_button(view, get_embed=None, row=None, get_file=None):
 
     async def callback(interaction):
         import inspect
+        # Posted as a new message in the channel, not as the reply to the
+        # button press - a reply would carry a link back to the private
+        # menu, which everyone else sees as "message could not be loaded".
+        # The press itself is just acknowledged, leaving the menu as it is.
+        await interaction.response.defer()
         if get_file is not None:
-            file = await get_file()
-            if file is None:
-                await interaction.response.send_message("❌ There's nothing to share.", ephemeral=True)
+            content = {"file": await get_file()}
+            if content["file"] is None:
+                await interaction.followup.send("❌ There's nothing to share.", ephemeral=True)
                 return
-            await interaction.response.send_message(
-                content=f"📢 Shared by {interaction.user.mention}", file=file,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-        message = getattr(interaction, "message", None)
-        if get_embed is None and message is not None and message.embeds:
-            embed = message.embeds[0]
         else:
-            embed = (get_embed or view.create_embed)()
-            if inspect.isawaitable(embed):
-                embed = await embed
-        await interaction.response.send_message(
-            content=f"📢 Shared by {interaction.user.mention}",
-            embed=discord.Embed.from_dict(embed.to_dict()),
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+            message = getattr(interaction, "message", None)
+            if get_embed is None and message is not None and message.embeds:
+                embed = message.embeds[0]
+            else:
+                embed = (get_embed or view.create_embed)()
+                if inspect.isawaitable(embed):
+                    embed = await embed
+            content = {"embed": discord.Embed.from_dict(embed.to_dict())}
+        try:
+            await interaction.channel.send(
+                f"📢 Shared by {interaction.user.mention}",
+                allowed_mentions=discord.AllowedMentions.none(), **content
+            )
+        except (discord.Forbidden, AttributeError):
+            await interaction.followup.send(
+                "❌ I can't post in this channel - check I have permission to send messages here.",
+                ephemeral=True
+            )
     button.callback = callback
     view.add_item(button)
 
