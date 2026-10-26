@@ -4,7 +4,7 @@ from discord import app_commands
 import aiosqlite
 import json
 from config import DB_PATH
-from utils import (is_admin_user, assign_drafted_player, get_team_emoji, pick_origin_label,
+from utils import (add_share_button, share_view, is_admin_user, assign_drafted_player, get_team_emoji, pick_origin_label,
                    get_team_emoji_str, build_team_options, fetch_teams_for_dropdown, add_page_buttons)
 
 
@@ -555,7 +555,7 @@ class DraftCommands(commands.Cog):
             # Display all picks in embed description
             embed.description = "\n".join(all_pick_lines) if all_pick_lines else "*No picks*"
 
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, view=share_view(embed), ephemeral=True)
 
     @app_commands.command(name="draftpoints", description="View the points value for all draft pick numbers")
     async def draft_points(self, interaction: discord.Interaction):
@@ -598,7 +598,7 @@ class DraftCommands(commands.Cog):
                     inline=True
                 )
 
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, view=share_view(embed), ephemeral=True)
 
     @app_commands.command(name="draftpointscalculator", description="Calculate the highest bid your draft picks can match")
     async def draft_points_calculator(self, interaction: discord.Interaction):
@@ -1580,6 +1580,7 @@ class DraftOrderView(discord.ui.View):
     def update_buttons(self):
         self.clear_items()
         add_page_buttons(self, self.current_round - 1, self.max_rounds, self._go_to_round, count_label="Round")
+        add_share_button(self)
 
     async def _go_to_round(self, interaction: discord.Interaction, page):
         self.current_round = page + 1
@@ -2711,6 +2712,14 @@ class DraftPointsCalculatorView(discord.ui.View):
         if clear is not None:
             self.remove_item(clear)
             self.add_item(clear)
+        # 📢 Share last on that row - added once, then moved back to the end
+        # each time the page buttons are rebuilt.
+        share = next((item for item in self.children if getattr(item, "label", None) == "📢 Share"), None)
+        if share is not None:
+            self.remove_item(share)
+            self.add_item(share)
+        else:
+            add_share_button(self, row=1)
 
 
 class DraftPoolView(discord.ui.View):
@@ -2743,6 +2752,7 @@ class DraftPoolView(discord.ui.View):
     def update_components(self):
         self.clear_items()
         add_page_buttons(self, self.current_page, self.total_pages, self._go_to_page)
+        add_share_button(self)
 
     def create_embed(self):
         lines = []

@@ -5,7 +5,7 @@ import aiosqlite
 from config import DB_PATH
 from utils import (
     get_current_season, is_admin_user, calculate_contract_expiry, get_team_emoji, get_team_emoji_str, get_user_team,
-    fetch_teams_for_dropdown, build_team_options, add_page_buttons,
+    fetch_teams_for_dropdown, build_team_options, add_page_buttons, add_share_button, share_view,
 )
 from commands.lineup_commands import clear_departed_players_from_lineups
 from compensation_image import render_compensation_chart_image
@@ -2536,7 +2536,10 @@ class FreeAgencyHubView(discord.ui.View):
                 "❌ No compensation chart data found! Use `/migratedb` to initialize.", ephemeral=True
             )
             return
-        await interaction.response.send_message(file=file, ephemeral=True)
+        async def fresh_chart():
+            async with aiosqlite.connect(DB_PATH) as db:
+                return await cog.build_compensation_chart_file(db)
+        await interaction.response.send_message(file=file, view=share_view(get_file=fresh_chart), ephemeral=True)
 
     async def refresh_callback(self, interaction: discord.Interaction):
         async with aiosqlite.connect(DB_PATH) as db:
@@ -2562,6 +2565,7 @@ class _ContractStatusView(discord.ui.View):
     def update_components(self):
         self.clear_items()
         self.add_item(_ContractStatusTeamSelect(self))
+        add_share_button(self, row=1)
 
     def no_team_embed(self):
         return discord.Embed(
@@ -2621,6 +2625,7 @@ class FreeAgentsView(discord.ui.View):
         self.add_item(_FreeAgentsTeamFilterSelect(self))
 
         add_page_buttons(self, self.current_page, len(self.pages()), self._go_to_page, row=1)
+        add_share_button(self, row=1)
 
     # A page's text stays under this, short of Discord's 4096-character
     # limit on an embed description.
@@ -2963,6 +2968,7 @@ class MatchingView(discord.ui.View):
                 back_button = discord.ui.Button(label="← Back to Hub", style=discord.ButtonStyle.secondary, row=0)
                 back_button.callback = self.back_to_hub_callback
                 self.add_item(back_button)
+            add_share_button(self, row=0)
             return
 
         # Add dropdown to select players to match (limit to 25)
@@ -3012,6 +3018,7 @@ class MatchingView(discord.ui.View):
             back_button = discord.ui.Button(label="← Back to Hub", style=discord.ButtonStyle.secondary, row=1)
             back_button.callback = self.back_to_hub_callback
             self.add_item(back_button)
+        add_share_button(self, row=1)
 
     async def back_to_hub_callback(self, interaction: discord.Interaction):
         async with aiosqlite.connect(DB_PATH) as db:
@@ -3317,6 +3324,7 @@ class AuctionsMenuView(discord.ui.View):
             back_button = discord.ui.Button(label="← Back to Hub", style=discord.ButtonStyle.secondary, row=button_row)
             back_button.callback = self.back_to_hub_callback
             self.add_item(back_button)
+        add_share_button(self, row=button_row)
 
     async def back_to_hub_callback(self, interaction: discord.Interaction):
         async with aiosqlite.connect(DB_PATH) as db:
@@ -3509,6 +3517,7 @@ class FreeResignSelectionView(discord.ui.View):
             back_button = discord.ui.Button(label="← Back to Hub", style=discord.ButtonStyle.secondary)
             back_button.callback = self.back_to_hub_callback
             self.add_item(back_button)
+        add_share_button(self)
 
     async def back_to_hub_callback(self, interaction: discord.Interaction):
         async with aiosqlite.connect(DB_PATH) as db:

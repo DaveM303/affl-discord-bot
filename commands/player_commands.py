@@ -4,7 +4,7 @@ from discord import app_commands
 import aiosqlite
 from config import DB_PATH
 from utils import (get_team_emoji_str, build_team_options, fetch_teams_for_dropdown, DEFAULT_OFFSEASON_WEEKS, add_page_buttons,
-                   fetch_stat_seasons, add_season_select)
+                   fetch_stat_seasons, add_season_select, add_share_button, share_view)
 
 class PlayerCommands(commands.Cog):
     def __init__(self, bot):
@@ -305,7 +305,7 @@ class PlayerCommands(commands.Cog):
                 embed.description = "No players on this team"
                 embed.set_footer(text="0/44 players")
 
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, view=share_view(embed), ephemeral=True)
 
     @app_commands.command(name="injurylist", description="View current injuries and suspensions")
     @app_commands.describe(team_name="Name of the team (leave empty for all teams)")
@@ -367,7 +367,7 @@ class PlayerCommands(commands.Cog):
                 description="\n".join(lines) if lines else "No current injuries or suspensions.",
                 color=discord.Color.blue()
             )
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(embed=embed, view=share_view(embed))
     @app_commands.command(name="filterplayers", description="Search for players with filters")
     async def search_players(self, interaction: discord.Interaction):
         """Opens the interactive filter menu. All filtering happens through
@@ -597,6 +597,7 @@ class PlayerProfileView(discord.ui.View):
             back = discord.ui.Button(label="◀ Back", style=discord.ButtonStyle.secondary, row=0)
             back.callback = self.go_back
             self.add_item(back)
+        add_share_button(self, row=0)
 
         add_season_select(self, self.data.get('seasons', []), self.data['season_id'], self.season_number,
                           self._switch_season, row=1)
@@ -767,6 +768,7 @@ class GameLogView(discord.ui.View):
             back = discord.ui.Button(label="◀ Back", style=discord.ButtonStyle.secondary, row=2)
             back.callback = self._back
             self.add_item(back)
+        add_share_button(self, row=2)
 
     async def _go_to_page(self, interaction: discord.Interaction, page):
         self.page = page
@@ -845,9 +847,9 @@ class ProfilePickSelect(discord.ui.Select):
 #
 # Component budget: Discord allows 5 action rows per message and a Select
 # eats a whole row. Position / team / sort / profile-pick dropdowns are 4 of
-# them, so the five numeric filters share ONE button opening a 5-field modal
-# (a modal's own limit is 5 inputs, which is exactly what's needed) and the
-# last row carries that button plus pagination.
+# them, so the name and numeric filters share ONE button opening one modal
+# (a modal holds at most 5 inputs, so age and OVR are a range box each, e.g.
+# "20-25") and the top row carries that button, reset, pagination and share.
 
 FILTER_SORT_OPTIONS = [
     ('ovr_desc', 'OVR (High to Low)'),
@@ -856,15 +858,41 @@ FILTER_SORT_OPTIONS = [
     ('age_asc', 'Age (Youngest to Oldest)'),
 ]
 
-# (FilterState attribute, modal field label) for the numeric filters, in the
-# order they appear in the modal.
-NUMERIC_FILTER_FIELDS = [
-    ('min_age', 'Min Age'),
-    ('max_age', 'Max Age'),
-    ('min_ovr', 'Min OVR'),
-    ('max_ovr', 'Max OVR'),
-    ('contract_expiry', 'Contract Expiry (season)'),
-]
+def parse_range(text, label):
+    """A range box's text as (min, max), either side None for no limit:
+    "20-25", "25+" (25 and over), "-22" (22 and under), "25" (exactly 25),
+    or blank for no limit at all. Raises ValueError with a message for the
+    user if it isn't one of those."""
+    raw = text.replace(" ", "")
+    if not raw:
+        return None, None
+    try:
+        if raw.endswith("+"):
+            return int(raw[:-1]), None
+        if raw.startswith("-"):
+            return None, int(raw[1:])
+        if "-" in raw:
+            low, high = raw.split("-", 1)
+            low, high = int(low), int(high)
+            if low > high:
+                raise ValueError(f"{label}: {low} is more than {high} - put the lower number first.")
+            return low, high
+        return int(raw), int(raw)
+    except ValueError as e:
+        if str(e).startswith(label):
+            raise
+        raise ValueError(f"{label}: '{text.strip()}' isn't a range - try 20-25, 25+ or -22.") from None
+
+
+def format_range(low, high):
+    """parse_range's inverse, to pre-fill a range box."""
+    if low is None and high is None:
+        return None
+    if low is None:
+        return f"-{high}"
+    if high is None:
+        return f"{low}+"
+    return str(low) if low == high else f"{low}-{high}"
 
 
 class FilterState:
@@ -980,103 +1008,71 @@ class FilterState:
         return " | ".join(bits) if bits else "No filters"
 
 
-class NumericFiltersModal(discord.ui.Modal, title="Set Numeric Filters"):
-    """All five numeric filters in one form. Each field is pre-filled with its
-    current value and is optional - clearing a field clears that filter, which
-    is how a user undoes a min/max they no longer want."""
+class FiltersModal(discord.ui.Modal, title="Filters"):
+    """The name, age, OVR and contract filters in one form. Each box is
+    pre-filled with its current value and is optional - clearing a box
+    clears that filter."""
 
     def __init__(self, parent_view):
         super().__init__()
         self.parent_view = parent_view
-        self.inputs = {}
-
-        for attribute, label in NUMERIC_FILTER_FIELDS:
-            current = getattr(parent_view.state, attribute)
-            field = discord.ui.TextInput(
-                label=label,
-                placeholder="Leave blank for no limit",
-                default=str(current) if current is not None else None,
-                required=False,
-                max_length=4
-            )
-            self.inputs[attribute] = field
+        state = parent_view.state
+        self.name = discord.ui.TextInput(
+            label="Name contains", placeholder="e.g. smith - leave blank for any name",
+            default=state.name, required=False, max_length=50)
+        self.age = discord.ui.TextInput(
+            label="Age Range", placeholder="e.g. 20-25, 25+ or -22 - leave blank for any age",
+            default=format_range(state.min_age, state.max_age), required=False, max_length=9)
+        self.ovr = discord.ui.TextInput(
+            label="OVR Range", placeholder="e.g. 70-80, 80+ or -65 - leave blank for any OVR",
+            default=format_range(state.min_ovr, state.max_ovr), required=False, max_length=9)
+        self.contract = discord.ui.TextInput(
+            label="Contract Expiry (season)", placeholder="Leave blank for any",
+            default=str(state.contract_expiry) if state.contract_expiry is not None else None,
+            required=False, max_length=4)
+        for field in (self.name, self.age, self.ovr, self.contract):
             self.add_item(field)
 
     async def on_submit(self, interaction: discord.Interaction):
         # Validate everything before applying any of it, so a single typo
         # doesn't leave the filters half-updated.
-        parsed = {}
-        for attribute, label in NUMERIC_FILTER_FIELDS:
-            raw = self.inputs[attribute].value.strip()
-            if not raw:
-                parsed[attribute] = None
-                continue
-            try:
-                parsed[attribute] = int(raw)
-            except ValueError:
-                await interaction.response.send_message(
-                    f"'{raw}' isn't a whole number - check the {label} field.",
-                    ephemeral=True
-                )
-                return
+        try:
+            age = parse_range(self.age.value, "Age Range")
+            ovr = parse_range(self.ovr.value, "OVR Range")
+            raw_contract = self.contract.value.strip()
+            if raw_contract and not raw_contract.isdigit():
+                raise ValueError(f"Contract Expiry: '{raw_contract}' isn't a season number.")
+        except ValueError as e:
+            await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+            return
 
-        for attribute, value in parsed.items():
-            setattr(self.parent_view.state, attribute, value)
-
+        state = self.parent_view.state
+        state.name = self.name.value.strip() or None
+        state.min_age, state.max_age = age
+        state.min_ovr, state.max_ovr = ovr
+        state.contract_expiry = int(raw_contract) if raw_contract else None
+        self.parent_view.current_page = 0
         await self.parent_view.refresh(interaction)
 
 
-class NumericFiltersButton(discord.ui.Button):
+class FiltersButton(discord.ui.Button):
     def __init__(self, parent_view, row):
         state = parent_view.state
-        active = sum(
-            1 for attribute, _ in NUMERIC_FILTER_FIELDS
-            if getattr(state, attribute) is not None
-        )
+        active = sum((
+            state.name is not None,
+            state.min_age is not None or state.max_age is not None,
+            state.min_ovr is not None or state.max_ovr is not None,
+            state.contract_expiry is not None,
+        ))
         super().__init__(
-            label=f"Age / OVR / Contract ({active})" if active else "Age / OVR / Contract",
+            label=f"🔍 More Filters ({active})" if active else "🔍 More Filters",
             style=discord.ButtonStyle.primary if active else discord.ButtonStyle.secondary,
             row=row
         )
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(NumericFiltersModal(self.parent_view))
-
-
-class NameFilterModal(discord.ui.Modal, title="Filter by Name"):
-    """Part of a player's name - clearing it clears the filter."""
-
-    def __init__(self, parent_view):
-        super().__init__()
-        self.parent_view = parent_view
-        self.name = discord.ui.TextInput(
-            label="Name contains",
-            placeholder="e.g. smith - leave blank for any name",
-            default=parent_view.state.name,
-            required=False,
-            max_length=50
-        )
-        self.add_item(self.name)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        self.parent_view.state.name = self.name.value.strip() or None
-        self.parent_view.current_page = 0
-        await self.parent_view.refresh(interaction)
-
-
-class NameFilterButton(discord.ui.Button):
-    def __init__(self, parent_view, row):
-        name = parent_view.state.name
-        super().__init__(
-            label=f"🔍 \"{name}\""[:80] if name else "🔍 Name",
-            style=discord.ButtonStyle.primary if name else discord.ButtonStyle.secondary,
-            row=row
-        )
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(NameFilterModal(self.parent_view))
+        await interaction.response.send_modal(FiltersModal(self.parent_view))
 
 
 class ResetFiltersButton(discord.ui.Button):
@@ -1170,7 +1166,7 @@ class FilterPlayersView(discord.ui.View):
     so the filters and their results are always one panel.
 
     Row layout (Discord's cap is 5 rows, a Select taking a full row):
-        0  name button, numeric-filters button, reset, pagination
+        0  pagination, more-filters button, reset, share
         1  position dropdown
         2  team dropdown
         3  sort dropdown
@@ -1220,14 +1216,14 @@ class FilterPlayersView(discord.ui.View):
     def update_components(self):
         self.clear_items()
 
-        self.add_item(NameFilterButton(self, row=0))
-        self.add_item(NumericFiltersButton(self, row=0))
-        self.add_item(ResetFiltersButton(self, row=0))
-
-        # Standard page buttons; no counter - the top row already holds the
-        # 3 filter buttons, and the footer shows the page.
+        # Standard page buttons at the far left; no counter - the top row is
+        # full (both arrows, filters, reset, share), and the footer shows
+        # the page.
         add_page_buttons(self, self.current_page, self.total_pages, self._go_to_page, row=0,
                          count_label=None)
+        self.add_item(FiltersButton(self, row=0))
+        self.add_item(ResetFiltersButton(self, row=0))
+        add_share_button(self, row=0)
 
         self.add_item(PositionFilterSelect(self, row=1))
         self.add_item(TeamFilterSelect(self, self.teams, row=2))
@@ -1311,6 +1307,7 @@ class PlayerSearchResultsView(discord.ui.View):
             self.add_item(ProfilePickSelect(self.cog, page_players, self, row=0))
 
         add_page_buttons(self, self.current_page, self.total_pages, self._go_to_page, row=1)
+        add_share_button(self, row=1)
 
     def create_embed(self):
         lines = []

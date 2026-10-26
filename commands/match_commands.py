@@ -8,7 +8,7 @@ from discord import app_commands
 import aiosqlite
 from config import DB_PATH
 from utils import (is_admin_user, get_team_emoji_str, build_team_options, fetch_teams_for_dropdown, add_page_buttons,
-                   fetch_stat_seasons, add_season_select)
+                   fetch_stat_seasons, add_season_select, add_share_button)
 from match_sim import (
     simulate_match, simulate_match_with_events, format_score, DEFAULT_VARIANCE,
     Player, MatchEvent, simulate_extra_time_half, simulate_extra_time_after_siren_shot,
@@ -104,6 +104,10 @@ BOX_SCORE_PLAYERS_PER_PAGE = 16
 # finals), so the dropdown shows a window of this size that the Earlier/Later
 # buttons scroll.
 ROUND_WINDOW_SIZE = 25
+# When a season's rounds don't fit in one round dropdown, its first page
+# ("Earlier Rounds") holds the first this-many rounds, and the rest go on
+# the next page ("Later Rounds").
+EARLIER_ROUNDS_PAGE_SIZE = 14
 
 
 def _event_message(event, team_emoji, home_emoji, away_emoji, running_home_goals, running_home_behinds,
@@ -2647,27 +2651,36 @@ class MatchCentreView(discord.ui.View):
         # Which page of available_rounds the round dropdown offers. Discord's
         # Select caps at ROUND_WINDOW_SIZE options, so when a season has more
         # rounds than that the dropdown pages (standard page buttons -
-        # utils.add_page_buttons) instead of the extra rounds being dropped.
-        # Opens on the page holding the current round.
+        # utils.add_page_buttons) instead of the extra rounds being dropped:
+        # rounds 1-14 on "Earlier Rounds", the rest on "Later Rounds" (see
+        # _round_page_slices). Opens on the page holding the current round.
         self.round_page = self._page_for(current_round)
         self.message = None
         self.matches = []  # (match_id, home_team_id, home_name, home_emoji_id, away_team_id, away_name, away_emoji_id, simulated, home_score, away_score, match_name, ground)
         self.all_teams = None  # [(team_id, team_name, emoji_id)] for the team dropdown - loaded by refresh()
         self.seasons = []  # fetch_stat_seasons rows, for the season dropdown - set by build_match_centre_view
 
+    def _round_page_slices(self):
+        """available_rounds split into the round dropdown's pages: all on one
+        page if they fit, else the first EARLIER_ROUNDS_PAGE_SIZE, then the
+        rest (in pages of ROUND_WINDOW_SIZE, should a season ever be long
+        enough to need more than two)."""
+        rounds = self.available_rounds
+        if len(rounds) <= ROUND_WINDOW_SIZE:
+            return [rounds]
+        rest = rounds[EARLIER_ROUNDS_PAGE_SIZE:]
+        return [rounds[:EARLIER_ROUNDS_PAGE_SIZE]] + [
+            rest[i:i + ROUND_WINDOW_SIZE] for i in range(0, len(rest), ROUND_WINDOW_SIZE)]
+
     def _page_for(self, round_number):
         """The round dropdown page holding `round_number` (0 if absent)."""
-        try:
-            return self.available_rounds.index(round_number) // ROUND_WINDOW_SIZE
-        except ValueError:
-            return 0
+        return next((i for i, page in enumerate(self._round_page_slices()) if round_number in page), 0)
 
     def _round_pages(self):
-        return max(1, -(-len(self.available_rounds) // ROUND_WINDOW_SIZE))
+        return len(self._round_page_slices())
 
     def _visible_rounds(self):
-        start = self.round_page * ROUND_WINDOW_SIZE
-        return self.available_rounds[start:start + ROUND_WINDOW_SIZE]
+        return self._round_page_slices()[self.round_page]
 
     async def refresh(self, db):
         """Re-populates self.matches for self.current_round - called after
@@ -2701,10 +2714,10 @@ class MatchCentreView(discord.ui.View):
             )
             for r in visible_rounds
         ]
-        # Rows: round-window page buttons at the top, then the round
-        # dropdown, match dropdown, the team filter - picking a team opens
-        # that team's whole-season fixture (_TeamMatchesView) - and the
-        # season dropdown at the bottom.
+        # Rows: the round-window page buttons and Share at the top, then the
+        # round dropdown, the match dropdown, the team filter - picking a
+        # team opens that team's whole-season fixture (_TeamMatchesView) -
+        # and the season dropdown at the bottom.
         self.add_item(_RoundSelect(self, round_options))
         if self.matches:
             self.add_item(_MatchCentreSelect(self))
@@ -2716,7 +2729,8 @@ class MatchCentreView(discord.ui.View):
         # Only when there are rounds beyond one dropdown's worth - with 25
         # rounds or fewer it holds them all (add_page_buttons adds nothing).
         add_page_buttons(self, self.round_page, self._round_pages(), self._go_to_round_page, row=0,
-                         prev_label="◀ Earlier Rounds", next_label="Later Rounds ▶")
+                         prev_label="◀ Earlier Rounds", next_label="Later Rounds ▶", count_label=None)
+        add_share_button(self, row=0)
 
     def create_embed(self):
         from commands.season_commands import get_round_name
@@ -2905,13 +2919,15 @@ class _TeamMatchesView(discord.ui.View):
 
         add_page_buttons(self, self.match_page, max(1, -(-len(self.matches) // ROUND_WINDOW_SIZE)),
                          self._go_to_match_page, row=0,
-                         prev_label="◀ Earlier Rounds", next_label="Later Rounds ▶")
+                         prev_label="◀ Earlier Rounds", next_label="Later Rounds ▶", count_label=None)
 
         self.add_item(_TeamPickSelect(self))
 
         clear_button = discord.ui.Button(label="Clear filter", style=discord.ButtonStyle.secondary, row=3)
         clear_button.callback = self._main_menu
         self.add_item(clear_button)
+        if self.team_id is not None:
+            add_share_button(self, row=3)
 
     async def _go_to_match_page(self, interaction: discord.Interaction, page):
         self.match_page = page
@@ -3074,6 +3090,7 @@ class _MatchStatsView(discord.ui.View):
             back_button = discord.ui.Button(label="Main menu", style=discord.ButtonStyle.secondary, row=2)
             back_button.callback = self._back
             self.add_item(back_button)
+        add_share_button(self, row=2)
 
         # The players on this page, in the same order as the embed lists
         # them, opening that player's full line for the game. Older data
@@ -3147,6 +3164,7 @@ class _PlayerGameView(discord.ui.View):
         profile = discord.ui.Button(label="👤 View Player Profile", style=discord.ButtonStyle.primary)
         profile.callback = self._profile
         self.add_item(profile)
+        add_share_button(self)
 
     def create_embed(self):
         from commands.season_commands import get_round_name

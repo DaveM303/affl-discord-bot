@@ -4,7 +4,7 @@ from discord import app_commands
 import aiosqlite
 from config import DB_PATH
 from utils import (get_team_emoji_str, build_team_options, fetch_teams_for_dropdown, add_page_buttons,
-                   fetch_stat_seasons, add_season_select)
+                   fetch_stat_seasons, add_season_select, add_share_button)
 
 # Core box-score stats only - brownlow_votes/best_fairest_votes are
 # deliberately excluded from the leaderboard dropdown (those already have
@@ -135,6 +135,7 @@ class StatsMenuView(discord.ui.View):
         self.add_item(_StatLeaderboardSelect(self))
         add_season_select(self, self.seasons or [], self.season_id, self.season_number,
                           self._switch_season, row=1)
+        add_share_button(self, row=2)
 
     async def _switch_season(self, interaction: discord.Interaction, season_id, season_number):
         self.season_id = season_id
@@ -277,6 +278,7 @@ class _StatLeaderboardView(discord.ui.View):
         back_button = discord.ui.Button(label="Main menu", style=discord.ButtonStyle.secondary)
         back_button.callback = self._back
         self.add_item(back_button)
+        add_share_button(self)
 
     async def _go_to_page(self, interaction: discord.Interaction, page):
         self.page = page

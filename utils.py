@@ -294,6 +294,68 @@ def add_page_buttons(view, page, total_pages, on_page, row=None,
     view.add_item(arrow(next_label, page + 1, page >= total_pages - 1))
 
 
+def add_share_button(view, get_embed=None, row=None, get_file=None):
+    """Adds the standard "📢 Share" button to an ephemeral menu: posts a copy
+    of the embed currently on screen as a public message in the same
+    channel, with "Shared by @user" above it. Only the embed is posted, no
+    buttons or dropdowns, so nobody else can drive the sharer's menu, and
+    the sharer's own menu stays open. Only add it to menus whose content is
+    fine for everyone to see - never admin menus or anything with hidden
+    ratings.
+
+    get_embed: callable returning the embed to share (or a coroutine
+    function, for menus that build their embed asynchronously) - for a menu
+    that shares something other than what's on screen. Without it, the
+    embed on screen is shared as it is (falling back to view.create_embed()
+    if the message isn't available), so it works even for screens whose
+    embed was built outside the view.
+    row: the action row to put the button on (None = automatic).
+    get_file: coroutine function returning a discord.File - for a menu
+    showing an image rather than an embed (e.g. the compensation table).
+    A File can only be sent once, so it's built fresh for each share."""
+    import discord  # local: utils is imported by non-discord tooling too
+
+    button = discord.ui.Button(label="📢 Share", style=discord.ButtonStyle.secondary, row=row)
+
+    async def callback(interaction):
+        import inspect
+        if get_file is not None:
+            file = await get_file()
+            if file is None:
+                await interaction.response.send_message("❌ There's nothing to share.", ephemeral=True)
+                return
+            await interaction.response.send_message(
+                content=f"📢 Shared by {interaction.user.mention}", file=file,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        message = getattr(interaction, "message", None)
+        if get_embed is None and message is not None and message.embeds:
+            embed = message.embeds[0]
+        else:
+            embed = (get_embed or view.create_embed)()
+            if inspect.isawaitable(embed):
+                embed = await embed
+        await interaction.response.send_message(
+            content=f"📢 Shared by {interaction.user.mention}",
+            embed=discord.Embed.from_dict(embed.to_dict()),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    button.callback = callback
+    view.add_item(button)
+
+
+def share_view(embed=None, timeout=900, get_file=None):
+    """A view holding just the 📢 Share button, for a command that replies
+    with a plain embed and no menu of its own (e.g. /roster) - or, with
+    get_file, an image (see add_share_button)."""
+    import discord  # local: utils is imported by non-discord tooling too
+
+    view = discord.ui.View(timeout=timeout)
+    add_share_button(view, get_embed=(lambda: embed) if embed is not None else None, get_file=get_file)
+    return view
+
+
 async def fetch_stat_seasons(db, player_id=None):
     """Seasons with stats to look back on, for a season dropdown (see
     add_season_select): started (active, offseason or completed) and with

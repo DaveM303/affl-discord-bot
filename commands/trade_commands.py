@@ -6,7 +6,7 @@ import json
 from config import DB_PATH
 from utils import is_admin_user, get_team_emoji, get_team_emoji_str
 # Aliased - PendingTradesView has its own method called add_page_buttons.
-from utils import add_page_buttons as add_standard_page_buttons
+from utils import add_page_buttons as add_standard_page_buttons, add_share_button
 from commands.lineup_commands import clear_departed_players_from_lineups
 
 # Canonical embed color per trade state, used by build_trade_embed() so every
@@ -1247,6 +1247,8 @@ class TradeMenuView(discord.ui.View):
         back_btn = discord.ui.Button(label="← Back to Main Menu", style=discord.ButtonStyle.secondary, row=2)
         back_btn.callback = self.back_callback
         self.add_item(back_btn)
+        if self.incoming_trades:
+            add_share_button(self, row=2)
 
     async def add_outgoing_page_buttons(self):
         """Add buttons for outgoing offers page view"""
@@ -1264,6 +1266,8 @@ class TradeMenuView(discord.ui.View):
         back_btn = discord.ui.Button(label="← Back to Main Menu", style=discord.ButtonStyle.secondary, row=2)
         back_btn.callback = self.back_callback
         self.add_item(back_btn)
+        if self.outgoing_trades:
+            add_share_button(self, row=2)
 
     async def add_approval_page_buttons(self):
         """Add buttons for approval page view"""
@@ -1275,6 +1279,8 @@ class TradeMenuView(discord.ui.View):
         back_btn = discord.ui.Button(label="← Back to Main Menu", style=discord.ButtonStyle.secondary, row=1)
         back_btn.callback = self.back_callback
         self.add_item(back_btn)
+        if self.approval_trades:
+            add_share_button(self, row=1)
 
     async def _go_to_incoming(self, interaction: discord.Interaction, page):
         self.incoming_page = page

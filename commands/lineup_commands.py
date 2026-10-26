@@ -6,7 +6,7 @@ import aiosqlite
 import json
 from config import DB_PATH
 from commands.season_commands import get_round_name
-from utils import is_admin_user, get_team_emoji, get_team_emoji_str, add_page_buttons
+from utils import is_admin_user, get_team_emoji, get_team_emoji_str, add_page_buttons, add_share_button, share_view
 from match_sim import (
     slot_group, POSITION_ALLOWED_GROUPS, RUCK_SLOT, RUCK_ELIGIBLE_POSITIONS, Player,
     _team_strengths, _resolve_bench_groups, INTERCHANGE_SLOTS,
@@ -666,20 +666,15 @@ class LineupCommands(commands.Cog):
         # Return up to 25 choices (Discord limit)
         return choices[:25]
 
-    @app_commands.command(name="teamlineup", description="Open the lineup management menu")
-    @app_commands.describe(team_name="[ADMIN ONLY] Team name to manage lineup for")
+    @app_commands.command(name="teamlineup", description="Open the lineup management menu, or view another team's lineup")
+    @app_commands.describe(team_name="Team to view (admins can manage it)")
     @app_commands.autocomplete(team_name=team_autocomplete)
     async def team_lineup(self, interaction: discord.Interaction, team_name: str = None):
-        # If team_name specified, check if user is admin
+        # Anyone can name a team. Admins get the full menu for it, a coach
+        # naming their own team gets their normal menu, and anyone else gets
+        # it view-only (Share and View Main Lineup only).
+        view_only = False
         if team_name:
-            if not await self.is_admin(interaction):
-                await interaction.response.send_message(
-                    "❌ Only admins can manage other teams' lineups! "
-                    "Type `/teamlineup` without a team parameter to access your own lineup.",
-                    ephemeral=True
-                )
-                return
-
             # Look up specified team (exact match due to autocomplete)
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
@@ -694,93 +689,27 @@ class LineupCommands(commands.Cog):
                     )
                     return
                 team_id, team_name = result
+            if not await self.is_admin(interaction):
+                own_team_id, _ = await self.get_user_team(interaction.user.id, interaction.guild)
+                view_only = team_id != own_team_id
         else:
             # Get user's team
             team_id, team_name = await self.get_user_team(interaction.user.id, interaction.guild)
 
             if not team_id:
                 await interaction.response.send_message(
-                    "❌ You don't manage a team!",
+                    "❌ You don't manage a team! Add a team name to view that team's lineup.",
                     ephemeral=True
                 )
                 return
 
         async with aiosqlite.connect(DB_PATH) as db:
-            view, embed = await build_team_lineup_menu(db, self.bot, team_id, team_name)
+            view, embed = await build_team_lineup_menu(db, self.bot, team_id, team_name, view_only=view_only)
 
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
         # Store message reference so the view can edit it later
         view.message = await interaction.original_response()
-
-    @app_commands.command(name="viewlineup", description="View your team's current lineup")
-    @app_commands.autocomplete(team_name=team_autocomplete)
-    async def view_lineup(self, interaction: discord.Interaction, team_name: str = None):
-        # If no team specified, get user's team
-        if not team_name:
-            team_id, team_name = await self.get_user_team(interaction.user.id, interaction.guild)
-            if not team_id:
-                await interaction.response.send_message(
-                    "❌ You don't manage a team! Specify a team name to view their lineup.",
-                    ephemeral=True
-                )
-                return
-        else:
-            # Look up specified team (exact match due to autocomplete)
-            async with aiosqlite.connect(DB_PATH) as db:
-                cursor = await db.execute(
-                    "SELECT team_id FROM teams WHERE team_name = ?",
-                    (team_name,)
-                )
-                result = await cursor.fetchone()
-                if not result:
-                    await interaction.response.send_message(
-                        f"❌ Team '{team_name}' not found. Please select from the autocomplete suggestions.",
-                        ephemeral=True
-                    )
-                    return
-                team_id = result[0]
-        
-        # Get lineup
-        async with aiosqlite.connect(DB_PATH) as db:
-            # player_id is selected too because format_lineup_description
-            # needs it to compute each slot's ADJUSTED (effective) OVR.
-            cursor = await db.execute(
-                """SELECT l.position_name, p.player_id, p.name, p.position, p.overall_rating
-                   FROM lineups l
-                   JOIN players p ON l.player_id = p.player_id AND p.team_id = l.team_id
-                   WHERE l.team_id = ?
-                   ORDER BY l.slot_number""",
-                (team_id,)
-            )
-            lineup = await cursor.fetchall()
-        
-        # Get team emoji
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT emoji_id FROM teams WHERE team_id = ?",
-                (team_id,)
-            )
-            result = await cursor.fetchone()
-            emoji_id = result[0] if result else None
-        
-        # Get emoji
-        emoji = get_team_emoji_str(interaction.client, emoji_id)
-
-        # Create embed
-        embed = discord.Embed(
-            title=f"{emoji}{team_name} Lineup",
-            color=discord.Color.blue()
-        )
-        
-        # Same renderer as the lineup channel post, so both show the
-        # adjusted (effective) OVR for anyone out of position.
-        field_text = format_lineup_description(lineup)
-
-        embed.description = field_text
-        embed.set_footer(text=f"{len(lineup)}/23 players selected")
-
-        await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="delist", description="Delist player(s) from your team (offseason only)")
     @app_commands.describe(
@@ -979,7 +908,7 @@ class LineupCommands(commands.Cog):
                 print(f"Failed to log delist to bot logs channel: {e}")
 
 
-async def build_team_lineup_menu(db, bot, team_id, team_name=None):
+async def build_team_lineup_menu(db, bot, team_id, team_name=None, view_only=False):
     """Builds a ready-to-send (TeamLineupMenu, embed) pair for one team -
     factored out of /teamlineup's own command body so other code (e.g.
     season_commands.py's round-summary "Set Lineup for Next Round" button)
@@ -1047,7 +976,7 @@ async def build_team_lineup_menu(db, bot, team_id, team_name=None):
 
     view = TeamLineupMenu(team_id, team_name, lineup, roster, bot, emoji_id, has_starting_lineup,
                            is_confirmed=is_confirmed, lineups_locked=season_lineups_locked,
-                           not_playing_this_round=not_playing_this_round)
+                           not_playing_this_round=not_playing_this_round, view_only=view_only)
     embed = await view.create_menu_embed()
     return view, embed
 
@@ -1055,8 +984,12 @@ async def build_team_lineup_menu(db, bot, team_id, team_name=None):
 class TeamLineupMenu(discord.ui.View):
     """Main menu for team lineup management"""
     def __init__(self, team_id, team_name, lineup, roster, bot, emoji_id=None, has_starting_lineup=False,
-                 is_confirmed=False, lineups_locked=False, not_playing_this_round=False):
+                 is_confirmed=False, lineups_locked=False, not_playing_this_round=False, view_only=False):
         super().__init__(timeout=300)
+        # view_only: another team's lineup, opened by someone who doesn't
+        # manage it - just Share and View Main Lineup, and none of the
+        # coach-only warnings or status.
+        self.view_only = view_only
         self.team_id = team_id
         self.team_name = team_name
         self.lineup = lineup
@@ -1192,6 +1125,16 @@ class TeamLineupMenu(discord.ui.View):
         # get you back to an editable state.
         locked_for_editing = self.is_confirmed or self.lineups_locked
 
+        if self.view_only:
+            view_starting_btn = discord.ui.Button(
+                label="👁️ View Main Lineup", style=discord.ButtonStyle.secondary,
+                disabled=not self.has_starting_lineup
+            )
+            view_starting_btn.callback = self.view_starting_lineup_callback
+            self.add_item(view_starting_btn)
+            add_share_button(self, get_embed=self.share_embed)
+            return
+
         # Row 1: Primary actions
         edit_btn = discord.ui.Button(
             label="📝 Edit Lineup", style=discord.ButtonStyle.primary, custom_id="edit_lineup",
@@ -1247,6 +1190,16 @@ class TeamLineupMenu(discord.ui.View):
         )
         clear_btn.callback = self.clear_lineup_callback
         self.add_item(clear_btn)
+
+        add_share_button(self, get_embed=self.share_embed)
+
+    async def share_embed(self):
+        """What 📢 Share posts: the lineup itself - the menu's warnings and
+        status footer are only for the coach."""
+        embed = await self.create_menu_embed()
+        embed.clear_fields()
+        embed.remove_footer()
+        return embed
 
     async def edit_lineup_callback(self, interaction: discord.Interaction):
         """Open the lineup editor"""
@@ -1633,7 +1586,7 @@ class TeamLineupMenu(discord.ui.View):
         embed.description = field_text
         embed.set_footer(text=f"{len(lineup_data)}/23 positions filled")
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, view=share_view(embed), ephemeral=True)
 
     async def create_menu_embed(self):
         """Create the menu display embed"""
@@ -1643,7 +1596,7 @@ class TeamLineupMenu(discord.ui.View):
         emoji = get_team_emoji_str(self.bot, self.emoji_id)
 
         embed = discord.Embed(
-            title=f"{emoji}{self.team_name} - Lineup Management",
+            title=f"{emoji}{self.team_name} Lineup",
             color=discord.Color.blue()
         )
 
@@ -1690,17 +1643,18 @@ class TeamLineupMenu(discord.ui.View):
         embed.description = field_text
 
         # Add warnings if any exist
-        if self.warnings:
+        if self.warnings and not self.view_only:
             embed.add_field(name="\u200b", value="\n".join(self.warnings), inline=False)
 
-        status = f"{len(self.lineup)}/23 positions filled"
+        status = None
         if self.lineups_locked:
-            status += " • Lineups locked for this round"
+            status = "Lineups locked for this round"
         elif self.not_playing_this_round:
-            status += " • Not playing this round - lineup can't be submitted"
+            status = "Not playing this round - lineup can't be submitted"
         elif self.is_confirmed:
-            status += " • Submitted - select Unsubmit Lineup to make changes"
-        embed.set_footer(text=status)
+            status = "Submitted - select Unsubmit Lineup to make changes"
+        if status and not self.view_only:
+            embed.set_footer(text=status)
 
         return embed
 
